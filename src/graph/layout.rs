@@ -384,4 +384,63 @@ mod tests {
             }
         }
     }
+
+    // Milestone 15: multi-level nesting + absolute positions.
+
+    #[test]
+    fn grandchild_is_contained_in_child_is_contained_in_root() {
+        let graph = graph_from(
+            vec![
+                parent("root", "root", None, &["root::mid"]),
+                parent("root::mid", "mid", Some("root"), &["root::mid::leaf"]),
+                leaf("root::mid::leaf", "leaf", Some("root::mid")),
+            ],
+            vec!["root"],
+        );
+
+        let result = layout(&graph);
+
+        let root_rect = result.rects[&NodeId::from("root")];
+        let mid_rect = result.rects[&NodeId::from("root::mid")];
+        let leaf_rect = result.rects[&NodeId::from("root::mid::leaf")];
+
+        assert!(root_rect.contains(&mid_rect));
+        assert!(mid_rect.contains(&leaf_rect));
+    }
+
+    #[test]
+    fn disjoint_roots_do_not_intersect() {
+        let graph = graph_from(
+            vec![
+                parent("root_a", "root_a", None, &["root_a::x"]),
+                leaf("root_a::x", "x", Some("root_a")),
+                parent("root_b", "root_b", None, &["root_b::y"]),
+                leaf("root_b::y", "y", Some("root_b")),
+            ],
+            vec!["root_a", "root_b"],
+        );
+
+        let result = layout(&graph);
+
+        let a = result.rects[&NodeId::from("root_a")];
+        let b = result.rects[&NodeId::from("root_b")];
+        assert!(!a.intersects(&b));
+    }
+
+    #[test]
+    fn layout_is_deterministic() {
+        let graph = graph_from(
+            vec![
+                parent("root", "root", None, &["root::a", "root::b"]),
+                leaf("root::a", "a", Some("root")),
+                leaf("root::b", "b", Some("root")),
+            ],
+            vec!["root"],
+        );
+
+        let first = layout(&graph);
+        let second = layout(&graph);
+
+        assert_eq!(first.rects, second.rects);
+    }
 }
