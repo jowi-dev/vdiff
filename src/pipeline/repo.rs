@@ -51,6 +51,16 @@ pub trait GitRepo {
     /// Every file tracked at HEAD (needed to parse unchanged files for the
     /// module-name table).
     fn list_tracked_files(&self) -> Result<Vec<PathBuf>>;
+
+    /// `path`'s blob id (hex) at `base_oid`, or `None` if it didn't exist
+    /// there. Populates [`crate::graph::model::FileRef::base_blob`] without
+    /// loading the blob's full content into the graph -- distinct from
+    /// [`GitRepo::base_blob`], which returns content for extraction.
+    fn base_blob_oid(&self, base_oid: &str, path: &Path) -> Result<Option<String>>;
+
+    /// `path`'s blob id (hex) in the checked-out worktree/HEAD, or `None`
+    /// if absent. Populates [`crate::graph::model::FileRef::head_blob`].
+    fn head_blob_oid(&self, path: &Path) -> Result<Option<String>>;
 }
 
 /// In-memory [`GitRepo`] for pipeline tests: scripted deltas plus base/head
@@ -91,6 +101,25 @@ impl GitRepo for FakeRepo {
     fn list_tracked_files(&self) -> Result<Vec<PathBuf>> {
         Ok(self.tracked_files.clone())
     }
+
+    fn base_blob_oid(&self, _base_oid: &str, path: &Path) -> Result<Option<String>> {
+        Ok(self.base_files.get(path).map(|content| fake_oid(content)))
+    }
+
+    fn head_blob_oid(&self, path: &Path) -> Result<Option<String>> {
+        Ok(self.head_files.get(path).map(|content| fake_oid(content)))
+    }
+}
+
+/// A cheap, deterministic stand-in for a real git blob oid, derived from
+/// content -- good enough for [`FakeRepo`] tests to assert presence/absence
+/// and stability without depending on git2.
+fn fake_oid(content: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
 }
 
 #[cfg(test)]
@@ -197,6 +226,33 @@ mod tests {
         );
         assert_eq!(
             repo.head_content(Path::new("src/deleted.rs")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn base_blob_oid_present_iff_content_present() {
+        let repo = scenario();
+        assert!(repo
+            .base_blob_oid("deadbeef", Path::new("src/deleted.rs"))
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            repo.base_blob_oid("deadbeef", Path::new("src/added.rs"))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn head_blob_oid_present_iff_content_present() {
+        let repo = scenario();
+        assert!(repo
+            .head_blob_oid(Path::new("src/added.rs"))
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            repo.head_blob_oid(Path::new("src/deleted.rs")).unwrap(),
             None
         );
     }
