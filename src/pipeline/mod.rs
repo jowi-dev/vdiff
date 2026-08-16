@@ -4,6 +4,7 @@
 pub mod changed_files;
 pub mod error;
 pub mod extract;
+pub mod git2_repo;
 pub mod repo;
 pub mod resolve;
 
