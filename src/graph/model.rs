@@ -1,0 +1,248 @@
+//! Pure graph data model: the nodes/edges vdiff renders, and the exact shape
+//! serialized as `--dump json`. Zero dependencies on egui/git2/syn/
+//! tree-sitter -- this module only knows about serde and std.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+/// Stable identifier for a [`ModuleNode`], qualified by crate/app so
+/// workspace and umbrella-project nodes never collide (e.g.
+/// `myapp::foo::bar`, `MyApp.Accounts.User`). Serializes as a bare string
+/// (`#[serde(transparent)]`), matching the `--dump json` payload shape.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NodeId(String);
+
+impl fmt::Display for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<&str> for NodeId {
+    fn from(value: &str) -> Self {
+        NodeId(value.to_string())
+    }
+}
+
+impl From<String> for NodeId {
+    fn from(value: String) -> Self {
+        NodeId(value)
+    }
+}
+
+/// A node's git status relative to the diff base, driving its color in the
+/// graph view: gray unchanged, green added, yellow modified, red deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GitStatus {
+    /// No changes between base and head.
+    Unchanged,
+    /// Present at head, absent at base.
+    Added,
+    /// Present at both, content differs.
+    Modified,
+    /// Present at base, absent at head.
+    Deleted,
+}
+
+/// One file backing a [`ModuleNode`]. File-to-module is one-to-many (a
+/// single Elixir file can `defmodule` several modules), so a node's `files`
+/// list may repeat across nodes. Blob ids are hex strings rather than
+/// `git2::Oid` -- this layer stays git2-free. `base_blob` is `None` for
+/// added files, `head_blob` is `None` for deleted files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRef {
+    /// Path relative to the repository root.
+    pub path: PathBuf,
+    /// Blob id (hex) at the diff base, or `None` if the file is new.
+    pub base_blob: Option<String>,
+    /// Blob id (hex) at head, or `None` if the file was deleted.
+    pub head_blob: Option<String>,
+}
+
+/// One module/file cluster in the project hierarchy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleNode {
+    /// This node's stable id.
+    pub id: NodeId,
+    /// Human-readable name shown in the graph view and used to order
+    /// siblings (see [`ProjectGraph::sorted_children`]).
+    pub display_name: String,
+    /// Parent node id, `None` for roots.
+    pub parent: Option<NodeId>,
+    /// Child node ids, in no particular stored order -- rendering always
+    /// goes through [`ProjectGraph::sorted_children`].
+    pub children: Vec<NodeId>,
+    /// This node's git status relative to the diff base.
+    pub status: GitStatus,
+    /// Files backing this node.
+    pub files: Vec<FileRef>,
+}
+
+/// The kind of dependency a [`DepEdge`] represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DepKind {
+    /// Rust `use`.
+    Use,
+    /// Elixir `import`.
+    Import,
+    /// Elixir `alias`.
+    Alias,
+    /// Elixir `require`.
+    Require,
+    /// A cross-reference call resolved via `mix xref graph`.
+    XrefCall,
+}
+
+/// A directed dependency edge between two modules.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepEdge {
+    /// The module the dependency is declared in.
+    pub from: NodeId,
+    /// The module depended on.
+    pub to: NodeId,
+    /// How the dependency was declared/resolved.
+    pub kind: DepKind,
+}
+
+/// The full project graph: every module node, the dependency edges between
+/// them, and the top-level roots. Flat and serde-friendly by design -- this
+/// struct IS the `--dump json` payload. Any petgraph-based structure needed
+/// for layout/focus algorithms is built on demand from this.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectGraph {
+    /// Every node, keyed by id.
+    pub nodes: HashMap<NodeId, ModuleNode>,
+    /// Top-level node ids (no parent), in no particular stored order -- see
+    /// [`ProjectGraph::sorted_roots`].
+    pub roots: Vec<NodeId>,
+    /// Every dependency edge in the graph.
+    pub edges: Vec<DepEdge>,
+}
+
+impl ProjectGraph {
+    /// Look up a node by id.
+    pub fn node(&self, id: &NodeId) -> Option<&ModuleNode> {
+        self.nodes.get(id)
+    }
+
+    /// `parent`'s children, sorted by `display_name`. This defines sibling
+    /// order for navigation (`j`/`k` in [`crate::core::focus`]). Returns an
+    /// empty vec if `parent` is unknown or has no children.
+    pub fn sorted_children(&self, parent: &NodeId) -> Vec<NodeId> {
+        let Some(node) = self.node(parent) else {
+            return Vec::new();
+        };
+        self.sorted_by_name(&node.children)
+    }
+
+    /// The graph's top-level roots, sorted by `display_name` -- the sibling
+    /// order navigation uses when the focused node has no parent.
+    pub fn sorted_roots(&self) -> Vec<NodeId> {
+        self.sorted_by_name(&self.roots)
+    }
+
+    /// Sort a slice of node ids by their `display_name`, dropping any id
+    /// that isn't present in `nodes`.
+    fn sorted_by_name(&self, ids: &[NodeId]) -> Vec<NodeId> {
+        let mut named: Vec<(&str, NodeId)> = ids
+            .iter()
+            .filter_map(|id| Some((self.node(id)?.display_name.as_str(), id.clone())))
+            .collect();
+        named.sort_by(|a, b| a.0.cmp(b.0));
+        named.into_iter().map(|(_, id)| id).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hand-built 3-node graph: one root with two children, one dep edge from
+    /// one child to the other. Asserts the JSON round-trips and that
+    /// `sorted_children` orders by `display_name`, not insertion order.
+    #[test]
+    fn round_trips_and_sorts_children_by_name() {
+        let root_id = NodeId::from("app");
+        let zeta_id = NodeId::from("app::zeta");
+        let alpha_id = NodeId::from("app::alpha");
+
+        let mut nodes = std::collections::HashMap::new();
+        nodes.insert(
+            root_id.clone(),
+            ModuleNode {
+                id: root_id.clone(),
+                display_name: "app".to_string(),
+                parent: None,
+                children: vec![zeta_id.clone(), alpha_id.clone()],
+                status: GitStatus::Unchanged,
+                files: vec![],
+            },
+        );
+        nodes.insert(
+            zeta_id.clone(),
+            ModuleNode {
+                id: zeta_id.clone(),
+                display_name: "zeta".to_string(),
+                parent: Some(root_id.clone()),
+                children: vec![],
+                status: GitStatus::Modified,
+                files: vec![FileRef {
+                    path: PathBuf::from("src/zeta.rs"),
+                    base_blob: Some("aaa111".to_string()),
+                    head_blob: Some("bbb222".to_string()),
+                }],
+            },
+        );
+        nodes.insert(
+            alpha_id.clone(),
+            ModuleNode {
+                id: alpha_id.clone(),
+                display_name: "alpha".to_string(),
+                parent: Some(root_id.clone()),
+                children: vec![],
+                status: GitStatus::Added,
+                files: vec![FileRef {
+                    path: PathBuf::from("src/alpha.rs"),
+                    base_blob: None,
+                    head_blob: Some("ccc333".to_string()),
+                }],
+            },
+        );
+
+        let graph = ProjectGraph {
+            nodes,
+            roots: vec![root_id.clone()],
+            edges: vec![DepEdge {
+                from: zeta_id.clone(),
+                to: alpha_id.clone(),
+                kind: DepKind::Use,
+            }],
+        };
+
+        // Sibling order is name-sorted, not insertion order (zeta was
+        // inserted into `children` before alpha).
+        assert_eq!(
+            graph.sorted_children(&root_id),
+            vec![alpha_id.clone(), zeta_id.clone()]
+        );
+        assert_eq!(graph.sorted_roots(), vec![root_id.clone()]);
+        assert_eq!(graph.node(&zeta_id).unwrap().display_name, "zeta");
+        assert_eq!(graph.node(&NodeId::from("missing")), None);
+
+        let json = serde_json::to_string(&graph).expect("serialize");
+        let round_tripped: ProjectGraph = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, graph);
+    }
+
+    #[test]
+    fn node_id_display_and_conversions() {
+        let from_str: NodeId = "foo::bar".into();
+        let from_string: NodeId = String::from("foo::bar").into();
+        assert_eq!(from_str, from_string);
+        assert_eq!(from_str.to_string(), "foo::bar");
+    }
+}
