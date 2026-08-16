@@ -38,6 +38,12 @@ fn write(dir: &Path, rel: &str, content: &str) {
     fs::write(path, content).unwrap();
 }
 
+fn write_bytes(dir: &Path, rel: &str, content: &[u8]) {
+    let path = dir.join(rel);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, content).unwrap();
+}
+
 fn remove(dir: &Path, rel: &str) {
     fs::remove_file(dir.join(rel)).unwrap();
 }
@@ -166,4 +172,36 @@ fn base_override_produces_the_same_result_as_default_detection() {
     let repo_dir = fixture_repo();
     let graph = dump_json(repo_dir.path(), Some("main"));
     assert_fixture_graph(&graph);
+}
+
+/// A branch that adds a non-UTF8 binary file (a fake PNG, including its
+/// 0x89 0x50 magic bytes and an invalid UTF-8 continuation byte) must not
+/// crash `build_graph` -- `Git2Repo::head_content` has to lossy-decode the
+/// worktree read the same way `base_blob` already does. The binary file
+/// still shows up as an Added `file:` leaf node; its (garbage) decoded
+/// content just yields no extracted defs, so it's a leaf with no children.
+#[test]
+fn added_binary_file_does_not_crash_build_graph() {
+    let tmp = TempDir::new().expect("create tempdir");
+    let dir = tmp.path();
+
+    git(dir, &["init", "-b", "main"]);
+    write(dir, "README.md", "# hi\n");
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-m", "initial"]);
+
+    git(dir, &["checkout", "-b", "feature"]);
+    let png_bytes: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFE, 0xFD, 0x00, 0x01, 0x02,
+    ];
+    write_bytes(dir, "assets/logo.png", &png_bytes);
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-m", "add binary asset"]);
+
+    let graph = dump_json(dir, None);
+
+    let logo = graph
+        .node(&NodeId::from("file:assets/logo.png"))
+        .expect("binary file node");
+    assert_eq!(logo.status, GitStatus::Added);
 }

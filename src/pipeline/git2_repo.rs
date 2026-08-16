@@ -8,12 +8,16 @@
 //!
 //! `head_content`/`list_tracked_files` read the checked-out worktree and
 //! the HEAD commit's tree respectively; `base_blob`/`base_blob_oid` read
-//! `base_oid`'s tree. Known limitation: `head_blob_oid` is sourced from the
-//! HEAD commit's tree, not a live hash of the worktree file -- if the
-//! worktree has uncommitted changes beyond HEAD, `head_content` still
-//! returns the accurate live content for parsing, but the recorded blob id
-//! won't match it exactly. Fine for the reviewed-branch workflow this tool
-//! targets (committed changes), a known gap otherwise.
+//! `base_oid`'s tree. `head_content` and `base_blob` both read raw bytes and
+//! lossy-decode as UTF-8 (`String::from_utf8_lossy`), so a non-UTF8 file
+//! (a binary asset) degrades to garbage text for extraction rather than
+//! erroring `build_graph` out entirely. Known limitation: `head_blob_oid`
+//! is sourced from the HEAD commit's tree, not a live hash of the worktree
+//! file -- if the worktree has uncommitted changes beyond HEAD,
+//! `head_content` still returns the accurate live content for parsing, but
+//! the recorded blob id won't match it exactly. Fine for the
+//! reviewed-branch workflow this tool targets (committed changes), a known
+//! gap otherwise.
 
 use std::path::{Path, PathBuf};
 
@@ -64,9 +68,15 @@ impl Git2Repo {
         Ok(commit.tree()?)
     }
 
+    /// Read `path`'s raw bytes and lossy-decode as UTF-8 -- mirrors
+    /// `base_blob`'s handling of git blob content, so a non-UTF8 file (a
+    /// binary asset, say) degrades to garbage text instead of erroring the
+    /// whole pipeline out. The extractors for both languages already treat
+    /// unparseable source as "no defs", so lossy-decoded binary content
+    /// just becomes a childless leaf node.
     fn read_io(path: &Path) -> Result<Option<String>> {
-        match std::fs::read_to_string(path) {
-            Ok(content) => Ok(Some(content)),
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(source) => Err(PipelineError::Io {
                 path: path.to_path_buf(),
