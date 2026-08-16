@@ -16,6 +16,7 @@ use crate::graph::layout::LayoutResult;
 use crate::graph::model::{NodeId, ProjectGraph};
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome};
 use crate::pipeline::repo::GitRepo;
+use crate::ui::diff_view;
 use crate::ui::graph_view::{self, Transform};
 
 /// How long `--smoke` keeps the window open before closing it.
@@ -181,15 +182,13 @@ impl VdiffApp {
             });
     }
 
-    /// [`Screen::Diff`] placeholder: the focused node's name and the paths
-    /// of the files backing it. Real diff rendering arrives in chunk E;
-    /// `Esc` already returns to the graph via the tested reducer.
-    fn show_diff_placeholder(&self, ui: &mut egui::Ui) {
-        ui.heading("diff pane — chunk E");
-        if let Some(node) = self.app.graph.node(&self.app.focus) {
-            ui.label(format!("Node: {}", node.display_name));
-            for file in &node.files {
-                ui.label(file.path.display().to_string());
+    /// [`Screen::Diff`]: the loaded diff pane via [`diff_view::show`], or a
+    /// loading message while [`Cmd::LoadDiff`] is still in flight.
+    fn show_diff(&self, ui: &mut egui::Ui) {
+        match &self.app.diff {
+            Some(diff) => diff_view::show(ui, diff),
+            None => {
+                ui.heading("Loading diff...");
             }
         }
     }
@@ -220,7 +219,7 @@ impl eframe::App for VdiffApp {
             }
             Screen::Diff => {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    self.show_diff_placeholder(ui);
+                    self.show_diff(ui);
                 });
             }
         }
@@ -249,6 +248,7 @@ pub fn egui_key_to_input(key: Key) -> Option<KeyInput> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::repo::FakeRepo;
 
     #[test]
     fn translates_mapped_keys() {
@@ -273,5 +273,101 @@ mod tests {
         for key in [Key::A, Key::Z, Key::Num1, Key::Space, Key::Tab] {
             assert_eq!(egui_key_to_input(key), None, "key={key:?}");
         }
+    }
+
+    /// One node backed by an added file (`new.rs`, no base content) and a
+    /// modified file (`changed.rs`, differs on both sides) -- exercises
+    /// `DiffLoader::load`'s added/modified branches against `FakeRepo`
+    /// without needing a real git checkout.
+    fn graph_and_repo() -> (ProjectGraph, FakeRepo) {
+        use crate::graph::model::{FileRef, GitStatus, ModuleNode};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let node_id = NodeId::from("rust:demo");
+        let node = ModuleNode {
+            id: node_id.clone(),
+            display_name: "demo".to_string(),
+            parent: None,
+            children: vec![],
+            status: GitStatus::Modified,
+            files: vec![
+                FileRef {
+                    path: PathBuf::from("new.rs"),
+                    base_blob: None,
+                    head_blob: Some("h1".to_string()),
+                },
+                FileRef {
+                    path: PathBuf::from("changed.rs"),
+                    base_blob: Some("b2".to_string()),
+                    head_blob: Some("h2".to_string()),
+                },
+            ],
+        };
+        let mut nodes = HashMap::new();
+        nodes.insert(node_id.clone(), node);
+        let graph = ProjectGraph {
+            nodes,
+            roots: vec![node_id],
+            edges: vec![],
+        };
+
+        let mut base_files = HashMap::new();
+        base_files.insert(PathBuf::from("changed.rs"), "before\n".to_string());
+        let mut head_files = HashMap::new();
+        head_files.insert(PathBuf::from("new.rs"), "brand new\n".to_string());
+        head_files.insert(PathBuf::from("changed.rs"), "after\n".to_string());
+
+        let repo = FakeRepo {
+            default_base_oid: "base-oid".to_string(),
+            deltas: vec![],
+            base_files,
+            head_files,
+            tracked_files: vec![],
+        };
+        (graph, repo)
+    }
+
+    #[test]
+    fn diff_loader_loads_every_file_with_correct_sides() {
+        let (graph, repo) = graph_and_repo();
+        let loader = DiffLoader {
+            repo: Box::new(repo) as Box<dyn GitRepo>,
+            base_oid: "base-oid".to_string(),
+        };
+
+        let state = loader.load(&graph, &NodeId::from("rust:demo")).unwrap();
+        assert_eq!(state.node, NodeId::from("rust:demo"));
+        assert_eq!(state.files.len(), 2);
+
+        let new_file = state
+            .files
+            .iter()
+            .find(|f| f.path.to_str() == Some("new.rs"))
+            .unwrap();
+        assert!(
+            new_file.diff.base_lines.is_empty(),
+            "added file has empty base"
+        );
+        assert_eq!(new_file.diff.head_lines, vec!["brand new"]);
+
+        let changed_file = state
+            .files
+            .iter()
+            .find(|f| f.path.to_str() == Some("changed.rs"))
+            .unwrap();
+        assert_eq!(changed_file.diff.base_lines, vec!["before"]);
+        assert_eq!(changed_file.diff.head_lines, vec!["after"]);
+        assert_eq!(changed_file.diff.hunks.len(), 1);
+    }
+
+    #[test]
+    fn diff_loader_errors_on_unknown_node() {
+        let (graph, repo) = graph_and_repo();
+        let loader = DiffLoader {
+            repo: Box::new(repo) as Box<dyn GitRepo>,
+            base_oid: "base-oid".to_string(),
+        };
+        assert!(loader.load(&graph, &NodeId::from("nope")).is_err());
     }
 }
