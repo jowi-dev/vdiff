@@ -27,6 +27,11 @@ pub struct Cli {
     /// Dump the project graph instead of launching the GUI.
     #[arg(long, value_enum)]
     pub dump: Option<DumpFormat>,
+    /// Include per-node diff content in `--dump json` output (the
+    /// AI-review payload). Requires `--dump json`; a `--dump text` run with
+    /// this flag set is a friendly CLI error, not a silent no-op.
+    #[arg(long, requires = "dump")]
+    pub include_diffs: bool,
     /// Startup self-test: open the GUI window, then close it after a couple
     /// seconds and exit 0. Used to sanity-check that the window opens
     /// without hanging around for a human to close it manually.

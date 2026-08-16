@@ -2,8 +2,19 @@
 //! over two whole-file strings and produces context-collapsed [`DiffHunk`]s
 //! of [`LinePair`]s the diff pane renders directly. Pure -- no I/O, no
 //! egui/git2 dependency.
+//!
+//! [`FileDiff`]/[`DiffHunk`]/[`LinePair`] all derive `serde`: this is a
+//! stable machine contract, since [`FileDiffEntry`] (a [`FileDiff`] plus its
+//! path) is what `--dump json --include-diffs` serializes under its
+//! `diffs` map (see [`crate::cli::dump`]). [`LinePair`] uses serde's default
+//! externally-tagged enum representation, e.g.
+//! `{"Unchanged": {"base": 0, "head": 0}}` or `{"Added": {"head": 3}}` --
+//! keep that shape in mind before renaming any variant or field.
+
+use std::path::PathBuf;
 
 use imara_diff::{Algorithm, Diff, InternedInput};
+use serde::{Deserialize, Serialize};
 
 /// How many unchanged lines of context to keep on each side of a change
 /// run. Two change runs separated by more than `2 * CONTEXT` unchanged
@@ -13,7 +24,7 @@ const CONTEXT: usize = 3;
 /// One line's relationship between the base and head versions of a file.
 /// Indices are 0-based positions into [`FileDiff::base_lines`]/
 /// [`FileDiff::head_lines`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LinePair {
     /// Identical on both sides.
     Unchanged { base: u32, head: u32 },
@@ -30,7 +41,7 @@ pub enum LinePair {
 
 /// A run of [`LinePair`]s: the changed lines plus up to `CONTEXT`
 /// unchanged lines of surrounding context.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct DiffHunk {
     pub lines: Vec<LinePair>,
 }
@@ -38,11 +49,33 @@ pub struct DiffHunk {
 /// A whole file's diff: every hunk, plus every line of both sides so the
 /// view layer can render Unchanged/context rows and syntax-highlight
 /// content by index.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct FileDiff {
     pub hunks: Vec<DiffHunk>,
     pub base_lines: Vec<String>,
     pub head_lines: Vec<String>,
+}
+
+/// A [`FileDiff`] plus the path it belongs to -- one entry in `--dump json
+/// --include-diffs`'s `diffs` map (see [`crate::cli::dump`] and
+/// [`crate::pipeline::file_diff::diffs_for_graph`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDiffEntry {
+    pub path: PathBuf,
+    pub hunks: Vec<DiffHunk>,
+    pub base_lines: Vec<String>,
+    pub head_lines: Vec<String>,
+}
+
+impl FileDiffEntry {
+    pub fn new(path: PathBuf, diff: FileDiff) -> Self {
+        Self {
+            path,
+            hunks: diff.hunks,
+            base_lines: diff.base_lines,
+            head_lines: diff.head_lines,
+        }
+    }
 }
 
 /// Diff `base` against `head` line-by-line, returning context-collapsed

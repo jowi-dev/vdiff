@@ -1,12 +1,50 @@
 //! Render a [`ProjectGraph`] as `--dump json`/`--dump text`.
+//!
+//! `--dump json`'s top-level shape is `{ "graph": ProjectGraph }`; with
+//! `--include-diffs`, a sibling `"diffs"` key appears:
+//! `{ "graph": ProjectGraph, "diffs": { "<node id>": [FileDiffEntry, ...] } }`.
+//! `diffs` is a map from a node's stringified [`NodeId`] to that node's
+//! [`FileDiffEntry`] list (see [`crate::pipeline::file_diff::diffs_for_graph`]
+//! for how it's computed); nodes with no changes are simply absent from the
+//! map, not present with an empty list. Without `--include-diffs`, the
+//! `"diffs"` key is entirely absent (not `null`) -- this is the stable
+//! machine contract for the AI-review payload, so keep both shapes (with
+//! and without diffs) in mind before changing field names here or on
+//! [`crate::diffing::hunks::FileDiff`]/[`crate::diffing::hunks::DiffHunk`]/
+//! [`crate::diffing::hunks::LinePair`].
+//!
+//! `--dump text` always stays graph-only; it never renders diff content.
+
+use std::collections::HashMap;
+
+use serde::Serialize;
 
 use crate::cli::DumpFormat;
+use crate::diffing::hunks::FileDiffEntry;
 use crate::graph::model::{GitStatus, NodeId, ProjectGraph};
 
-/// Render `graph` per `format`.
-pub fn render(graph: &ProjectGraph, format: DumpFormat) -> String {
+/// The `--dump json` top-level envelope. See the module docs for the exact
+/// shape with and without `--include-diffs`.
+#[derive(Serialize)]
+struct DumpEnvelope<'a> {
+    graph: &'a ProjectGraph,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diffs: Option<&'a HashMap<String, Vec<FileDiffEntry>>>,
+}
+
+/// Render `graph` per `format`. `diffs`, if given, is only used for
+/// [`DumpFormat::Json`] -- [`DumpFormat::Text`] ignores it and stays
+/// graph-only.
+pub fn render(
+    graph: &ProjectGraph,
+    format: DumpFormat,
+    diffs: Option<&HashMap<String, Vec<FileDiffEntry>>>,
+) -> String {
     match format {
-        DumpFormat::Json => serde_json::to_string_pretty(graph).expect("ProjectGraph serializes"),
+        DumpFormat::Json => {
+            let envelope = DumpEnvelope { graph, diffs };
+            serde_json::to_string_pretty(&envelope).expect("DumpEnvelope serializes")
+        }
         DumpFormat::Text => render_text(graph),
     }
 }
@@ -113,15 +151,53 @@ mod tests {
 
     #[test]
     fn text_renders_indented_status_letters_in_name_sorted_order() {
-        let output = render(&fixture(), DumpFormat::Text);
+        let output = render(&fixture(), DumpFormat::Text, None);
         assert_eq!(output, "M app\n  A alpha\n  D zeta");
     }
 
+    /// Top-level JSON shape without `--include-diffs`: `{ "graph": ... }`,
+    /// with no `"diffs"` key at all (not `null`).
     #[test]
-    fn json_round_trips_through_project_graph() {
+    fn json_envelope_without_diffs_has_only_a_graph_key() {
         let graph = fixture();
-        let output = render(&graph, DumpFormat::Json);
-        let parsed: ProjectGraph = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed, graph);
+        let output = render(&graph, DumpFormat::Json, None);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.keys().collect::<Vec<_>>(), vec!["graph"]);
+
+        let parsed_graph: ProjectGraph = serde_json::from_value(obj["graph"].clone()).unwrap();
+        assert_eq!(parsed_graph, graph);
+    }
+
+    /// With `--include-diffs`, the envelope gains a `"diffs"` map keyed by
+    /// stringified node id.
+    #[test]
+    fn json_envelope_with_diffs_includes_the_diffs_map() {
+        use crate::diffing::hunks::{DiffHunk, FileDiffEntry, LinePair};
+        use std::path::PathBuf;
+
+        let graph = fixture();
+        let mut diffs = HashMap::new();
+        diffs.insert(
+            "app::alpha".to_string(),
+            vec![FileDiffEntry {
+                path: PathBuf::from("src/alpha.rs"),
+                hunks: vec![DiffHunk {
+                    lines: vec![LinePair::Added { head: 0 }],
+                }],
+                base_lines: vec![],
+                head_lines: vec!["new line".to_string()],
+            }],
+        );
+
+        let output = render(&graph, DumpFormat::Json, Some(&diffs));
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert!(obj.contains_key("diffs"));
+        assert!(obj["diffs"].get("app::alpha").is_some());
+        assert!(
+            obj["diffs"].get("app::zeta").is_none(),
+            "node with no scripted diff entry must be absent from the map"
+        );
     }
 }

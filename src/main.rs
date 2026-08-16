@@ -48,12 +48,39 @@ fn main() -> ExitCode {
     };
 
     match cli.dump {
-        Some(format) => {
-            println!("{}", cli::render(&graph, format));
-            ExitCode::SUCCESS
-        }
+        Some(format) => dump(&graph, format, cli.include_diffs, repo.as_ref(), &base_oid),
         None => run_gui(graph, &repo_path, cli.smoke, DiffLoader { repo, base_oid }),
     }
+}
+
+/// `--dump <format>`: render `graph`, computing the `--include-diffs`
+/// payload first if requested. `--include-diffs` with `--dump text` is a
+/// friendly CLI error (clap's `requires = "dump"` only guarantees `--dump`
+/// was given at all, not which format) rather than a silent no-op.
+fn dump(
+    graph: &ProjectGraph,
+    format: cli::DumpFormat,
+    include_diffs: bool,
+    repo: &dyn GitRepo,
+    base_oid: &str,
+) -> ExitCode {
+    if include_diffs && format != cli::DumpFormat::Json {
+        eprintln!("error: --include-diffs requires --dump json");
+        return ExitCode::FAILURE;
+    }
+    let diffs = if include_diffs {
+        match vdiff::pipeline::file_diff::diffs_for_graph(repo, base_oid, graph) {
+            Ok(diffs) => Some(diffs),
+            Err(err) => {
+                eprintln!("error computing diffs: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    println!("{}", cli::render(graph, format, diffs.as_ref()));
+    ExitCode::SUCCESS
 }
 
 /// Open the eframe window on `graph`, titled after `repo_path`'s directory

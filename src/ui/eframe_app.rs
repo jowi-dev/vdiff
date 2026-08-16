@@ -11,10 +11,10 @@ use egui::{Align2, Context, Key};
 
 use crate::core::app::{update, App, Cmd, Msg, Screen};
 use crate::core::diff_state::{DiffPaneState, FileEntry};
-use crate::diffing::hunks::diff_file;
 use crate::graph::layout::LayoutResult;
 use crate::graph::model::{NodeId, ProjectGraph};
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome};
+use crate::pipeline::file_diff::load_file_diff;
 use crate::pipeline::repo::GitRepo;
 use crate::ui::diff_view;
 use crate::ui::graph_view::{self, Transform};
@@ -43,25 +43,10 @@ impl DiffLoader {
 
         let mut files = Vec::with_capacity(module.files.len());
         for file_ref in &module.files {
-            let base_content = if file_ref.base_blob.is_some() {
-                self.repo
-                    .base_blob(&self.base_oid, &file_ref.path)
-                    .map_err(|err| err.to_string())?
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let head_content = if file_ref.head_blob.is_some() {
-                self.repo
-                    .head_content(&file_ref.path)
-                    .map_err(|err| err.to_string())?
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
+            let diff = load_file_diff(self.repo.as_ref(), &self.base_oid, file_ref)?;
             files.push(FileEntry {
                 path: file_ref.path.clone(),
-                diff: diff_file(&base_content, &head_content),
+                diff,
             });
         }
 
