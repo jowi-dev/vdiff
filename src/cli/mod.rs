@@ -24,10 +24,14 @@ pub struct Cli {
     /// Diff base ref override (defaults to the detected default branch).
     #[arg(long)]
     pub base: Option<String>,
-    /// Dump the project graph instead of launching the GUI (not yet
-    /// built, so this is required for now).
+    /// Dump the project graph instead of launching the GUI.
     #[arg(long, value_enum)]
     pub dump: Option<DumpFormat>,
+    /// Startup self-test: open the GUI window, then close it after a couple
+    /// seconds and exit 0. Used to sanity-check that the window opens
+    /// without hanging around for a human to close it manually.
+    #[arg(long, hide = true)]
+    pub smoke: bool,
 }
 
 /// `--dump` output format.

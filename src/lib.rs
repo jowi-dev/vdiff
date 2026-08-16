@@ -5,3 +5,4 @@ pub mod core;
 pub mod graph;
 pub mod keymap;
 pub mod pipeline;
+pub mod ui;
