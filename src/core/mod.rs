@@ -1,4 +1,6 @@
-//! Pure application core: focus navigation over a [`crate::graph::model::ProjectGraph`].
-//! No dependencies on egui/git2/syn/tree-sitter -- only `crate::graph` and std.
+//! Pure application core: focus navigation and the Elm-style App/Msg/Cmd
+//! reducer over a [`crate::graph::model::ProjectGraph`]. No dependencies on
+//! egui/git2/syn/tree-sitter -- only `crate::graph` and std.
 
+pub mod app;
 pub mod focus;
