@@ -78,8 +78,9 @@ pub struct ModuleNode {
     pub display_name: String,
     /// Parent node id, `None` for roots.
     pub parent: Option<NodeId>,
-    /// Child node ids, in no particular stored order -- rendering always
-    /// goes through [`ProjectGraph::sorted_children`].
+    /// Child node ids, stored sorted by display name (tie-broken by id) --
+    /// see [`ProjectGraph::sorted_children`], which agrees with this order
+    /// but is a fresh (re-filtered, re-sorted) copy, not a raw field read.
     pub children: Vec<NodeId>,
     /// This node's git status relative to the diff base.
     pub status: GitStatus,
@@ -121,8 +122,8 @@ pub struct DepEdge {
 pub struct ProjectGraph {
     /// Every node, keyed by id.
     pub nodes: HashMap<NodeId, ModuleNode>,
-    /// Top-level node ids (no parent), in no particular stored order -- see
-    /// [`ProjectGraph::sorted_roots`].
+    /// Top-level node ids (no parent), stored sorted by display name
+    /// (tie-broken by id) -- see [`ProjectGraph::sorted_roots`].
     pub roots: Vec<NodeId>,
     /// Every dependency edge in the graph.
     pub edges: Vec<DepEdge>,

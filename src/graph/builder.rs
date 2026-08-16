@@ -223,7 +223,13 @@ fn ensure_ancestors(nodes: &mut HashMap<NodeId, ModuleNode>, start: &NodeId, sep
 }
 
 /// Populate every node's `children` from the reverse of its `parent`, and
-/// return the ids with no parent (the graph's roots).
+/// return the ids with no parent (the graph's roots). Both `children` and
+/// the returned roots are sorted by display name (tie-broken by id) before
+/// returning -- `HashMap` iteration order is otherwise unspecified per
+/// process, which made `--dump json` a non-deterministic machine contract
+/// for identical repo states. [`ProjectGraph::sorted_children`]/
+/// [`ProjectGraph::sorted_roots`] remain available and now simply agree
+/// with this stored order.
 fn link_children_and_collect_roots(nodes: &mut HashMap<NodeId, ModuleNode>) -> Vec<NodeId> {
     let mut roots = Vec::new();
     let child_parent_pairs: Vec<(NodeId, Option<NodeId>)> = nodes
@@ -240,7 +246,26 @@ fn link_children_and_collect_roots(nodes: &mut HashMap<NodeId, ModuleNode>) -> V
             None => roots.push(child),
         }
     }
+
+    let names: HashMap<NodeId, String> = nodes
+        .values()
+        .map(|n| (n.id.clone(), n.display_name.clone()))
+        .collect();
+    for node in nodes.values_mut() {
+        sort_ids_by_name(&names, &mut node.children);
+    }
+    sort_ids_by_name(&names, &mut roots);
     roots
+}
+
+/// Sort `ids` by their looked-up display name, tie-broken by id itself so
+/// the order is fully deterministic even for same-named siblings.
+fn sort_ids_by_name(names: &HashMap<NodeId, String>, ids: &mut [NodeId]) {
+    ids.sort_by(|a, b| {
+        let name_a = names.get(a).map(String::as_str).unwrap_or_default();
+        let name_b = names.get(b).map(String::as_str).unwrap_or_default();
+        name_a.cmp(name_b).then_with(|| a.cmp(b))
+    });
 }
 
 /// Split `id` into its parent id (everything before the last `sep`) and
@@ -696,6 +721,60 @@ mod tests {
                 .unwrap()
                 .status,
             GitStatus::Modified
+        );
+    }
+
+    #[test]
+    fn stored_children_and_roots_are_sorted_by_display_name() {
+        // Insertion order here (zeta, mid, alpha for crate_a's children;
+        // zzz_crate then crate_a for the roots) is deliberately not
+        // name-sorted, so this only passes if `build` itself sorts
+        // `children`/`roots` rather than relying on HashMap iteration
+        // order, which is what made `--dump json` output
+        // non-deterministic between runs of the same repo state.
+        let files = vec![
+            FileInput {
+                file_ref: file_ref("crate_a/src/lib.rs"),
+                lang: Lang::Rust,
+                defs: vec![module("", vec![])],
+            },
+            FileInput {
+                file_ref: file_ref("crate_a/src/zeta.rs"),
+                lang: Lang::Rust,
+                defs: vec![module("", vec![])],
+            },
+            FileInput {
+                file_ref: file_ref("crate_a/src/mid.rs"),
+                lang: Lang::Rust,
+                defs: vec![module("", vec![])],
+            },
+            FileInput {
+                file_ref: file_ref("crate_a/src/alpha.rs"),
+                lang: Lang::Rust,
+                defs: vec![module("", vec![])],
+            },
+            FileInput {
+                file_ref: file_ref("zzz_crate/src/lib.rs"),
+                lang: Lang::Rust,
+                defs: vec![module("", vec![])],
+            },
+        ];
+        let graph = build(files, &changes(vec![]));
+
+        let crate_a = graph.node(&NodeId::from("rust:crate_a")).unwrap();
+        assert_eq!(
+            crate_a.children,
+            vec![
+                NodeId::from("rust:crate_a::alpha"),
+                NodeId::from("rust:crate_a::mid"),
+                NodeId::from("rust:crate_a::zeta"),
+            ],
+            "stored children order must already be display-name order"
+        );
+        assert_eq!(
+            graph.roots,
+            vec![NodeId::from("rust:crate_a"), NodeId::from("rust:zzz_crate"),],
+            "stored roots order must already be display-name order"
         );
     }
 }
