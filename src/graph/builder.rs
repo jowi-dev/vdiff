@@ -177,12 +177,18 @@ fn insert_real_node(
     );
 }
 
-/// Combine two statuses observed for the same node: modified beats
-/// deleted beats added beats unchanged.
+/// Combine two statuses observed for the same node: Modified beats
+/// everything else. A node that's both Deleted and Added -- e.g. a moved
+/// module whose git rename detection missed, reported as a Deleted
+/// old-location file plus an Added new-location file both resolving to
+/// the same node id -- exists at both base and head under this id, so
+/// that combination is itself Modified, not Deleted. Otherwise Deleted
+/// beats Added beats Unchanged.
 fn combine_status(a: GitStatus, b: GitStatus) -> GitStatus {
     use GitStatus::{Added, Deleted, Modified, Unchanged};
     match (a, b) {
         (Modified, _) | (_, Modified) => Modified,
+        (Deleted, Added) | (Added, Deleted) => Modified,
         (Deleted, _) | (_, Deleted) => Deleted,
         (Added, _) | (_, Added) => Added,
         (Unchanged, Unchanged) => Unchanged,
@@ -650,6 +656,46 @@ mod tests {
                 .unwrap()
                 .status,
             GitStatus::Deleted
+        );
+    }
+
+    #[test]
+    fn module_moved_without_rename_detection_is_modified_not_deleted() {
+        // Rename detection missed a heavily-edited move: git reports it as
+        // a Deleted old-location file plus an Added new-location file, but
+        // both land on the same node id (crate_a::foo, whether split from
+        // foo.rs or foo/mod.rs). The module still exists at HEAD, so the
+        // combined status must be Modified, not Deleted.
+        let files = vec![
+            FileInput {
+                file_ref: file_ref("crate_a/src/foo.rs"),
+                lang: Lang::Rust,
+                defs: vec![module("", vec![])],
+            },
+            FileInput {
+                file_ref: file_ref("crate_a/src/foo/mod.rs"),
+                lang: Lang::Rust,
+                defs: vec![module("", vec![])],
+            },
+        ];
+        let deltas = vec![
+            FileDelta {
+                path: PathBuf::from("crate_a/src/foo.rs"),
+                change: Change::Deleted,
+            },
+            FileDelta {
+                path: PathBuf::from("crate_a/src/foo/mod.rs"),
+                change: Change::Added,
+            },
+        ];
+        let graph = build(files, &changes(deltas));
+
+        assert_eq!(
+            graph
+                .node(&NodeId::from("rust:crate_a::foo"))
+                .unwrap()
+                .status,
+            GitStatus::Modified
         );
     }
 }
