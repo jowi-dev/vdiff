@@ -5,4 +5,5 @@
 
 pub mod changed_files;
 pub mod error;
+pub mod extract;
 pub mod repo;
