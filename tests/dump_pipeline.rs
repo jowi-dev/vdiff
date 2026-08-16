@@ -206,6 +206,52 @@ fn added_binary_file_does_not_crash_build_graph() {
     assert_eq!(logo.status, GitStatus::Added);
 }
 
+/// A crate directory named `backend/` whose `Cargo.toml` declares
+/// `name = "myapi"` must produce NodeIds under `rust:myapi::...`, not
+/// `rust:backend::...` -- the directory name is only a fallback for crates
+/// with no discoverable `Cargo.toml`.
+#[test]
+fn rust_crate_name_comes_from_cargo_toml_package_name() {
+    let tmp = TempDir::new().expect("create tempdir");
+    let dir = tmp.path();
+
+    git(dir, &["init", "-b", "main"]);
+    write(
+        dir,
+        "backend/Cargo.toml",
+        "[package]\nname = \"myapi\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(dir, "backend/src/lib.rs", "mod foo;\n");
+    write(dir, "backend/src/foo.rs", "pub fn helper() {}\n");
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-m", "initial"]);
+
+    git(dir, &["checkout", "-b", "feature"]);
+    write(
+        dir,
+        "backend/src/foo.rs",
+        "pub fn helper() {}\npub fn other() {}\n",
+    );
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-m", "touch foo"]);
+
+    let graph = dump_json(dir, None);
+
+    assert!(
+        graph.node(&NodeId::from("rust:myapi::foo")).is_some(),
+        "expected rust:myapi::foo, got nodes {:?}",
+        graph.nodes.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        graph.node(&NodeId::from("rust:backend::foo")).is_none(),
+        "directory name must not be used once Cargo.toml names the crate"
+    );
+    assert_eq!(
+        graph.node(&NodeId::from("rust:myapi::foo")).unwrap().status,
+        GitStatus::Modified
+    );
+}
+
 /// A branch that `git mv`s a file to a new path plus a small content edit
 /// (so it isn't a byte-for-byte rename) must be picked up by git2's
 /// `find_similar` as a genuine rename: `changed_files` reports one

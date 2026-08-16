@@ -29,7 +29,7 @@
 //! fills in a gap, never overwrites.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::graph::model::{FileRef, GitStatus, ModuleNode, NodeId, ProjectGraph};
 use crate::pipeline::changed_files::ChangeSet;
@@ -86,8 +86,17 @@ impl Sep {
 }
 
 /// Build a [`ProjectGraph`] from every extracted file plus the diff's
-/// [`ChangeSet`].
-pub fn build(files: Vec<FileInput>, changes: &ChangeSet) -> ProjectGraph {
+/// [`ChangeSet`]. `crate_names` maps a Rust crate's root directory (see
+/// [`rust_crate_root_dir`]) to its `Cargo.toml`-declared name; a root
+/// directory absent from the map falls back to the directory heuristic
+/// (see [`rust_crate_and_prefix`]). Resolving `crate_names` is the
+/// pipeline layer's job (it needs [`crate::pipeline::repo::GitRepo`]
+/// access) -- this function stays pure, doing no I/O of its own.
+pub fn build(
+    files: Vec<FileInput>,
+    changes: &ChangeSet,
+    crate_names: &HashMap<PathBuf, String>,
+) -> ProjectGraph {
     let mut nodes: HashMap<NodeId, ModuleNode> = HashMap::new();
     let mut ancestor_work: Vec<(NodeId, Sep)> = Vec::new();
     let mut contexts: Vec<NodeContext> = Vec::new();
@@ -96,7 +105,8 @@ pub fn build(files: Vec<FileInput>, changes: &ChangeSet) -> ProjectGraph {
         let status = changes.status_for(&file.file_ref.path);
         match file.lang {
             Lang::Rust => {
-                let (crate_name, file_prefix) = rust_crate_and_prefix(&file.file_ref.path);
+                let (crate_name, file_prefix) =
+                    rust_crate_and_prefix(&file.file_ref.path, crate_names);
                 for def in file.defs {
                     let full_path = join_segments(&file_prefix, &def.name, "::");
                     let id = rust_node_id(&crate_name, &full_path);
@@ -316,13 +326,14 @@ fn other_node_id(path: &Path) -> NodeId {
     NodeId::from(format!("file:{}", path_to_id(path)))
 }
 
-/// Best-effort (crate_name, module_path_prefix) for a Rust source file's
-/// repo-relative path. The crate root is the directory containing this
-/// file's `src/` component; falls back to the literal crate name
-/// `"crate"` if no `src/` component is found at all (e.g. a single-crate
-/// repo laid out without an enclosing crate directory) -- a known,
-/// documented limitation rather than a Cargo.toml-driven lookup.
-fn rust_crate_and_prefix(path: &Path) -> (String, String) {
+/// (crate_name, module_path_prefix) for a Rust source file's repo-relative
+/// path. `crate_names` (see [`build`]) is consulted first, keyed by
+/// [`rust_crate_root_dir`]; a root directory absent from the map falls back
+/// to the directory heuristic -- the directory containing this file's
+/// `src/` component, or the literal crate name `"crate"` if no `src/`
+/// component is found at all (e.g. a single-crate repo laid out without an
+/// enclosing crate directory).
+fn rust_crate_and_prefix(path: &Path, crate_names: &HashMap<PathBuf, String>) -> (String, String) {
     let components: Vec<&str> = path
         .components()
         .filter_map(|c| c.as_os_str().to_str())
@@ -330,13 +341,32 @@ fn rust_crate_and_prefix(path: &Path) -> (String, String) {
     let Some(src_index) = components.iter().position(|c| *c == "src") else {
         return ("crate".to_string(), String::new());
     };
-    let crate_name = if src_index == 0 {
+    let dir_name = if src_index == 0 {
         "crate".to_string()
     } else {
         components[src_index - 1].to_string()
     };
+    let root_dir = rust_crate_root_dir(path);
+    let crate_name = crate_names.get(&root_dir).cloned().unwrap_or(dir_name);
     let prefix = module_path_from_components(&components[src_index + 1..]);
     (crate_name, prefix)
+}
+
+/// The directory containing `path`'s `src/` component (empty path if `src/`
+/// sits at the repo root, e.g. `src/lib.rs` with no crate directory of its
+/// own), or empty if `path` has no `src/` component at all. This is the key
+/// [`build`]'s `crate_names` map is keyed by, and the directory the
+/// pipeline layer looks for a `Cargo.toml` above (see
+/// [`crate::pipeline::crate_names::crate_name_for`]).
+pub fn rust_crate_root_dir(path: &Path) -> PathBuf {
+    let components: Vec<&str> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    match components.iter().position(|c| *c == "src") {
+        Some(src_index) => components[..src_index].iter().collect(),
+        None => PathBuf::new(),
+    }
 }
 
 /// `["foo", "bar.rs"]` -> `"foo::bar"`; `["lib.rs"]` -> `""`;
@@ -399,24 +429,69 @@ mod tests {
     #[test]
     fn rust_crate_and_prefix_covers_layout_variants() {
         assert_eq!(
-            rust_crate_and_prefix(Path::new("crate_a/src/lib.rs")),
+            rust_crate_and_prefix(Path::new("crate_a/src/lib.rs"), &HashMap::new()),
             ("crate_a".to_string(), "".to_string())
         );
         assert_eq!(
-            rust_crate_and_prefix(Path::new("crate_a/src/main.rs")),
+            rust_crate_and_prefix(Path::new("crate_a/src/main.rs"), &HashMap::new()),
             ("crate_a".to_string(), "".to_string())
         );
         assert_eq!(
-            rust_crate_and_prefix(Path::new("crate_a/src/foo.rs")),
+            rust_crate_and_prefix(Path::new("crate_a/src/foo.rs"), &HashMap::new()),
             ("crate_a".to_string(), "foo".to_string())
         );
         assert_eq!(
-            rust_crate_and_prefix(Path::new("crate_a/src/foo/mod.rs")),
+            rust_crate_and_prefix(Path::new("crate_a/src/foo/mod.rs"), &HashMap::new()),
             ("crate_a".to_string(), "foo".to_string())
         );
         assert_eq!(
-            rust_crate_and_prefix(Path::new("crate_a/src/foo/bar.rs")),
+            rust_crate_and_prefix(Path::new("crate_a/src/foo/bar.rs"), &HashMap::new()),
             ("crate_a".to_string(), "foo::bar".to_string())
+        );
+    }
+
+    #[test]
+    fn crate_names_map_overrides_directory_heuristic() {
+        // The directory is named "backend", but a `crate_names` entry keyed
+        // by its `src/`-containing root directory says the real crate name
+        // (from Cargo.toml) is "myapi" -- the resulting NodeIds must use
+        // "myapi", not the directory name.
+        let mut crate_names = HashMap::new();
+        crate_names.insert(PathBuf::from("backend"), "myapi".to_string());
+
+        let files = vec![FileInput {
+            file_ref: file_ref("backend/src/foo.rs"),
+            lang: Lang::Rust,
+            defs: vec![module("", vec![])],
+        }];
+        let graph = build(files, &changes(vec![]), &crate_names);
+
+        assert!(graph.nodes.contains_key(&NodeId::from("rust:myapi::foo")));
+        assert!(!graph.nodes.contains_key(&NodeId::from("rust:backend::foo")));
+    }
+
+    #[test]
+    fn crate_names_map_absent_falls_back_to_directory_name() {
+        let files = vec![FileInput {
+            file_ref: file_ref("backend/src/lib.rs"),
+            lang: Lang::Rust,
+            defs: vec![module("", vec![])],
+        }];
+        let graph = build(files, &changes(vec![]), &HashMap::new());
+
+        assert!(graph.nodes.contains_key(&NodeId::from("rust:backend")));
+    }
+
+    #[test]
+    fn rust_crate_root_dir_covers_layout_variants() {
+        assert_eq!(
+            rust_crate_root_dir(Path::new("backend/src/foo/bar.rs")),
+            PathBuf::from("backend")
+        );
+        assert_eq!(rust_crate_root_dir(Path::new("src/lib.rs")), PathBuf::new());
+        assert_eq!(
+            rust_crate_root_dir(Path::new("no_src_here.rs")),
+            PathBuf::new()
         );
     }
 
@@ -434,7 +509,7 @@ mod tests {
                 defs: vec![module("", vec![])],
             },
         ];
-        let graph = build(files, &changes(vec![]));
+        let graph = build(files, &changes(vec![]), &HashMap::new());
 
         assert!(graph.nodes.contains_key(&NodeId::from("rust:crate_a")));
         assert!(graph.nodes.contains_key(&NodeId::from("rust:crate_a::foo")));
@@ -461,7 +536,7 @@ mod tests {
             lang: Lang::Rust,
             defs: vec![module("", vec![])],
         }];
-        let graph = build(files, &changes(vec![]));
+        let graph = build(files, &changes(vec![]), &HashMap::new());
 
         let root = graph
             .node(&NodeId::from("rust:crate_a"))
@@ -499,7 +574,7 @@ mod tests {
                 defs: vec![module("MyApp.Repo", vec![])],
             },
         ];
-        let graph = build(files, &changes(vec![]));
+        let graph = build(files, &changes(vec![]), &HashMap::new());
 
         // "MyApp" is referenced by both dotted names but never itself
         // `defmodule`d -- it must be synthesized.
@@ -535,7 +610,7 @@ mod tests {
             path: PathBuf::from("lib/my_app.ex"),
             change: Change::Modified,
         }];
-        let graph = build(files, &changes(deltas));
+        let graph = build(files, &changes(deltas), &HashMap::new());
 
         let my_app = graph.node(&NodeId::from("elixir:MyApp")).unwrap();
         assert_eq!(
@@ -560,7 +635,7 @@ mod tests {
                 defs: vec![module("", vec![])],
             },
         ];
-        let graph = build(files, &changes(vec![]));
+        let graph = build(files, &changes(vec![]), &HashMap::new());
 
         let docs = graph
             .node(&NodeId::from("file:docs"))
@@ -614,7 +689,7 @@ mod tests {
                 change: Change::Added,
             },
         ];
-        let graph = build(files, &changes(deltas));
+        let graph = build(files, &changes(deltas), &HashMap::new());
 
         let rust_node = graph
             .node(&NodeId::from("rust:Foo"))
@@ -662,7 +737,7 @@ mod tests {
                 change: Change::Deleted,
             },
         ];
-        let graph = build(files, &changes(deltas));
+        let graph = build(files, &changes(deltas), &HashMap::new());
 
         assert_eq!(
             graph.node(&NodeId::from("rust:crate_a")).unwrap().status,
@@ -713,7 +788,7 @@ mod tests {
                 change: Change::Added,
             },
         ];
-        let graph = build(files, &changes(deltas));
+        let graph = build(files, &changes(deltas), &HashMap::new());
 
         assert_eq!(
             graph
@@ -759,7 +834,7 @@ mod tests {
                 defs: vec![module("", vec![])],
             },
         ];
-        let graph = build(files, &changes(vec![]));
+        let graph = build(files, &changes(vec![]), &HashMap::new());
 
         let crate_a = graph.node(&NodeId::from("rust:crate_a")).unwrap();
         assert_eq!(

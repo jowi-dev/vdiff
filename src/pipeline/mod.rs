@@ -2,18 +2,20 @@
 //! together turn a repository into a [`crate::graph::model::ProjectGraph`].
 
 pub mod changed_files;
+pub mod crate_names;
 pub mod error;
 pub mod extract;
 pub mod git2_repo;
 pub mod repo;
 pub mod resolve;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::graph::builder::{self, FileInput, Lang};
+use crate::graph::builder::{self, rust_crate_root_dir, FileInput, Lang};
 use crate::graph::model::{FileRef, GitStatus, ProjectGraph};
 use crate::pipeline::changed_files::ChangeSet;
+use crate::pipeline::crate_names::crate_name_for;
 use crate::pipeline::error::Result;
 use crate::pipeline::extract::elixir_extract::ElixirExtract;
 use crate::pipeline::extract::rust_extract::RustExtract;
@@ -49,12 +51,23 @@ pub fn build_graph(repo: &dyn GitRepo, opts: &PipelineOptions) -> Result<Project
         }
     }
 
+    let mut crate_names: HashMap<PathBuf, String> = HashMap::new();
+    let mut crate_roots_seen: HashSet<PathBuf> = HashSet::new();
+
     let mut files = Vec::new();
     for path in paths {
         let status = changes.status_for(&path);
         let lang = detect_lang(&path);
         if lang == Lang::Other && status == GitStatus::Unchanged {
             continue;
+        }
+        if lang == Lang::Rust {
+            let root_dir = rust_crate_root_dir(&path);
+            if crate_roots_seen.insert(root_dir.clone()) {
+                if let Some(name) = crate_name_for(repo, &path) {
+                    crate_names.insert(root_dir, name);
+                }
+            }
         }
 
         let Some(content) = load_content(repo, &base_oid, &path, status)? else {
@@ -86,7 +99,7 @@ pub fn build_graph(repo: &dyn GitRepo, opts: &PipelineOptions) -> Result<Project
         });
     }
 
-    Ok(builder::build(files, &changes))
+    Ok(builder::build(files, &changes, &crate_names))
 }
 
 /// Deleted files are read from the diff base; everything else from head.
