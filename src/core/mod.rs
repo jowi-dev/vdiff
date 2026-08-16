@@ -3,4 +3,5 @@
 //! egui/git2/syn/tree-sitter -- only `crate::graph` and std.
 
 pub mod app;
+pub mod diff_state;
 pub mod focus;

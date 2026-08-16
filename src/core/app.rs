@@ -6,6 +6,7 @@
 //! chunk) should perform next; `DiffLoaded`/`LoadFailed` feed its result back
 //! in without `update` ever needing to touch git/egui itself.
 
+pub use crate::core::diff_state::DiffPaneState;
 use crate::core::focus::{dep_targets, dependent_sources, move_focus, Direction};
 use crate::graph::model::{NodeId, ProjectGraph};
 
@@ -29,12 +30,6 @@ pub struct EdgePicker {
     /// Index into `candidates` of the currently highlighted option.
     pub selected: usize,
 }
-
-/// Diff pane state. Empty placeholder in this chunk -- chunk E adds the
-/// real fields (`pub node: NodeId`, hunks, scroll position, etc.) once
-/// `diffing/` exists to produce them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct DiffPaneState {}
 
 /// All state needed to drive vdiff's core: the graph itself, what's
 /// focused, which screen is shown, and any open overlay.
@@ -83,6 +78,24 @@ pub enum Msg {
     CloseDiff,
     /// [`Cmd::LoadDiff`] succeeded.
     DiffLoaded(DiffPaneState),
+    /// Scroll the diff pane's current file by `delta` rows, clamped. Only
+    /// acted on with a loaded diff pane open.
+    DiffScroll(i32),
+    /// `]c`: jump to the next hunk in the current file. Only acted on with
+    /// a loaded diff pane open.
+    DiffNextHunk,
+    /// `[c`: jump to the previous hunk in the current file. Only acted on
+    /// with a loaded diff pane open.
+    DiffPrevHunk,
+    /// `s`: toggle side-by-side/unified rendering. Only acted on with a
+    /// loaded diff pane open.
+    DiffToggleMode,
+    /// `]f`: switch to the next file backing the node, clamped. Only acted
+    /// on with a loaded diff pane open.
+    DiffNextFile,
+    /// `[f`: switch to the previous file backing the node, clamped. Only
+    /// acted on with a loaded diff pane open.
+    DiffPrevFile,
     /// [`Cmd::LoadDiff`] failed; returns to the graph screen. The message is
     /// not stored -- [`App`] has no status/error field yet (can come
     /// later).
@@ -144,6 +157,41 @@ pub fn update(mut app: App, msg: Msg) -> (App, Cmd) {
             app.screen = Screen::Graph;
             (app, Cmd::None)
         }
+        Msg::DiffScroll(delta) => {
+            with_diff_pane(&mut app, |diff| diff.scroll(delta));
+            (app, Cmd::None)
+        }
+        Msg::DiffNextHunk => {
+            with_diff_pane(&mut app, DiffPaneState::next_hunk);
+            (app, Cmd::None)
+        }
+        Msg::DiffPrevHunk => {
+            with_diff_pane(&mut app, DiffPaneState::prev_hunk);
+            (app, Cmd::None)
+        }
+        Msg::DiffToggleMode => {
+            with_diff_pane(&mut app, DiffPaneState::toggle_mode);
+            (app, Cmd::None)
+        }
+        Msg::DiffNextFile => {
+            with_diff_pane(&mut app, |diff| diff.shift_file(1));
+            (app, Cmd::None)
+        }
+        Msg::DiffPrevFile => {
+            with_diff_pane(&mut app, |diff| diff.shift_file(-1));
+            (app, Cmd::None)
+        }
+    }
+}
+
+/// Shared guard for the `Diff*` messages that mutate the open diff pane:
+/// only on [`Screen::Diff`] with a diff pane loaded. A no-op otherwise.
+fn with_diff_pane(app: &mut App, f: impl FnOnce(&mut DiffPaneState)) {
+    if app.screen != Screen::Diff {
+        return;
+    }
+    if let Some(diff) = app.diff.as_mut() {
+        f(diff);
     }
 }
 
@@ -217,6 +265,7 @@ mod tests {
     use super::*;
     use crate::graph::model::{DepEdge, DepKind, GitStatus, ModuleNode};
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     /// `leaf_a`/`leaf_b` are children of `root`; `target_x/y/z` sit
     /// alongside them with no hierarchy relevant to these tests. Edges:
@@ -499,11 +548,39 @@ mod tests {
         assert_eq!(cmd, Cmd::None);
     }
 
+    /// An empty diff pane (no files loaded) for the given node -- enough
+    /// for tests that only care about screen/pane-presence guards.
+    fn empty_diff_pane(node: &str) -> DiffPaneState {
+        DiffPaneState::new(NodeId::from(node), vec![])
+    }
+
+    /// A diff pane with one file of two single-line hunks, for tests that
+    /// exercise scroll/hunk-jump/file-switch transitions.
+    fn loaded_diff_pane(node: &str) -> DiffPaneState {
+        use crate::core::diff_state::FileEntry;
+        use crate::diffing::hunks::{DiffHunk, FileDiff, LinePair};
+
+        let hunk = |base: u32| DiffHunk {
+            lines: vec![LinePair::Unchanged { base, head: base }],
+        };
+        DiffPaneState::new(
+            NodeId::from(node),
+            vec![FileEntry {
+                path: PathBuf::from("f.rs"),
+                diff: FileDiff {
+                    hunks: vec![hunk(0), hunk(1)],
+                    base_lines: vec!["a".to_string(), "b".to_string()],
+                    head_lines: vec!["a".to_string(), "b".to_string()],
+                },
+            }],
+        )
+    }
+
     #[test]
     fn close_diff_returns_to_graph_and_clears_diff_preserving_focus() {
         let mut app = app_at("leaf_a");
         app.screen = Screen::Diff;
-        app.diff = Some(DiffPaneState::default());
+        app.diff = Some(empty_diff_pane("leaf_a"));
         let (app, cmd) = update(app, Msg::CloseDiff);
         assert_eq!(app.screen, Screen::Graph);
         assert!(app.diff.is_none());
@@ -515,8 +592,8 @@ mod tests {
     fn diff_loaded_stores_diff_state() {
         let mut app = app_at("leaf_a");
         app.screen = Screen::Diff;
-        let (app, _) = update(app, Msg::DiffLoaded(DiffPaneState::default()));
-        assert_eq!(app.diff, Some(DiffPaneState::default()));
+        let (app, _) = update(app, Msg::DiffLoaded(empty_diff_pane("leaf_a")));
+        assert_eq!(app.diff, Some(empty_diff_pane("leaf_a")));
     }
 
     #[test]
@@ -526,5 +603,64 @@ mod tests {
         let (app, cmd) = update(app, Msg::LoadFailed("boom".to_string()));
         assert_eq!(app.screen, Screen::Graph);
         assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn diff_scroll_moves_row_on_diff_screen() {
+        let mut app = app_at("leaf_a");
+        app.screen = Screen::Diff;
+        app.diff = Some(loaded_diff_pane("leaf_a"));
+        let (app, cmd) = update(app, Msg::DiffScroll(1));
+        assert_eq!(app.diff.unwrap().scroll_row, 1);
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn diff_scroll_noop_on_graph_screen() {
+        let mut app = app_at("leaf_a");
+        app.diff = Some(loaded_diff_pane("leaf_a"));
+        let (app, _) = update(app, Msg::DiffScroll(1));
+        assert_eq!(app.diff.unwrap().scroll_row, 0, "no-op off Diff screen");
+    }
+
+    #[test]
+    fn diff_scroll_noop_with_no_pane_loaded() {
+        let mut app = app_at("leaf_a");
+        app.screen = Screen::Diff;
+        app.diff = None;
+        let (app, _) = update(app, Msg::DiffScroll(1));
+        assert!(app.diff.is_none());
+    }
+
+    #[test]
+    fn diff_next_hunk_and_prev_hunk_jump_scroll_row() {
+        let mut app = app_at("leaf_a");
+        app.screen = Screen::Diff;
+        app.diff = Some(loaded_diff_pane("leaf_a"));
+        let (app, _) = update(app, Msg::DiffNextHunk);
+        assert_eq!(app.diff.as_ref().unwrap().scroll_row, 1);
+        let (app, _) = update(app, Msg::DiffPrevHunk);
+        assert_eq!(app.diff.unwrap().scroll_row, 0);
+    }
+
+    #[test]
+    fn diff_toggle_mode_flips_mode() {
+        use crate::core::diff_state::DiffMode;
+        let mut app = app_at("leaf_a");
+        app.screen = Screen::Diff;
+        app.diff = Some(loaded_diff_pane("leaf_a"));
+        let (app, _) = update(app, Msg::DiffToggleMode);
+        assert_eq!(app.diff.unwrap().mode, DiffMode::Unified);
+    }
+
+    #[test]
+    fn diff_next_file_and_prev_file_clamp() {
+        let mut app = app_at("leaf_a");
+        app.screen = Screen::Diff;
+        app.diff = Some(loaded_diff_pane("leaf_a"));
+        let (app, _) = update(app, Msg::DiffNextFile);
+        assert_eq!(app.diff.as_ref().unwrap().file_index, 0, "clamped: 1 file");
+        let (app, _) = update(app, Msg::DiffPrevFile);
+        assert_eq!(app.diff.unwrap().file_index, 0);
     }
 }

@@ -2,7 +2,7 @@
 //! event type. `map_key` never touches `App` state directly; the caller
 //! threads `KeyContext` in (current screen, whether a picker is open) and
 //! carries `pending` across calls to implement the two-keystroke `gd`/`gr`
-//! chords.
+//! (graph) and `]c`/`[c`/`]f`/`[f` (diff pane) chords.
 
 use crate::core::app::{Msg, Screen};
 use crate::core::focus::Direction;
@@ -41,8 +41,9 @@ pub struct KeyContext {
 pub enum KeyOutcome {
     /// Dispatch this message.
     Msg(Msg),
-    /// `key` started a chord (currently only `g`); remember it and pass it
-    /// back in as `pending` on the next keypress.
+    /// `key` started a chord (`g` on the graph screen, `]`/`[` on the diff
+    /// screen); remember it and pass it back in as `pending` on the next
+    /// keypress.
     Pending(char),
     /// No mapping for this key in this context.
     None,
@@ -53,14 +54,21 @@ pub enum KeyOutcome {
 /// Precedence:
 /// 1. `ctx.picker_open` -- `j`/`k` move the selection, `Enter` selects,
 ///    `Esc` cancels; everything else is unmapped.
-/// 2. `ctx.pending == Some('g')` -- completes the `gd`/`gr` chord
-///    ([`Msg::FollowDeps`]/[`Msg::FollowDependents`]); any other key clears
-///    the chord with no message.
+/// 2. `ctx.pending` set -- completes a chord started by a previous call:
+///    `gd`/`gr` -> [`Msg::FollowDeps`]/[`Msg::FollowDependents`], `]c`/`[c`
+///    -> [`Msg::DiffNextHunk`]/[`Msg::DiffPrevHunk`], `]f`/`[f` ->
+///    [`Msg::DiffNextFile`]/[`Msg::DiffPrevFile`]; any other completion
+///    clears the chord with no message. Not screen-gated -- only the
+///    keys that start a chord are (see below), matching how [`update`]
+///    itself guards `Diff*` messages to [`Screen::Diff`].
 /// 3. Otherwise, per `ctx.screen`:
 ///    - [`Screen::Graph`]: `h`/`j`/`k`/`l` -> [`Msg::FocusMove`], `Enter` ->
 ///      [`Msg::OpenDiff`], `g` -> [`KeyOutcome::Pending`].
-///    - [`Screen::Diff`]: `Esc` -> [`Msg::CloseDiff`]. Scrolling and
-///      hunk-jumping keys arrive in a later chunk.
+///    - [`Screen::Diff`]: `Esc` -> [`Msg::CloseDiff`], `j`/`k` ->
+///      [`Msg::DiffScroll`], `s` -> [`Msg::DiffToggleMode`], `]`/`[` ->
+///      [`KeyOutcome::Pending`].
+///
+/// [`update`]: crate::core::app::update
 pub fn map_key(key: KeyInput, ctx: KeyContext) -> KeyOutcome {
     if ctx.picker_open {
         return match key {
@@ -76,6 +84,10 @@ pub fn map_key(key: KeyInput, ctx: KeyContext) -> KeyOutcome {
         return match (prefix, key) {
             ('g', KeyInput::Char('d')) => KeyOutcome::Msg(Msg::FollowDeps),
             ('g', KeyInput::Char('r')) => KeyOutcome::Msg(Msg::FollowDependents),
+            (']', KeyInput::Char('c')) => KeyOutcome::Msg(Msg::DiffNextHunk),
+            ('[', KeyInput::Char('c')) => KeyOutcome::Msg(Msg::DiffPrevHunk),
+            (']', KeyInput::Char('f')) => KeyOutcome::Msg(Msg::DiffNextFile),
+            ('[', KeyInput::Char('f')) => KeyOutcome::Msg(Msg::DiffPrevFile),
             _ => KeyOutcome::None,
         };
     }
@@ -92,6 +104,11 @@ pub fn map_key(key: KeyInput, ctx: KeyContext) -> KeyOutcome {
         },
         Screen::Diff => match key {
             KeyInput::Esc => KeyOutcome::Msg(Msg::CloseDiff),
+            KeyInput::Char('j') => KeyOutcome::Msg(Msg::DiffScroll(1)),
+            KeyInput::Char('k') => KeyOutcome::Msg(Msg::DiffScroll(-1)),
+            KeyInput::Char('s') => KeyOutcome::Msg(Msg::DiffToggleMode),
+            KeyInput::Char(']') => KeyOutcome::Pending(']'),
+            KeyInput::Char('[') => KeyOutcome::Pending('['),
             _ => KeyOutcome::None,
         },
     }
@@ -177,9 +194,25 @@ mod tests {
                 KeyOutcome::Msg(Msg::PickerCancel),
             ),
             (KeyInput::Char('h'), picker_ctx(), KeyOutcome::None),
-            // Diff screen: only Esc is mapped.
+            // Diff screen: Esc/j/k/s mapped directly, Enter unmapped.
             (KeyInput::Esc, diff_ctx(), KeyOutcome::Msg(Msg::CloseDiff)),
-            (KeyInput::Char('j'), diff_ctx(), KeyOutcome::None),
+            (
+                KeyInput::Char('j'),
+                diff_ctx(),
+                KeyOutcome::Msg(Msg::DiffScroll(1)),
+            ),
+            (
+                KeyInput::Char('k'),
+                diff_ctx(),
+                KeyOutcome::Msg(Msg::DiffScroll(-1)),
+            ),
+            (
+                KeyInput::Char('s'),
+                diff_ctx(),
+                KeyOutcome::Msg(Msg::DiffToggleMode),
+            ),
+            (KeyInput::Char(']'), diff_ctx(), KeyOutcome::Pending(']')),
+            (KeyInput::Char('['), diff_ctx(), KeyOutcome::Pending('[')),
             (KeyInput::Enter, diff_ctx(), KeyOutcome::None),
         ];
 
@@ -217,6 +250,47 @@ mod tests {
         assert_eq!(map_key(KeyInput::Char('x'), ctx), KeyOutcome::None);
         assert_eq!(map_key(KeyInput::Char('g'), ctx), KeyOutcome::None);
         assert_eq!(map_key(KeyInput::Enter, ctx), KeyOutcome::None);
+        assert_eq!(map_key(KeyInput::Esc, ctx), KeyOutcome::None);
+    }
+
+    #[test]
+    fn bracket_c_chords_jump_hunks() {
+        let mut ctx = diff_ctx();
+        assert_eq!(map_key(KeyInput::Char(']'), ctx), KeyOutcome::Pending(']'));
+        ctx.pending = Some(']');
+        assert_eq!(
+            map_key(KeyInput::Char('c'), ctx),
+            KeyOutcome::Msg(Msg::DiffNextHunk)
+        );
+
+        ctx.pending = Some('[');
+        assert_eq!(
+            map_key(KeyInput::Char('c'), ctx),
+            KeyOutcome::Msg(Msg::DiffPrevHunk)
+        );
+    }
+
+    #[test]
+    fn bracket_f_chords_switch_files() {
+        let mut ctx = diff_ctx();
+        ctx.pending = Some(']');
+        assert_eq!(
+            map_key(KeyInput::Char('f'), ctx),
+            KeyOutcome::Msg(Msg::DiffNextFile)
+        );
+
+        ctx.pending = Some('[');
+        assert_eq!(
+            map_key(KeyInput::Char('f'), ctx),
+            KeyOutcome::Msg(Msg::DiffPrevFile)
+        );
+    }
+
+    #[test]
+    fn bracket_then_anything_else_clears_chord_with_no_message() {
+        let mut ctx = diff_ctx();
+        ctx.pending = Some(']');
+        assert_eq!(map_key(KeyInput::Char('x'), ctx), KeyOutcome::None);
         assert_eq!(map_key(KeyInput::Esc, ctx), KeyOutcome::None);
     }
 

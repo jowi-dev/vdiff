@@ -8,8 +8,9 @@ use vdiff::core::app::{App, Screen};
 use vdiff::graph::layout::layout;
 use vdiff::graph::model::{NodeId, ProjectGraph};
 use vdiff::pipeline::git2_repo::Git2Repo;
+use vdiff::pipeline::repo::GitRepo;
 use vdiff::pipeline::{build_graph, PipelineOptions};
-use vdiff::ui::eframe_app::VdiffApp;
+use vdiff::ui::eframe_app::{DiffLoader, VdiffApp};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -23,10 +24,22 @@ fn main() -> ExitCode {
         }
     };
 
+    // Resolved once up front and reused for both the graph build and the
+    // diff pane's later `Cmd::LoadDiff` lookups, so both agree on the same
+    // base commit for the lifetime of this run.
+    let base_oid = match repo.default_base_oid(cli.base.as_deref()) {
+        Ok(oid) => oid,
+        Err(err) => {
+            eprintln!("error resolving diff base: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let repo: Box<dyn GitRepo> = Box::new(repo);
+
     let opts = PipelineOptions {
         base_override: cli.base,
     };
-    let graph = match build_graph(&repo, &opts) {
+    let graph = match build_graph(repo.as_ref(), &opts) {
         Ok(graph) => graph,
         Err(err) => {
             eprintln!("error building graph: {err}");
@@ -39,14 +52,20 @@ fn main() -> ExitCode {
             println!("{}", cli::render(&graph, format));
             ExitCode::SUCCESS
         }
-        None => run_gui(graph, &repo_path, cli.smoke),
+        None => run_gui(graph, &repo_path, cli.smoke, DiffLoader { repo, base_oid }),
     }
 }
 
 /// Open the eframe window on `graph`, titled after `repo_path`'s directory
 /// name. `smoke` closes the window after a couple seconds instead of
 /// waiting for the user, for headless-ish startup verification.
-fn run_gui(graph: ProjectGraph, repo_path: &Path, smoke: bool) -> ExitCode {
+/// `diff_loader` backs `Cmd::LoadDiff` once a node's diff pane is opened.
+fn run_gui(
+    graph: ProjectGraph,
+    repo_path: &Path,
+    smoke: bool,
+    diff_loader: DiffLoader,
+) -> ExitCode {
     let layout_result = layout(&graph);
     let focus = graph
         .sorted_roots()
@@ -66,7 +85,14 @@ fn run_gui(graph: ProjectGraph, repo_path: &Path, smoke: bool) -> ExitCode {
     let result = eframe::run_native(
         &title,
         native_options,
-        Box::new(move |_cc| Ok(Box::new(VdiffApp::new(app, layout_result, smoke)))),
+        Box::new(move |_cc| {
+            Ok(Box::new(VdiffApp::new(
+                app,
+                layout_result,
+                smoke,
+                diff_loader,
+            )))
+        }),
     );
 
     match result {

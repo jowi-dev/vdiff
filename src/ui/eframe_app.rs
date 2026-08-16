@@ -9,13 +9,64 @@ use std::time::{Duration, Instant};
 
 use egui::{Align2, Context, Key};
 
-use crate::core::app::{update, App, Cmd, DiffPaneState, Msg, Screen};
+use crate::core::app::{update, App, Cmd, Msg, Screen};
+use crate::core::diff_state::{DiffPaneState, FileEntry};
+use crate::diffing::hunks::diff_file;
 use crate::graph::layout::LayoutResult;
+use crate::graph::model::{NodeId, ProjectGraph};
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome};
+use crate::pipeline::repo::GitRepo;
 use crate::ui::graph_view::{self, Transform};
 
 /// How long `--smoke` keeps the window open before closing it.
 const SMOKE_DURATION: Duration = Duration::from_secs(2);
+
+/// Everything [`Cmd::LoadDiff`] needs to read file content from git: the
+/// repository and the diff base it was resolved against at startup. Lives
+/// alongside [`VdiffApp`] rather than in `core` -- it's I/O, not state.
+pub struct DiffLoader {
+    pub repo: Box<dyn GitRepo>,
+    pub base_oid: String,
+}
+
+impl DiffLoader {
+    /// Load every file backing `node` in `graph`: base content from
+    /// [`GitRepo::base_blob`] at `self.base_oid` (empty for added files),
+    /// head content from [`GitRepo::head_content`] (empty for deleted
+    /// files), diffed with [`diff_file`]. Errors as a message string,
+    /// matching [`Msg::LoadFailed`]'s shape.
+    fn load(&self, graph: &ProjectGraph, node: &NodeId) -> Result<DiffPaneState, String> {
+        let module = graph
+            .node(node)
+            .ok_or_else(|| format!("node {node} not found in graph"))?;
+
+        let mut files = Vec::with_capacity(module.files.len());
+        for file_ref in &module.files {
+            let base_content = if file_ref.base_blob.is_some() {
+                self.repo
+                    .base_blob(&self.base_oid, &file_ref.path)
+                    .map_err(|err| err.to_string())?
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let head_content = if file_ref.head_blob.is_some() {
+                self.repo
+                    .head_content(&file_ref.path)
+                    .map_err(|err| err.to_string())?
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            files.push(FileEntry {
+                path: file_ref.path.clone(),
+                diff: diff_file(&base_content, &head_content),
+            });
+        }
+
+        Ok(DiffPaneState::new(node.clone(), files))
+    }
+}
 
 /// Owns [`core::App`] and drives it from egui input/paint each frame.
 pub struct VdiffApp {
@@ -25,13 +76,15 @@ pub struct VdiffApp {
     pending_key: Option<char>,
     smoke: bool,
     started_at: Instant,
+    diff_loader: DiffLoader,
 }
 
 impl VdiffApp {
     /// Build a fresh GUI app wrapping an already-constructed [`App`] and its
     /// [`LayoutResult`]. `smoke` enables the self-closing startup self-test
-    /// (see the module-level `--smoke` flag in `main.rs`).
-    pub fn new(app: App, layout: LayoutResult, smoke: bool) -> Self {
+    /// (see the module-level `--smoke` flag in `main.rs`). `diff_loader`
+    /// backs [`Cmd::LoadDiff`].
+    pub fn new(app: App, layout: LayoutResult, smoke: bool, diff_loader: DiffLoader) -> Self {
         Self {
             app,
             layout,
@@ -39,6 +92,7 @@ impl VdiffApp {
             pending_key: None,
             smoke,
             started_at: Instant::now(),
+            diff_loader,
         }
     }
 
@@ -50,13 +104,16 @@ impl VdiffApp {
         self.execute(cmd);
     }
 
-    /// Execute a [`Cmd`]. `LoadDiff` has no real diffing pipeline yet
-    /// (chunk E) -- immediately report an empty [`DiffPaneState`] back
-    /// through the reducer, matching the plan's chunk D placeholder.
+    /// Execute a [`Cmd`]: `LoadDiff` reads file content via `diff_loader`
+    /// and reports the result back through the reducer as `DiffLoaded`/
+    /// `LoadFailed`.
     fn execute(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::None => {}
-            Cmd::LoadDiff(_node) => self.dispatch(Msg::DiffLoaded(DiffPaneState::default())),
+            Cmd::LoadDiff(node) => match self.diff_loader.load(&self.app.graph, &node) {
+                Ok(state) => self.dispatch(Msg::DiffLoaded(state)),
+                Err(message) => self.dispatch(Msg::LoadFailed(message)),
+            },
         }
     }
 
