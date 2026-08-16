@@ -2,3 +2,4 @@
 
 pub mod core;
 pub mod graph;
+pub mod keymap;
