@@ -4,6 +4,7 @@
 //! whole-project name table is [`crate::pipeline::resolve`]'s job, not
 //! this one -- extractors only see one file at a time.
 
+pub mod elixir_extract;
 pub mod rust_extract;
 
 use std::path::Path;
