@@ -68,19 +68,24 @@ impl Transform {
 /// Paint the graph into `ui`'s available space: background, edges, then
 /// node rects parent-before-child (containment gives natural z-order),
 /// leaf/title labels. Handles pan (drag) and zoom (scroll) on the empty
-/// canvas.
+/// canvas, and auto-pans so the focused node stays visible.
 pub fn show(ui: &mut Ui, app: &App, layout: &LayoutResult, transform: &mut Transform) {
     let viewport = ui.max_rect();
     let response = ui.allocate_rect(viewport, Sense::click_and_drag());
 
     handle_pan_zoom(ui, &response, transform);
 
+    if let Some(focus_rect) = layout.rects.get(&app.focus) {
+        let screen_rect = transform.to_screen_rect(*focus_rect);
+        transform.pan(clamp_into_view(screen_rect, response.rect));
+    }
+
     let painter = ui.painter_at(response.rect);
     painter.rect_filled(response.rect, 0.0, theme::CANVAS_BG);
 
     paint_edges(&painter, layout, transform);
     for root in app.graph.sorted_roots() {
-        paint_node(&painter, &app.graph, layout, transform, &root);
+        paint_node(&painter, &app.graph, layout, transform, &root, &app.focus);
     }
 }
 
@@ -101,6 +106,27 @@ fn handle_pan_zoom(ui: &Ui, response: &egui::Response, transform: &mut Transform
     }
 }
 
+/// The offset delta (screen-space) needed to bring `focus_rect` fully
+/// inside `viewport`, with no animation -- zero if it's already visible.
+/// Pure function of plain rect data, unit-tested below.
+pub fn clamp_into_view(focus_rect: EguiRect, viewport: EguiRect) -> Vec2 {
+    let dx = if focus_rect.left() < viewport.left() {
+        viewport.left() - focus_rect.left()
+    } else if focus_rect.right() > viewport.right() {
+        viewport.right() - focus_rect.right()
+    } else {
+        0.0
+    };
+    let dy = if focus_rect.top() < viewport.top() {
+        viewport.top() - focus_rect.top()
+    } else if focus_rect.bottom() > viewport.bottom() {
+        viewport.bottom() - focus_rect.bottom()
+    } else {
+        0.0
+    };
+    Vec2::new(dx, dy)
+}
+
 fn paint_edges(painter: &egui::Painter, layout: &LayoutResult, transform: &Transform) {
     for edge in &layout.edges {
         let p0 = transform.to_screen_pos(edge.points[0]);
@@ -117,6 +143,7 @@ fn paint_node(
     layout: &LayoutResult,
     transform: &Transform,
     id: &NodeId,
+    focus: &NodeId,
 ) {
     let Some(node) = graph.node(id) else {
         return;
@@ -161,8 +188,17 @@ fn paint_node(
             label_color(node.status),
         );
         for child in graph.sorted_children(id) {
-            paint_node(painter, graph, layout, transform, &child);
+            paint_node(painter, graph, layout, transform, &child, focus);
         }
+    }
+
+    if id == focus {
+        painter.rect_stroke(
+            screen_rect,
+            2.0,
+            theme::focus_ring_stroke(),
+            StrokeKind::Inside,
+        );
     }
 }
 
@@ -213,5 +249,28 @@ mod tests {
         let after = t.to_screen_pos(layout_pt);
         assert!((after.x - cursor.x).abs() < 0.001);
         assert!((after.y - cursor.y).abs() < 0.001);
+    }
+
+    #[test]
+    fn clamp_into_view_is_noop_when_already_visible() {
+        let viewport = EguiRect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let focus = EguiRect::from_min_size(Pos2::new(100.0, 100.0), Vec2::new(50.0, 50.0));
+        assert_eq!(clamp_into_view(focus, viewport), Vec2::ZERO);
+    }
+
+    #[test]
+    fn clamp_into_view_pulls_rect_left_of_viewport_back_in() {
+        let viewport = EguiRect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(800.0, 600.0));
+        let focus = EguiRect::from_min_size(Pos2::new(-50.0, 100.0), Vec2::new(50.0, 50.0));
+        let delta = clamp_into_view(focus, viewport);
+        assert_eq!(delta, Vec2::new(50.0, 0.0));
+    }
+
+    #[test]
+    fn clamp_into_view_pulls_rect_right_of_viewport_back_in() {
+        let viewport = EguiRect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(800.0, 600.0));
+        let focus = EguiRect::from_min_size(Pos2::new(780.0, 100.0), Vec2::new(50.0, 50.0));
+        let delta = clamp_into_view(focus, viewport);
+        assert_eq!(delta, Vec2::new(800.0 - 830.0, 0.0));
     }
 }
