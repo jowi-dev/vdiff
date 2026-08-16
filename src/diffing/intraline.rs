@@ -13,7 +13,7 @@ pub struct HighlightSpan {
 }
 
 /// Diff `base_line` against `head_line` at word granularity (see
-/// [`tokenize_ranges`] for the tokenization rule), returning the byte
+/// `tokenize_ranges` for the tokenization rule), returning the byte
 /// spans that changed in each: `(spans in base_line, spans in head_line)`.
 /// A line that's entirely different from its pair comes back as a single
 /// span covering the whole line, since tokenization has no gaps between
@@ -46,7 +46,7 @@ pub fn intraline(base_line: &str, head_line: &str) -> (Vec<HighlightSpan>, Vec<H
 }
 
 /// A thin [`TokenSource`] wrapper over a pre-split `Vec<&str>` of word/
-/// whitespace/punctuation tokens (see [`tokenize_ranges`]), so `imara-diff`
+/// whitespace/punctuation tokens (see `tokenize_ranges`), so `imara-diff`
 /// can run at token granularity instead of its built-in line granularity.
 struct Tokens<'a>(Vec<&'a str>);
 
@@ -63,7 +63,7 @@ impl<'a> TokenSource for Tokens<'a> {
     }
 }
 
-/// Which token class a character belongs to, for [`tokenize_ranges`].
+/// Which token class a character belongs to, for `tokenize_ranges`.
 #[derive(PartialEq, Eq)]
 enum CharClass {
     Word,

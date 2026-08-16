@@ -23,12 +23,12 @@ pub enum LinePair {
     Removed { base: u32 },
     /// A base line paired with a head line it was rewritten into --
     /// synthesized from equal-length runs of removed/added lines (see
-    /// [`pair_lines`]); carries word-level highlights via
+    /// `pair_lines`); carries word-level highlights via
     /// [`crate::diffing::intraline::intraline`] at render time.
     Changed { base: u32, head: u32 },
 }
 
-/// A run of [`LinePair`]s: the changed lines plus up to [`CONTEXT`]
+/// A run of [`LinePair`]s: the changed lines plus up to `CONTEXT`
 /// unchanged lines of surrounding context.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiffHunk {
@@ -143,7 +143,7 @@ fn push_unchanged(
 
 /// Group `lines` into hunks: runs of non-[`LinePair::Unchanged`] lines
 /// separated by more than `2 * CONTEXT` unchanged lines become separate
-/// hunks, each padded with up to [`CONTEXT`] lines of context (clipped to
+/// hunks, each padded with up to `CONTEXT` lines of context (clipped to
 /// the file's bounds); closer runs merge into one hunk. No changes at all
 /// yields no hunks.
 fn collapse_context(lines: Vec<LinePair>) -> Vec<DiffHunk> {
