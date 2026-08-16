@@ -95,14 +95,14 @@ fn dump_json(repo_dir: &Path, base_override: Option<&str>) -> ProjectGraph {
 fn assert_fixture_graph(graph: &ProjectGraph) {
     assert_eq!(
         graph
-            .node(&NodeId::from("MyApp.Accounts"))
+            .node(&NodeId::from("elixir:MyApp.Accounts"))
             .expect("Accounts node")
             .status,
         GitStatus::Modified
     );
     assert_eq!(
         graph
-            .node(&NodeId::from("MyApp.Repo"))
+            .node(&NodeId::from("elixir:MyApp.Repo"))
             .expect("Repo node")
             .status,
         GitStatus::Unchanged,
@@ -110,14 +110,14 @@ fn assert_fixture_graph(graph: &ProjectGraph) {
     );
     assert_eq!(
         graph
-            .node(&NodeId::from("MyApp.Mailer"))
+            .node(&NodeId::from("elixir:MyApp.Mailer"))
             .expect("Mailer node")
             .status,
         GitStatus::Added
     );
 
     let namespace = graph
-        .node(&NodeId::from("MyApp"))
+        .node(&NodeId::from("elixir:MyApp"))
         .expect("synthesized MyApp namespace node");
     assert_eq!(namespace.status, GitStatus::Unchanged);
     assert!(namespace.files.is_empty());
@@ -126,21 +126,21 @@ fn assert_fixture_graph(graph: &ProjectGraph) {
         graph
             .edges
             .iter()
-            .any(|e| e.from == NodeId::from("MyApp.Accounts")
-                && e.to == NodeId::from("MyApp.Repo")
+            .any(|e| e.from == NodeId::from("elixir:MyApp.Accounts")
+                && e.to == NodeId::from("elixir:MyApp.Repo")
                 && e.kind == DepKind::Alias),
         "expected an Alias edge from MyApp.Accounts to MyApp.Repo, got {:?}",
         graph.edges
     );
 
     let backend_foo = graph
-        .node(&NodeId::from("backend::foo"))
+        .node(&NodeId::from("rust:backend::foo"))
         .expect("backend::foo node (read from base blob since deleted)");
     assert_eq!(backend_foo.status, GitStatus::Deleted);
 
     assert_eq!(
         graph
-            .node(&NodeId::from("backend"))
+            .node(&NodeId::from("rust:backend"))
             .expect("backend crate root")
             .status,
         GitStatus::Unchanged,
@@ -148,10 +148,10 @@ fn assert_fixture_graph(graph: &ProjectGraph) {
     );
 
     let readme = graph
-        .node(&NodeId::from("README.md"))
+        .node(&NodeId::from("file:README.md"))
         .expect("README.md node");
     assert_eq!(readme.status, GitStatus::Modified);
-    assert!(graph.roots.contains(&NodeId::from("README.md")));
+    assert!(graph.roots.contains(&NodeId::from("file:README.md")));
 }
 
 #[test]

@@ -10,7 +10,12 @@ use serde::{Deserialize, Serialize};
 
 /// Stable identifier for a [`ModuleNode`], qualified by crate/app so
 /// workspace and umbrella-project nodes never collide (e.g.
-/// `myapp::foo::bar`, `MyApp.Accounts.User`). Serializes as a bare string
+/// `rust:myapp::foo::bar`, `elixir:MyApp.Accounts.User`), and prefixed with
+/// a language namespace (`rust:`, `elixir:`, `file:` for everything else --
+/// see [`crate::graph::builder`] for the full convention) so that a
+/// single-segment Rust crate and an Elixir module of the same name never
+/// collide either. Ids are opaque to consumers; [`ModuleNode::display_name`]
+/// carries the human-readable label. Serializes as a bare string
 /// (`#[serde(transparent)]`), matching the `--dump json` payload shape.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

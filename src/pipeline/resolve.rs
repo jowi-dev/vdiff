@@ -66,13 +66,13 @@ fn resolve_one(
     ctx: &NodeContext,
     dep: &DepRef,
 ) -> Option<NodeId> {
-    let sep = if ctx.rust_crate_name.is_some() {
-        "::"
+    let (sep, lang_prefix) = if ctx.rust_crate_name.is_some() {
+        ("::", "rust:")
     } else {
-        "."
+        (".", "elixir:")
     };
     let candidate = substitute_prefix(nodes, ctx, &dep.name, sep);
-    progressive_match(nodes, &candidate, sep)
+    progressive_match(nodes, &candidate, sep, lang_prefix)
 }
 
 /// Substitute a Rust `crate::`/`self::`/`super::` prefix (or the bare
@@ -88,7 +88,11 @@ fn substitute_prefix(
     let Some(crate_name) = &ctx.rust_crate_name else {
         return raw.to_string();
     };
-    let home = ctx.id.to_string();
+    // `ctx.id`/its parent carry the `rust:` namespace prefix (see
+    // `crate::graph::builder`), but the candidate strings this function
+    // builds are matched against `progressive_match`, which re-adds the
+    // prefix itself -- so it must be stripped here first.
+    let home = strip_rust_prefix(&ctx.id.to_string());
 
     if raw == "crate" {
         return crate_name.clone();
@@ -106,7 +110,7 @@ fn substitute_prefix(
         let parent = nodes
             .get(&ctx.id)
             .and_then(|n| n.parent.clone())
-            .map(|p| p.to_string())
+            .map(|p| strip_rust_prefix(&p.to_string()))
             .unwrap_or_else(|| crate_name.clone());
         return match raw.strip_prefix("super::") {
             Some(rest) => join(&parent, rest, sep),
@@ -114,6 +118,12 @@ fn substitute_prefix(
         };
     }
     raw.to_string()
+}
+
+/// Strip the `rust:` namespace prefix a Rust NodeId's string form carries,
+/// for use as a candidate body in [`substitute_prefix`]/[`progressive_match`].
+fn strip_rust_prefix(id: &str) -> String {
+    id.strip_prefix("rust:").unwrap_or(id).to_string()
 }
 
 fn join(prefix: &str, rest: &str, sep: &str) -> String {
@@ -126,17 +136,21 @@ fn join(prefix: &str, rest: &str, sep: &str) -> String {
 
 /// Match `candidate` against `nodes`, trimming trailing `sep`-separated
 /// segments until a node is found or the candidate is exhausted.
+/// `lang_prefix` (`rust:`/`elixir:`) is prepended to each trimmed candidate
+/// before lookup, since `candidate` itself is an unprefixed path built from
+/// `dep.name`/`crate::`/`self::`/`super::` substitution.
 fn progressive_match(
     nodes: &HashMap<NodeId, ModuleNode>,
     candidate: &str,
     sep: &str,
+    lang_prefix: &str,
 ) -> Option<NodeId> {
     let mut current = candidate;
     loop {
         if current.is_empty() {
             return None;
         }
-        let id = NodeId::from(current.to_string());
+        let id = NodeId::from(format!("{lang_prefix}{current}"));
         if nodes.contains_key(&id) {
             return Some(id);
         }
@@ -177,40 +191,40 @@ mod tests {
     #[test]
     fn resolves_crate_prefixed_path_to_item_owning_module() {
         let nodes = nodes(&[
-            ("myapp", None),
-            ("myapp::pipeline", Some("myapp")),
-            ("myapp::pipeline::repo", Some("myapp::pipeline")),
+            ("rust:myapp", None),
+            ("rust:myapp::pipeline", Some("rust:myapp")),
+            ("rust:myapp::pipeline::repo", Some("rust:myapp::pipeline")),
         ]);
         let ctx = NodeContext {
-            id: NodeId::from("myapp"),
+            id: NodeId::from("rust:myapp"),
             dep_refs: vec![dep("crate::pipeline::repo::GitRepo")],
             rust_crate_name: Some("myapp".to_string()),
         };
         let edges = resolve_edges(&nodes, &[ctx]);
         assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].to, NodeId::from("myapp::pipeline::repo"));
+        assert_eq!(edges[0].to, NodeId::from("rust:myapp::pipeline::repo"));
     }
 
     #[test]
     fn resolves_bare_workspace_crate_path() {
         let nodes = nodes(&[
-            ("other_crate", None),
-            ("other_crate::thing", Some("other_crate")),
+            ("rust:other_crate", None),
+            ("rust:other_crate::thing", Some("rust:other_crate")),
         ]);
         let ctx = NodeContext {
-            id: NodeId::from("myapp"),
+            id: NodeId::from("rust:myapp"),
             dep_refs: vec![dep("other_crate::thing::Item")],
             rust_crate_name: Some("myapp".to_string()),
         };
         let edges = resolve_edges(&nodes, &[ctx]);
-        assert_eq!(edges[0].to, NodeId::from("other_crate::thing"));
+        assert_eq!(edges[0].to, NodeId::from("rust:other_crate::thing"));
     }
 
     #[test]
     fn drops_unresolvable_external_dep() {
-        let nodes = nodes(&[("myapp", None)]);
+        let nodes = nodes(&[("rust:myapp", None)]);
         let ctx = NodeContext {
-            id: NodeId::from("myapp"),
+            id: NodeId::from("rust:myapp"),
             dep_refs: vec![dep("serde::Serialize")],
             rust_crate_name: Some("myapp".to_string()),
         };
@@ -220,29 +234,32 @@ mod tests {
     #[test]
     fn resolves_single_super_relative_to_parent() {
         let nodes = nodes(&[
-            ("myapp", None),
-            ("myapp::foo", Some("myapp")),
-            ("myapp::foo::bar", Some("myapp::foo")),
-            ("myapp::foo::sibling", Some("myapp::foo")),
+            ("rust:myapp", None),
+            ("rust:myapp::foo", Some("rust:myapp")),
+            ("rust:myapp::foo::bar", Some("rust:myapp::foo")),
+            ("rust:myapp::foo::sibling", Some("rust:myapp::foo")),
         ]);
         let ctx = NodeContext {
-            id: NodeId::from("myapp::foo::bar"),
+            id: NodeId::from("rust:myapp::foo::bar"),
             dep_refs: vec![dep("super::sibling")],
             rust_crate_name: Some("myapp".to_string()),
         };
         let edges = resolve_edges(&nodes, &[ctx]);
-        assert_eq!(edges[0].to, NodeId::from("myapp::foo::sibling"));
+        assert_eq!(edges[0].to, NodeId::from("rust:myapp::foo::sibling"));
     }
 
     #[test]
     fn elixir_exact_dotted_match_with_no_prefix_syntax() {
-        let nodes = nodes(&[("MyApp", None), ("MyApp.Repo", Some("MyApp"))]);
+        let nodes = nodes(&[
+            ("elixir:MyApp", None),
+            ("elixir:MyApp.Repo", Some("elixir:MyApp")),
+        ]);
         let ctx = NodeContext {
-            id: NodeId::from("MyApp"),
+            id: NodeId::from("elixir:MyApp"),
             dep_refs: vec![dep("MyApp.Repo")],
             rust_crate_name: None,
         };
         let edges = resolve_edges(&nodes, &[ctx]);
-        assert_eq!(edges[0].to, NodeId::from("MyApp.Repo"));
+        assert_eq!(edges[0].to, NodeId::from("elixir:MyApp.Repo"));
     }
 }

@@ -4,13 +4,21 @@
 //! cross-file dependency edges.
 //!
 //! NodeId conventions:
-//! - Rust: `<crate>::<mod path>`, derived from the file's location (crate
-//!   name = the directory containing `src/`; `lib.rs`/`main.rs` is the
-//!   crate root, `foo.rs`/`foo/mod.rs` is `foo`, `foo/bar.rs` is
+//! - Rust: `rust:<crate>::<mod path>`, derived from the file's location
+//!   (crate name = the directory containing `src/`; `lib.rs`/`main.rs` is
+//!   the crate root, `foo.rs`/`foo/mod.rs` is `foo`, `foo/bar.rs` is
 //!   `foo::bar`) joined with any inline `mod` nesting from extraction.
-//! - Elixir: the module's full dotted name, exactly as `defmodule` wrote
-//!   it.
-//! - Other files: the repo-relative path, forward-slash-joined.
+//! - Elixir: `elixir:<dotted name>`, the module's full dotted name exactly
+//!   as `defmodule` wrote it.
+//! - Other files: `file:<repo-relative path>`, forward-slash-joined.
+//!
+//! Every id carries its language namespace prefix (`rust:`/`elixir:`/
+//! `file:`) so that, e.g., a single-segment Rust crate (`Foo/` with no
+//! nesting) and an Elixir `defmodule Foo` never collide into one node --
+//! ids are opaque to consumers, [`ModuleNode::display_name`] carries the
+//! human-readable label, so the prefix is contract-safe. Every id
+//! construction site (module ids, synthetic ancestors, and edge endpoints
+//! resolved in [`crate::pipeline::resolve`]) must agree on this scheme.
 //!
 //! Hierarchy: a node's parent is everything before its id's last
 //! separator-delimited segment. Any ancestor that isn't itself a real,
@@ -49,7 +57,9 @@ pub struct FileInput {
 
 /// The separator a node id's segments are joined with, and so the rule for
 /// splitting off its last segment (display name) and everything before it
-/// (parent id).
+/// (parent id). Also carries the language namespace prefix every id in
+/// that scheme starts with (see the module-level NodeId conventions
+/// above).
 #[derive(Clone, Copy)]
 enum Sep {
     DoubleColon,
@@ -63,6 +73,14 @@ impl Sep {
             Sep::DoubleColon => "::",
             Sep::Dot => ".",
             Sep::Slash => "/",
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            Sep::DoubleColon => "rust:",
+            Sep::Dot => "elixir:",
+            Sep::Slash => "file:",
         }
     }
 }
@@ -99,7 +117,7 @@ pub fn build(files: Vec<FileInput>, changes: &ChangeSet) -> ProjectGraph {
             }
             Lang::Elixir => {
                 for def in file.defs {
-                    let id = NodeId::from(def.name);
+                    let id = elixir_node_id(&def.name);
                     insert_real_node(&mut nodes, &id, Sep::Dot, status, file.file_ref.clone());
                     ancestor_work.push((id.clone(), Sep::Dot));
                     contexts.push(NodeContext {
@@ -110,7 +128,7 @@ pub fn build(files: Vec<FileInput>, changes: &ChangeSet) -> ProjectGraph {
                 }
             }
             Lang::Other => {
-                let id = NodeId::from(path_to_id(&file.file_ref.path));
+                let id = other_node_id(&file.file_ref.path);
                 insert_real_node(&mut nodes, &id, Sep::Slash, status, file.file_ref.clone());
                 ancestor_work.push((id, Sep::Slash));
             }
@@ -145,7 +163,7 @@ fn insert_real_node(
         existing.status = combine_status(existing.status, status);
         return;
     }
-    let (parent, display_name) = split_parent(&id.to_string(), sep);
+    let (parent, display_name) = split_prefixed_id(&id.to_string(), sep);
     nodes.insert(
         id.clone(),
         ModuleNode {
@@ -182,7 +200,7 @@ fn ensure_ancestors(nodes: &mut HashMap<NodeId, ModuleNode>, start: &NodeId, sep
         if nodes.contains_key(&parent_id) {
             break;
         }
-        let (grandparent, display_name) = split_parent(&parent_id.to_string(), sep);
+        let (grandparent, display_name) = split_prefixed_id(&parent_id.to_string(), sep);
         nodes.insert(
             parent_id.clone(),
             ModuleNode {
@@ -229,6 +247,20 @@ fn split_parent(id: &str, sep: Sep) -> (Option<String>, String) {
     }
 }
 
+/// [`split_parent`], but for a full (already language-prefixed) id: the
+/// prefix is stripped before splitting so it never leaks into
+/// `display_name`, then reattached to the parent id so the whole ancestor
+/// chain stays in the same language namespace.
+fn split_prefixed_id(id: &str, sep: Sep) -> (Option<String>, String) {
+    let prefix = sep.prefix();
+    let body = id.strip_prefix(prefix).unwrap_or(id);
+    let (parent_body, display_name) = split_parent(body, sep);
+    (
+        parent_body.map(|body| format!("{prefix}{body}")),
+        display_name,
+    )
+}
+
 fn join_segments(a: &str, b: &str, sep: &str) -> String {
     match (a.is_empty(), b.is_empty()) {
         (true, _) => b.to_string(),
@@ -239,10 +271,18 @@ fn join_segments(a: &str, b: &str, sep: &str) -> String {
 
 fn rust_node_id(crate_name: &str, full_path: &str) -> NodeId {
     if full_path.is_empty() {
-        NodeId::from(crate_name.to_string())
+        NodeId::from(format!("rust:{crate_name}"))
     } else {
-        NodeId::from(format!("{crate_name}::{full_path}"))
+        NodeId::from(format!("rust:{crate_name}::{full_path}"))
     }
+}
+
+fn elixir_node_id(dotted_name: &str) -> NodeId {
+    NodeId::from(format!("elixir:{dotted_name}"))
+}
+
+fn other_node_id(path: &Path) -> NodeId {
+    NodeId::from(format!("file:{}", path_to_id(path)))
 }
 
 /// Best-effort (crate_name, module_path_prefix) for a Rust source file's
@@ -365,16 +405,19 @@ mod tests {
         ];
         let graph = build(files, &changes(vec![]));
 
-        assert!(graph.nodes.contains_key(&NodeId::from("crate_a")));
-        assert!(graph.nodes.contains_key(&NodeId::from("crate_a::foo")));
-        assert_eq!(graph.roots, vec![NodeId::from("crate_a")]);
+        assert!(graph.nodes.contains_key(&NodeId::from("rust:crate_a")));
+        assert!(graph.nodes.contains_key(&NodeId::from("rust:crate_a::foo")));
+        assert_eq!(graph.roots, vec![NodeId::from("rust:crate_a")]);
         assert_eq!(
-            graph.node(&NodeId::from("crate_a::foo")).unwrap().parent,
-            Some(NodeId::from("crate_a"))
+            graph
+                .node(&NodeId::from("rust:crate_a::foo"))
+                .unwrap()
+                .parent,
+            Some(NodeId::from("rust:crate_a"))
         );
         assert_eq!(graph.edges.len(), 1);
-        assert_eq!(graph.edges[0].from, NodeId::from("crate_a"));
-        assert_eq!(graph.edges[0].to, NodeId::from("crate_a::foo"));
+        assert_eq!(graph.edges[0].from, NodeId::from("rust:crate_a"));
+        assert_eq!(graph.edges[0].to, NodeId::from("rust:crate_a::foo"));
     }
 
     #[test]
@@ -390,21 +433,21 @@ mod tests {
         let graph = build(files, &changes(vec![]));
 
         let root = graph
-            .node(&NodeId::from("crate_a"))
+            .node(&NodeId::from("rust:crate_a"))
             .expect("synthesized root");
         assert_eq!(root.status, GitStatus::Unchanged);
         assert!(root.files.is_empty());
         let foo = graph
-            .node(&NodeId::from("crate_a::foo"))
+            .node(&NodeId::from("rust:crate_a::foo"))
             .expect("synthesized intermediate dir node");
         assert_eq!(foo.status, GitStatus::Unchanged);
-        assert_eq!(foo.parent, Some(NodeId::from("crate_a")));
+        assert_eq!(foo.parent, Some(NodeId::from("rust:crate_a")));
         assert_eq!(
             graph
-                .node(&NodeId::from("crate_a::foo::bar"))
+                .node(&NodeId::from("rust:crate_a::foo::bar"))
                 .unwrap()
                 .parent,
-            Some(NodeId::from("crate_a::foo"))
+            Some(NodeId::from("rust:crate_a::foo"))
         );
     }
 
@@ -430,15 +473,15 @@ mod tests {
         // "MyApp" is referenced by both dotted names but never itself
         // `defmodule`d -- it must be synthesized.
         let namespace = graph
-            .node(&NodeId::from("MyApp"))
+            .node(&NodeId::from("elixir:MyApp"))
             .expect("synthesized namespace node");
         assert_eq!(namespace.status, GitStatus::Unchanged);
         assert!(namespace.files.is_empty());
-        assert_eq!(graph.roots, vec![NodeId::from("MyApp")]);
+        assert_eq!(graph.roots, vec![NodeId::from("elixir:MyApp")]);
 
         assert!(graph.edges.contains(&crate::graph::model::DepEdge {
-            from: NodeId::from("MyApp.Accounts"),
-            to: NodeId::from("MyApp.Repo"),
+            from: NodeId::from("elixir:MyApp.Accounts"),
+            to: NodeId::from("elixir:MyApp.Repo"),
             kind: DepKind::Alias,
         }));
     }
@@ -463,7 +506,7 @@ mod tests {
         }];
         let graph = build(files, &changes(deltas));
 
-        let my_app = graph.node(&NodeId::from("MyApp")).unwrap();
+        let my_app = graph.node(&NodeId::from("elixir:MyApp")).unwrap();
         assert_eq!(
             my_app.status,
             GitStatus::Modified,
@@ -489,23 +532,70 @@ mod tests {
         let graph = build(files, &changes(vec![]));
 
         let docs = graph
-            .node(&NodeId::from("docs"))
+            .node(&NodeId::from("file:docs"))
             .expect("synthetic dir node");
         assert_eq!(docs.status, GitStatus::Unchanged);
         assert!(docs.files.is_empty());
         let sub = graph
-            .node(&NodeId::from("docs/sub"))
+            .node(&NodeId::from("file:docs/sub"))
             .expect("synthetic nested dir node");
-        assert_eq!(sub.parent, Some(NodeId::from("docs")));
+        assert_eq!(sub.parent, Some(NodeId::from("file:docs")));
         assert_eq!(
-            graph.node(&NodeId::from("docs/a.md")).unwrap().parent,
-            Some(NodeId::from("docs"))
+            graph.node(&NodeId::from("file:docs/a.md")).unwrap().parent,
+            Some(NodeId::from("file:docs"))
         );
         assert_eq!(
-            graph.node(&NodeId::from("docs/sub/b.md")).unwrap().parent,
-            Some(NodeId::from("docs/sub"))
+            graph
+                .node(&NodeId::from("file:docs/sub/b.md"))
+                .unwrap()
+                .parent,
+            Some(NodeId::from("file:docs/sub"))
         );
-        assert_eq!(graph.roots, vec![NodeId::from("docs")]);
+        assert_eq!(graph.roots, vec![NodeId::from("file:docs")]);
+    }
+
+    #[test]
+    fn cross_language_single_segment_ids_do_not_collide() {
+        // A single-segment Rust crate id (`Foo/` with no `src/` nesting
+        // under it, so the module path is just the crate name) and an
+        // Elixir `defmodule Foo` both produce the bare display name "Foo".
+        // Without a language namespace prefix these collide into one node
+        // with merged files/edges; they must land as two distinct nodes.
+        let files = vec![
+            FileInput {
+                file_ref: file_ref("Foo/src/lib.rs"),
+                lang: Lang::Rust,
+                defs: vec![module("", vec![])],
+            },
+            FileInput {
+                file_ref: file_ref("lib/foo.ex"),
+                lang: Lang::Elixir,
+                defs: vec![module("Foo", vec![])],
+            },
+        ];
+        let deltas = vec![
+            FileDelta {
+                path: PathBuf::from("Foo/src/lib.rs"),
+                change: Change::Modified,
+            },
+            FileDelta {
+                path: PathBuf::from("lib/foo.ex"),
+                change: Change::Added,
+            },
+        ];
+        let graph = build(files, &changes(deltas));
+
+        let rust_node = graph
+            .node(&NodeId::from("rust:Foo"))
+            .expect("rust-namespaced Foo node");
+        let elixir_node = graph
+            .node(&NodeId::from("elixir:Foo"))
+            .expect("elixir-namespaced Foo node");
+        assert_ne!(rust_node.id, elixir_node.id);
+        assert_eq!(rust_node.status, GitStatus::Modified);
+        assert_eq!(elixir_node.status, GitStatus::Added);
+        assert_eq!(rust_node.files.len(), 1);
+        assert_eq!(elixir_node.files.len(), 1);
     }
 
     #[test]
@@ -544,16 +634,19 @@ mod tests {
         let graph = build(files, &changes(deltas));
 
         assert_eq!(
-            graph.node(&NodeId::from("crate_a")).unwrap().status,
+            graph.node(&NodeId::from("rust:crate_a")).unwrap().status,
             GitStatus::Modified
         );
         assert_eq!(
-            graph.node(&NodeId::from("crate_a::added")).unwrap().status,
+            graph
+                .node(&NodeId::from("rust:crate_a::added"))
+                .unwrap()
+                .status,
             GitStatus::Added
         );
         assert_eq!(
             graph
-                .node(&NodeId::from("crate_a::deleted"))
+                .node(&NodeId::from("rust:crate_a::deleted"))
                 .unwrap()
                 .status,
             GitStatus::Deleted

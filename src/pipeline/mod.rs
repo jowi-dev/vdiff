@@ -189,19 +189,31 @@ mod tests {
         let graph = build_graph(&repo, &PipelineOptions::default()).unwrap();
 
         assert_eq!(
-            graph.node(&NodeId::from("MyApp.Accounts")).unwrap().status,
+            graph
+                .node(&NodeId::from("elixir:MyApp.Accounts"))
+                .unwrap()
+                .status,
             GitStatus::Modified
         );
         assert_eq!(
-            graph.node(&NodeId::from("MyApp.Repo")).unwrap().status,
+            graph
+                .node(&NodeId::from("elixir:MyApp.Repo"))
+                .unwrap()
+                .status,
             GitStatus::Added
         );
         assert_eq!(
-            graph.node(&NodeId::from("MyApp.Mailer")).unwrap().status,
+            graph
+                .node(&NodeId::from("elixir:MyApp.Mailer"))
+                .unwrap()
+                .status,
             GitStatus::Deleted
         );
         assert_eq!(
-            graph.node(&NodeId::from("MyApp.Unchanged")).unwrap().status,
+            graph
+                .node(&NodeId::from("elixir:MyApp.Unchanged"))
+                .unwrap()
+                .status,
             GitStatus::Unchanged,
             "unchanged module is still parsed for the name table"
         );
@@ -210,19 +222,19 @@ mod tests {
         assert!(graph
             .edges
             .iter()
-            .any(|e| e.from == NodeId::from("MyApp.Accounts")
-                && e.to == NodeId::from("MyApp.Repo")
+            .any(|e| e.from == NodeId::from("elixir:MyApp.Accounts")
+                && e.to == NodeId::from("elixir:MyApp.Repo")
                 && e.kind == DepKind::Alias));
 
         // Synthetic namespace node for the shared "MyApp" prefix.
-        let namespace = graph.node(&NodeId::from("MyApp")).unwrap();
+        let namespace = graph.node(&NodeId::from("elixir:MyApp")).unwrap();
         assert_eq!(namespace.status, GitStatus::Unchanged);
         assert!(namespace.files.is_empty());
 
         // Changed non-code file at repo root is a top-level leaf node.
-        let readme = graph.node(&NodeId::from("README.md")).unwrap();
+        let readme = graph.node(&NodeId::from("file:README.md")).unwrap();
         assert_eq!(readme.status, GitStatus::Modified);
-        assert!(graph.roots.contains(&NodeId::from("README.md")));
+        assert!(graph.roots.contains(&NodeId::from("file:README.md")));
     }
 
     #[test]
