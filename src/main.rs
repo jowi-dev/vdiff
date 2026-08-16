@@ -19,7 +19,7 @@ fn main() -> ExitCode {
     let repo = match Git2Repo::open(&repo_path) {
         Ok(repo) => repo,
         Err(err) => {
-            eprintln!("error opening repository at {}: {err}", repo_path.display());
+            eprintln!("error: {err}");
             return ExitCode::FAILURE;
         }
     };

@@ -28,6 +28,18 @@ pub enum PipelineError {
     /// `main`, no `master`.
     #[error("no base ref found (tried override, origin/HEAD, main, master)")]
     NoBaseRef,
+    /// `path` (or any of its ancestors) isn't a git repository --
+    /// `git2::Repository::discover` found nothing to open. Reported as its
+    /// own friendly variant rather than the raw `git2::Error` from
+    /// `discover`, whose `Display` impl tacks on a `class=...; code=...`
+    /// suffix that reads as an internal detail, not a clear user-facing
+    /// message.
+    #[error("not a git repository: {path}")]
+    NotAGitRepo { path: PathBuf },
+    /// `--base <ref>` (or the default-branch detection's own tried
+    /// candidates) didn't resolve to a real ref/commit via `revparse_single`.
+    #[error("base ref '{base}' not found")]
+    BaseRefNotFound { base: String },
 }
 
 /// Convenience alias, used throughout `pipeline/`.

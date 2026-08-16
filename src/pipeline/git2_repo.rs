@@ -32,9 +32,14 @@ pub struct Git2Repo {
 }
 
 impl Git2Repo {
-    /// Discover and open the repository containing `path`.
+    /// Discover and open the repository containing `path`. Fails with
+    /// [`PipelineError::NotAGitRepo`] (a friendly message, not a raw
+    /// `git2::Error`) if `path` and none of its ancestors are a git
+    /// repository.
     pub fn open(path: &Path) -> Result<Self> {
-        let repo = Repository::discover(path)?;
+        let repo = Repository::discover(path).map_err(|_| PipelineError::NotAGitRepo {
+            path: path.to_path_buf(),
+        })?;
         Ok(Self { repo })
     }
 
@@ -90,7 +95,13 @@ impl GitRepo for Git2Repo {
     fn default_base_oid(&self, base_override: Option<&str>) -> Result<String> {
         let head = self.repo.head()?.peel_to_commit()?;
         let base_revspec = self.base_revspec(base_override)?;
-        let base_commit = self.repo.revparse_single(&base_revspec)?.peel_to_commit()?;
+        let base_commit = self
+            .repo
+            .revparse_single(&base_revspec)
+            .and_then(|obj| obj.peel_to_commit())
+            .map_err(|_| PipelineError::BaseRefNotFound {
+                base: base_revspec.clone(),
+            })?;
         let merge_base = self.repo.merge_base(head.id(), base_commit.id())?;
         Ok(merge_base.to_string())
     }
@@ -192,5 +203,94 @@ impl GitRepo for Git2Repo {
             .get_path(path)
             .ok()
             .map(|entry| entry.id().to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-c")
+            .arg("commit.gpgsign=false")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "vdiff tests")
+            .env("GIT_AUTHOR_EMAIL", "vdiff-tests@example.com")
+            .env("GIT_COMMITTER_NAME", "vdiff tests")
+            .env("GIT_COMMITTER_EMAIL", "vdiff-tests@example.com")
+            .status()
+            .unwrap_or_else(|err| panic!("failed to run git {args:?}: {err}"));
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    /// A tempdir with no `.git` anywhere above it must fail to open with a
+    /// friendly [`PipelineError::NotAGitRepo`], not a raw `git2::Error`
+    /// (whose `Display` impl tacks on an internal `class=...; code=...`
+    /// suffix).
+    #[test]
+    fn opening_a_non_repo_directory_is_a_friendly_error() {
+        let tmp = TempDir::new().expect("create tempdir");
+        let err = match Git2Repo::open(tmp.path()) {
+            Ok(_) => panic!("no .git anywhere above this tempdir"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, PipelineError::NotAGitRepo { .. }),
+            "expected NotAGitRepo, got {err}"
+        );
+        assert!(
+            !err.to_string().contains("class="),
+            "message leaked git2 internals: {err}"
+        );
+    }
+
+    /// `--base nonexistent-ref` must fail with a friendly
+    /// [`PipelineError::BaseRefNotFound`] naming the ref, not a raw
+    /// `git2::Error`.
+    #[test]
+    fn nonexistent_base_ref_is_a_friendly_error_naming_the_ref() {
+        let tmp = TempDir::new().expect("create tempdir");
+        let dir = tmp.path();
+        git(dir, &["init", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "hi\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "initial"]);
+
+        let repo = Git2Repo::open(dir).expect("open fixture repo");
+        let err = repo
+            .default_base_oid(Some("nonexistent-ref"))
+            .expect_err("no such ref");
+        match err {
+            PipelineError::BaseRefNotFound { base } => assert_eq!(base, "nonexistent-ref"),
+            other => panic!("expected BaseRefNotFound, got {other:?}"),
+        }
+    }
+
+    /// A detached-HEAD checkout must still resolve `default_base_oid` --
+    /// `HEAD` points directly at a commit rather than a branch, but `git2`'s
+    /// `repo.head()` peels to that commit exactly the same either way.
+    #[test]
+    fn detached_head_still_resolves_default_base_oid() {
+        let tmp = TempDir::new().expect("create tempdir");
+        let dir = tmp.path();
+        git(dir, &["init", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "hi\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "initial"]);
+        std::fs::write(dir.join("a.txt"), "hi again\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "second"]);
+        git(dir, &["checkout", "--detach", "HEAD"]);
+
+        let repo = Git2Repo::open(dir).expect("open fixture repo");
+        let result = repo.default_base_oid(Some("main"));
+        assert!(
+            result.is_ok(),
+            "detached HEAD must still resolve a base oid: {result:?}"
+        );
     }
 }
