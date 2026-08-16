@@ -123,6 +123,19 @@ impl VdiffApp {
                 }
             });
     }
+
+    /// [`Screen::Diff`] placeholder: the focused node's name and the paths
+    /// of the files backing it. Real diff rendering arrives in chunk E;
+    /// `Esc` already returns to the graph via the tested reducer.
+    fn show_diff_placeholder(&self, ui: &mut egui::Ui) {
+        ui.heading("diff pane — chunk E");
+        if let Some(node) = self.app.graph.node(&self.app.focus) {
+            ui.label(format!("Node: {}", node.display_name));
+            for file in &node.files {
+                ui.label(file.path.display().to_string());
+            }
+        }
+    }
 }
 
 impl eframe::App for VdiffApp {
@@ -150,7 +163,7 @@ impl eframe::App for VdiffApp {
             }
             Screen::Diff => {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    ui.heading("diff pane — chunk E");
+                    self.show_diff_placeholder(ui);
                 });
             }
         }
