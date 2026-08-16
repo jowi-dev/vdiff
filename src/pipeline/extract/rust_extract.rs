@@ -2,6 +2,13 @@
 //! visualization, not a full name resolver: `use` paths are stored as
 //! written (e.g. `"crate::pipeline::repo::GitRepo"`, `"serde::Serialize"`);
 //! turning those into resolved edges is [`crate::pipeline::resolve`]'s job.
+//!
+//! Modules tagged `#[cfg(test)]` are filtered out entirely (see
+//! `is_cfg_test`) -- they add no review-relevant structure to the graph.
+//! Only the exact, common `#[cfg(test)]` form is recognized; a compound
+//! predicate like `#[cfg(any(test, feature = "test-utils"))]` is not, and
+//! that module's inline tests still show up as a node -- a known,
+//! documented limitation rather than a full `cfg` expression evaluator.
 
 use std::path::Path;
 
@@ -30,10 +37,15 @@ impl ModuleExtractor for RustExtract {
 /// Recursively collect `ModuleDef`s for every inline `mod name { ... }` in
 /// `items` (out-of-line `mod name;` declarations have no body to recurse
 /// into, so they don't produce a `ModuleDef` here -- resolving those against
-/// the filesystem is the builder's job in a later milestone).
+/// the filesystem is the builder's job in a later milestone). Skips (and
+/// doesn't recurse into) any module tagged `#[cfg(test)]` -- test-only
+/// modules add no value to a change-review graph and only add noise.
 fn collect_inline_mods(items: &[Item], prefix: &str, defs: &mut Vec<ModuleDef>) {
     for item in items {
         let Item::Mod(module) = item else { continue };
+        if is_cfg_test(&module.attrs) {
+            continue;
+        }
         let Some((_, inner_items)) = &module.content else {
             continue;
         };
@@ -44,6 +56,19 @@ fn collect_inline_mods(items: &[Item], prefix: &str, defs: &mut Vec<ModuleDef>) 
         });
         collect_inline_mods(inner_items, &name, defs);
     }
+}
+
+/// Whether `attrs` contains an exact `#[cfg(test)]`. Known limitation: only
+/// this common, single-predicate form is recognized -- a compound form like
+/// `#[cfg(any(test, feature = "test-utils"))]` is not detected, so such a
+/// module still shows up as a node.
+fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("cfg")
+            && attr
+                .parse_args::<syn::Ident>()
+                .is_ok_and(|ident| ident == "test")
+    })
 }
 
 /// Join a module path prefix and a segment with `::`, omitting the
@@ -141,6 +166,22 @@ mod tests {
 
         let bar = defs.iter().find(|d| d.name == "foo::bar").unwrap();
         assert_eq!(bar.dep_refs, vec![dep_ref("baz::Qux".to_string())]);
+    }
+
+    #[test]
+    fn cfg_test_module_is_filtered_out() {
+        let source = r#"
+            mod foo {
+                pub fn helper() {}
+            }
+            #[cfg(test)]
+            mod tests {
+                use super::foo;
+            }
+        "#;
+        let defs = extract(source);
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["", "foo"], "no 'tests' module should appear");
     }
 
     #[test]
