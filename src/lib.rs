@@ -2,6 +2,7 @@
 
 pub mod cli;
 pub mod core;
+pub mod diffing;
 pub mod graph;
 pub mod keymap;
 pub mod pipeline;
