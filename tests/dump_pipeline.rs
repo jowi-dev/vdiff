@@ -205,3 +205,44 @@ fn added_binary_file_does_not_crash_build_graph() {
         .expect("binary file node");
     assert_eq!(logo.status, GitStatus::Added);
 }
+
+/// A branch that `git mv`s a file to a new path plus a small content edit
+/// (so it isn't a byte-for-byte rename) must be picked up by git2's
+/// `find_similar` as a genuine rename: `changed_files` reports one
+/// `Change::Renamed` delta rather than a `Deleted` + `Added` pair, so the
+/// old path never becomes its own node.
+#[test]
+fn renamed_and_edited_file_is_modified_at_new_path_with_no_deleted_old_node() {
+    let tmp = TempDir::new().expect("create tempdir");
+    let dir = tmp.path();
+
+    git(dir, &["init", "-b", "main"]);
+    write(
+        dir,
+        "docs/notes.md",
+        "# Notes\n\nline one\nline two\nline three\nline four\nline five\n",
+    );
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-m", "initial"]);
+
+    git(dir, &["checkout", "-b", "feature"]);
+    git(dir, &["mv", "docs/notes.md", "docs/journal.md"]);
+    write(
+        dir,
+        "docs/journal.md",
+        "# Notes\n\nline one\nline two EDITED\nline three\nline four\nline five\n",
+    );
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-m", "rename and edit notes"]);
+
+    let graph = dump_json(dir, None);
+
+    let journal = graph
+        .node(&NodeId::from("file:docs/journal.md"))
+        .expect("renamed file's new-path node");
+    assert_eq!(journal.status, GitStatus::Modified);
+    assert!(
+        graph.node(&NodeId::from("file:docs/notes.md")).is_none(),
+        "old path must not surface as a phantom Deleted node"
+    );
+}
