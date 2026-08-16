@@ -1,19 +1,20 @@
 //! Pure recursive shelf-packing layout: turns a [`ProjectGraph`] into
-//! absolute-position rectangles for every node. Zero dependencies on
-//! egui/git2 -- this module owns its own minimal geometry newtypes
-//! ([`Pos`], [`Size`], [`Rect`]) rather than pulling in a GUI crate's
-//! vector types.
+//! absolute-position rectangles for every node plus straight-line edge
+//! paths. Zero dependencies on egui/git2 -- this module owns its own
+//! minimal geometry newtypes ([`Pos`], [`Size`], [`Rect`]) rather than
+//! pulling in a GUI crate's vector types.
 //!
 //! Layout is bottom-up: a leaf gets a fixed [`LEAF_W`]x[`LEAF_H`] box; a
 //! parent packs its children (in [`ProjectGraph::sorted_children`] order,
 //! the same order navigation uses) onto shelves left-to-right, wrapping
 //! when a row would exceed a target width, then wraps that packed area in
-//! [`MARGIN`] on every side and a [`TITLE_H`] label strip on top. See
-//! "Layout algorithm" in the project plan for the full rationale.
+//! [`MARGIN`] on every side and a [`TITLE_H`] label strip on top. Roots are
+//! packed the same way onto the canvas from the origin. See "Layout
+//! algorithm" in the project plan for the full rationale.
 
 use std::collections::HashMap;
 
-use crate::graph::model::{NodeId, ProjectGraph};
+use crate::graph::model::{DepEdge, NodeId, ProjectGraph};
 
 /// Fixed width of a leaf (childless) node's box.
 pub const LEAF_W: f32 = 120.0;
@@ -77,15 +78,26 @@ impl Rect {
     }
 }
 
-/// The full computed layout: every node's absolute rect.
+/// A straight-line edge overlay from the center of one node's rect to the
+/// center of another's (v1 rendering; no routing around obstacles).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgePath {
+    pub from: NodeId,
+    pub to: NodeId,
+    pub points: [Pos; 2],
+}
+
+/// The full computed layout: every node's absolute rect, plus one
+/// [`EdgePath`] per resolvable [`DepEdge`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayoutResult {
     pub rects: HashMap<NodeId, Rect>,
+    pub edges: Vec<EdgePath>,
 }
 
 /// Lay out an entire project graph: recursively size every node bottom-up,
-/// pack children onto shelves at every level (roots included), then
-/// translate to absolute coordinates.
+/// pack children onto shelves at every level (roots included), translate
+/// to absolute coordinates, then resolve straight-line edge paths.
 pub fn layout(graph: &ProjectGraph) -> LayoutResult {
     let mut sizes = HashMap::new();
     let mut local_layouts = HashMap::new();
@@ -108,7 +120,9 @@ pub fn layout(graph: &ProjectGraph) -> LayoutResult {
         place_subtree(&root_id, pos, &sizes, &local_layouts, &mut rects);
     }
 
-    LayoutResult { rects }
+    let edges = layout_edges(&graph.edges, &rects);
+
+    LayoutResult { rects, edges }
 }
 
 /// Bottom-up: compute (and memoize) `id`'s size, recursing into children
@@ -223,6 +237,24 @@ fn pack_shelves(items: &[(NodeId, Size)]) -> (Vec<(NodeId, Pos)>, Size) {
             h: content_h,
         },
     )
+}
+
+/// Resolve every [`DepEdge`] to a straight center-to-center [`EdgePath`],
+/// skipping edges whose endpoints have no rect (defensive -- shouldn't
+/// happen since layout covers every node in the graph).
+fn layout_edges(dep_edges: &[DepEdge], rects: &HashMap<NodeId, Rect>) -> Vec<EdgePath> {
+    dep_edges
+        .iter()
+        .filter_map(|edge| {
+            let from_rect = rects.get(&edge.from)?;
+            let to_rect = rects.get(&edge.to)?;
+            Some(EdgePath {
+                from: edge.from.clone(),
+                to: edge.to.clone(),
+                points: [from_rect.center(), to_rect.center()],
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -442,5 +474,48 @@ mod tests {
         let second = layout(&graph);
 
         assert_eq!(first.rects, second.rects);
+    }
+
+    // Milestone 16: edge paths.
+
+    #[test]
+    fn edge_path_runs_center_to_center() {
+        let graph = ProjectGraph {
+            nodes: vec![leaf("a", "a", None), leaf("b", "b", None)]
+                .into_iter()
+                .collect(),
+            roots: vec![NodeId::from("a"), NodeId::from("b")],
+            edges: vec![DepEdge {
+                from: NodeId::from("a"),
+                to: NodeId::from("b"),
+                kind: crate::graph::model::DepKind::Use,
+            }],
+        };
+
+        let result = layout(&graph);
+
+        let a_rect = result.rects[&NodeId::from("a")];
+        let b_rect = result.rects[&NodeId::from("b")];
+
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.edges[0].points, [a_rect.center(), b_rect.center()]);
+    }
+
+    #[test]
+    fn edge_with_missing_endpoint_is_skipped() {
+        let mut graph = ProjectGraph {
+            nodes: vec![leaf("a", "a", None)].into_iter().collect(),
+            roots: vec![NodeId::from("a")],
+            edges: vec![],
+        };
+        graph.edges.push(DepEdge {
+            from: NodeId::from("a"),
+            to: NodeId::from("missing"),
+            kind: crate::graph::model::DepKind::Use,
+        });
+
+        let result = layout(&graph);
+
+        assert!(result.edges.is_empty());
     }
 }
