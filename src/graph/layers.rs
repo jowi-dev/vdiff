@@ -230,27 +230,12 @@ fn longest_path_layers(
 fn sort_by_root_then_name(graph: &ProjectGraph, ids: &mut Vec<NodeId>) {
     ids.retain(|id| graph.node(id).is_some());
     ids.sort_by(|a, b| {
-        let root_a = top_level_root(graph, a);
-        let root_b = top_level_root(graph, b);
+        let root_a = graph.top_level_root(a);
+        let root_b = graph.top_level_root(b);
         let name_a = graph.node(a).map(|n| n.display_name.as_str()).unwrap_or("");
         let name_b = graph.node(b).map(|n| n.display_name.as_str()).unwrap_or("");
         (root_a, name_a).cmp(&(root_b, name_b))
     });
-}
-
-/// Walk `id`'s parent chain up to its top-level ancestor (the root with no
-/// parent), returning that root's id. May itself be a synthetic namespace
-/// node -- that's fine, it's only used as a grouping/coloring key, never
-/// drawn or navigated to directly. Returns `id` itself if it's unknown or
-/// already a root.
-fn top_level_root(graph: &ProjectGraph, id: &NodeId) -> NodeId {
-    let mut current = id.clone();
-    loop {
-        match graph.node(&current).and_then(|n| n.parent.clone()) {
-            Some(parent) => current = parent,
-            None => return current,
-        }
-    }
 }
 
 #[cfg(test)]

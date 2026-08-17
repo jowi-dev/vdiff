@@ -151,6 +151,23 @@ impl ProjectGraph {
         self.sorted_by_name(&self.roots)
     }
 
+    /// Walk `id`'s parent chain up to its top-level ancestor (the node with
+    /// no parent), returning that root's id. The result may itself be a
+    /// synthetic namespace node ([`ModuleNode::files`] empty) -- that's
+    /// fine, it's only ever used as a grouping/coloring key (see
+    /// [`crate::graph::layers`] and [`crate::ui::theme::root_hue_color`]),
+    /// never drawn or navigated to directly. Returns `id` itself if it's
+    /// unknown or already a root.
+    pub fn top_level_root(&self, id: &NodeId) -> NodeId {
+        let mut current = id.clone();
+        loop {
+            match self.node(&current).and_then(|n| n.parent.clone()) {
+                Some(parent) => current = parent,
+                None => return current,
+            }
+        }
+    }
+
     /// Sort a slice of node ids by their `display_name`, dropping any id
     /// that isn't present in `nodes`.
     fn sorted_by_name(&self, ids: &[NodeId]) -> Vec<NodeId> {
