@@ -32,6 +32,7 @@ use egui::{Align2, Context, Event, Key, Modifiers};
 use crate::core::app::{update, App, Cmd, Msg, Pane, Screen};
 use crate::core::diff_state::{DiffPaneState, FileEntry};
 use crate::core::file_view::{FileViewEntry, FileViewState};
+use crate::core::focus::Direction;
 use crate::graph::layout::{layout, LayoutResult};
 use crate::graph::model::{GitStatus, ModuleNode, NodeId, ProjectGraph};
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome, Pending};
@@ -373,11 +374,9 @@ impl VdiffApp {
     }
 
     /// The nvim-mode input path: every raw egui event this frame either
-    /// completes/starts the local `Ctrl-w` chord (intercepted, never
-    /// forwarded -- `h` dispatches [`Msg::PaneLeft`], `l` dispatches
-    /// [`Msg::PaneRight`] exactly like [`map_key`]'s `Ctrl-w` binding does
-    /// for the built-in viewer, anything else clears the chord with no
-    /// effect) or gets translated by
+    /// starts/completes the local `Ctrl-w` chord (see
+    /// [`Self::complete_nvim_ctrl_w_chord`] for what each completion does)
+    /// or gets translated by
     /// [`crate::ui::nvim_pane::translate_event_for_nvim`] and sent to the
     /// session as [`NvimCmd::Input`]. `map_key`/the reducer are bypassed
     /// entirely for everything else -- nvim owns its own modal keymap, and
@@ -390,14 +389,13 @@ impl VdiffApp {
             if self.nvim_ctrl_w_pending {
                 self.nvim_ctrl_w_pending = false;
                 if let Event::Key {
-                    key, pressed: true, ..
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
                 } = event
                 {
-                    match key {
-                        Key::H => self.dispatch(Msg::PaneLeft),
-                        Key::L => self.dispatch(Msg::PaneRight),
-                        _ => {}
-                    }
+                    self.complete_nvim_ctrl_w_chord(*key, *modifiers);
                 }
                 continue;
             }
@@ -416,6 +414,54 @@ impl VdiffApp {
             if let Some(text) = nvim_pane::translate_event_for_nvim(event) {
                 if let Some(nvim) = &self.nvim {
                     nvim.send(NvimCmd::Input(text));
+                }
+            }
+        }
+    }
+
+    /// The second half of the nvim-mode `Ctrl-w` chord: boundary-aware for
+    /// `h`/`l`/`ArrowLeft`/`ArrowRight` (query nvim's own `winnr()` via
+    /// [`NvimPane::at_boundary`] -- at the edge, hop panes; not at the
+    /// edge, nvim has internal splits to move between, so forward
+    /// `<C-w>h`/`<C-w>l`/`<C-w><Left>`/`<C-w><Right>` instead), always
+    /// forwarded for `j`/`k`/`ArrowUp`/`ArrowDown` (vertical splits are
+    /// entirely nvim-internal -- vdiff has no pane above or below), and
+    /// forwarded as `<C-w><key>` via
+    /// [`crate::ui::nvim_pane::ctrl_w_continuation`] for everything else
+    /// (restores the rest of nvim's `Ctrl-w` repertoire -- `q`, `o`, `w`,
+    /// ... -- that this project's older blanket "clear the chord silently"
+    /// behavior used to swallow; see that function's doc for the one
+    /// accepted tradeoff, insert-mode `Ctrl-w` word-delete timing).
+    fn complete_nvim_ctrl_w_chord(&mut self, key: Key, modifiers: Modifiers) {
+        let Some(nvim) = &self.nvim else { return };
+        match key {
+            Key::H | Key::ArrowLeft => {
+                if nvim.at_boundary("h") {
+                    self.dispatch(Msg::PaneLeft);
+                } else {
+                    let seq = if key == Key::H {
+                        "<C-w>h"
+                    } else {
+                        "<C-w><Left>"
+                    };
+                    nvim.send(NvimCmd::Input(seq.to_string()));
+                }
+            }
+            Key::L | Key::ArrowRight => {
+                if !nvim.at_boundary("l") {
+                    let seq = if key == Key::L {
+                        "<C-w>l"
+                    } else {
+                        "<C-w><Right>"
+                    };
+                    nvim.send(NvimCmd::Input(seq.to_string()));
+                }
+                // At the right boundary already: nothing further right to
+                // hop to (there's no pane past the nvim pane), so no-op.
+            }
+            _ => {
+                if let Some(seq) = nvim_pane::ctrl_w_continuation(key, modifiers) {
+                    nvim.send(NvimCmd::Input(seq));
                 }
             }
         }
@@ -573,10 +619,17 @@ impl eframe::App for VdiffApp {
 /// toolkit-independent [`KeyInput`]. Pure and unit-tested: with Ctrl held,
 /// only `w`/`d`/`u` map to anything ([`KeyInput::Ctrl`]); otherwise the
 /// keys [`crate::keymap::map_key`] cares about (h/j/k/l/g/G/d/r/t/s/c/f/[/],
-/// Enter, Esc) map to anything, everything else is `None`. `Key::G` maps to
-/// `Char('G')` when Shift is held (uppercase, distinct from the `gg`/`gd`/
-/// `gr` prefix `Char('g')`) and `Char('g')` otherwise.
+/// Enter, Esc) map to anything, arrows map to [`KeyInput::Arrow`]
+/// unconditionally (checked before the Ctrl branch, so `Ctrl-w` followed by
+/// an arrow -- held or released -- both complete the `Ctrl-w` chord the
+/// same way `Ctrl-w h`/`Ctrl-w l` do; see [`crate::keymap::resolve_pending`]),
+/// everything else is `None`. `Key::G` maps to `Char('G')` when Shift is
+/// held (uppercase, distinct from the `gg`/`gd`/`gr` prefix `Char('g')`)
+/// and `Char('g')` otherwise.
 pub fn egui_key_to_input(key: Key, modifiers: Modifiers) -> Option<KeyInput> {
+    if let Some(dir) = arrow_direction(key) {
+        return Some(KeyInput::Arrow(dir));
+    }
     if modifiers.ctrl {
         return match key {
             Key::W => Some(KeyInput::Ctrl('w')),
@@ -601,6 +654,17 @@ pub fn egui_key_to_input(key: Key, modifiers: Modifiers) -> Option<KeyInput> {
         Key::CloseBracket => Some(KeyInput::Char(']')),
         Key::Enter => Some(KeyInput::Enter),
         Key::Escape => Some(KeyInput::Esc),
+        _ => None,
+    }
+}
+
+/// `Key::Arrow*` to [`Direction`], or `None` for any other key.
+fn arrow_direction(key: Key) -> Option<Direction> {
+    match key {
+        Key::ArrowLeft => Some(Direction::Left),
+        Key::ArrowRight => Some(Direction::Right),
+        Key::ArrowUp => Some(Direction::Up),
+        Key::ArrowDown => Some(Direction::Down),
         _ => None,
     }
 }
@@ -667,6 +731,28 @@ mod tests {
     fn unmapped_keys_translate_to_none() {
         for key in [Key::A, Key::Z, Key::Num1, Key::Space, Key::Tab] {
             assert_eq!(egui_key_to_input(key, Modifiers::NONE), None, "key={key:?}");
+        }
+    }
+
+    #[test]
+    fn arrow_keys_translate_to_arrow_input_with_or_without_ctrl() {
+        let cases = [
+            (Key::ArrowLeft, Direction::Left),
+            (Key::ArrowRight, Direction::Right),
+            (Key::ArrowUp, Direction::Up),
+            (Key::ArrowDown, Direction::Down),
+        ];
+        for (key, dir) in cases {
+            assert_eq!(
+                egui_key_to_input(key, Modifiers::NONE),
+                Some(KeyInput::Arrow(dir)),
+                "key={key:?} (no modifiers)"
+            );
+            assert_eq!(
+                egui_key_to_input(key, Modifiers::CTRL),
+                Some(KeyInput::Arrow(dir)),
+                "key={key:?} (ctrl held)"
+            );
         }
     }
 

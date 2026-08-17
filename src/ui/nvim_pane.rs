@@ -11,8 +11,10 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use egui::{Color32, Context, Event, FontId, Key, Rect, Ui, Vec2};
+use egui::{Color32, Context, Event, FontId, Key, Modifiers, Rect, Ui, Vec2};
+use rmpv::Value;
 
 use crate::nvim::grid::GridState;
 use crate::nvim::session::{NvimCmd, NvimSession};
@@ -20,6 +22,13 @@ use crate::nvim::session::{NvimCmd, NvimSession};
 /// The monospace font size the grid is painted at. Fixed for this spike --
 /// no font-size settings/zoom.
 const FONT_SIZE: f32 = 14.0;
+
+/// How long a boundary-detection [`NvimPane::at_boundary`] call (or any
+/// other [`NvimPane::call`]) blocks the calling (UI) thread waiting for
+/// nvim's response before giving up and treating it as a boundary/failure.
+/// Short enough that a wedged-but-not-dead nvim can never make `Ctrl-w`
+/// navigation feel stuck.
+const CALL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Owns a live [`NvimSession`] plus the cols/rows last sent to it, so
 /// [`show`] only fires [`NvimCmd::Resize`] when the pane's pixel size
@@ -89,6 +98,53 @@ impl NvimPane {
     /// rather than snapping back to a default and immediately resizing.
     pub fn size(&self) -> (u16, u16) {
         (self.cols, self.rows)
+    }
+
+    /// Call `method(params)` and wait up to [`CALL_TIMEOUT`] for the
+    /// response -- see [`NvimSession::call`] for the exact semantics
+    /// (`None` covers RPC error, timeout, *and* a dead session uniformly).
+    pub fn call(&self, method: &str, params: Vec<Value>) -> Option<Value> {
+        self.session.call(method, params, CALL_TIMEOUT)
+    }
+
+    /// Whether the current window is already at nvim's split boundary in
+    /// direction `dir` (`"h"` or `"l"`) -- i.e. `winnr()` and `winnr(dir)`
+    /// agree there's nowhere further to move. Used to decide whether a
+    /// `Ctrl-w h`/`Ctrl-w l` (or the arrow-key aliases) should hop out to
+    /// vdiff's graph pane (at the boundary) or forward into nvim's own
+    /// split navigation (not at the boundary, nvim has internal splits to
+    /// move between). On *any* failure to get a straight answer --
+    /// timeout, RPC error, dead session -- conservatively reports `true`
+    /// ("at boundary"): a wedged-but-not-dead nvim must never be able to
+    /// trap keyboard focus on this pane, so when in doubt, let the user
+    /// out.
+    pub fn at_boundary(&self, dir: &str) -> bool {
+        let winnr = |args: Vec<Value>| {
+            self.call(
+                "nvim_call_function",
+                vec![Value::from("winnr"), Value::Array(args)],
+            )
+        };
+        match (winnr(vec![]), winnr(vec![Value::from(dir)])) {
+            (Some(here), Some(there)) => here == there,
+            _ => true,
+        }
+    }
+
+    /// Run one Ex command via [`Self::call`] (rather than the
+    /// fire-and-forget [`NvimCmd::Ex`]) so a genuine failure can be logged
+    /// -- used for `--nvim-cmd` init commands, both on first spawn and
+    /// every respawn. Returns `Ok(())` if nvim reported no error, `Err`
+    /// with a message worth printing as a warning otherwise (including a
+    /// timeout/dead session, which can't be told apart from a real nvim
+    /// error at this layer -- see [`NvimSession::call`]).
+    pub fn run_init_command(&self, command: &str) -> Result<(), String> {
+        match self.call("nvim_command", vec![Value::from(command)]) {
+            Some(_) => Ok(()),
+            None => Err(format!(
+                "nvim-cmd '{command}' failed or timed out (no response within {CALL_TIMEOUT:?})"
+            )),
+        }
     }
 }
 
@@ -262,7 +318,7 @@ pub fn translate_event_for_nvim(event: &Event) -> Option<String> {
                 return Some(special.to_string());
             }
             if modifiers.ctrl {
-                if let Some(c) = letter_char(*key) {
+                if let Some(c) = single_char(*key) {
                     return Some(format!("<C-{c}>"));
                 }
             }
@@ -292,25 +348,61 @@ fn special_key_notation(key: Key) -> Option<&'static str> {
     }
 }
 
-/// The lowercase ascii letter a single-letter key represents (`Key::A` ->
-/// `'a'`), or `None` for any other key -- used only for `<C-x>` notation,
-/// where `x` must be the bare letter.
-fn letter_char(key: Key) -> Option<char> {
+/// The lowercase ascii letter/digit a single-character key represents
+/// (`Key::A` -> `'a'`, `Key::Num1` -> `'1'`), or `None` for any other key --
+/// used for `<C-x>` notation (where `x` must be the bare letter) and, via
+/// [`ctrl_w_continuation`], for forwarding an arbitrary un-intercepted
+/// `Ctrl-w <key>` continuation to nvim.
+fn single_char(key: Key) -> Option<char> {
     let name = key.name();
     let mut chars = name.chars();
     let c = chars.next()?;
-    if chars.next().is_none() && c.is_ascii_alphabetic() {
+    if chars.next().is_none() && c.is_ascii_alphanumeric() {
         Some(c.to_ascii_lowercase())
     } else {
         None
     }
 }
 
+/// Build the nvim key-notation to forward for a completed `Ctrl-w` chord
+/// whose second key isn't one of the boundary-aware bindings
+/// (`h`/`l`/arrows -- handled separately in
+/// [`crate::ui::eframe_app::VdiffApp::handle_nvim_keys`], since they need
+/// [`NvimPane::at_boundary`], not a pure translation). Restores the rest of
+/// nvim's `Ctrl-w` repertoire (`Ctrl-w q` close, `Ctrl-w o` only-this-window,
+/// `Ctrl-w w`/`Ctrl-w Ctrl-w` cycle, `Ctrl-w j`/`k` move down/up, ...) that
+/// a blanket "clear the chord silently" would otherwise have swallowed.
+///
+/// - `j`/`k`/`ArrowUp`/`ArrowDown` and their `Ctrl-w Ctrl-j`-style variants
+///   *are* included here (always forwarded, never boundary-checked) --
+///   vertical splits are entirely nvim-internal, vdiff has no pane above or
+///   below to hop to.
+/// - A second key held with Ctrl becomes a nested `<C-x>` (`Ctrl-w Ctrl-w`
+///   -> `<C-w><C-w>`), matching nvim's own idiom for that chord.
+/// - A special key (no ctrl) uses its angle notation as-is (`<C-w><Esc>`).
+/// - Anything else falls back to its bare letter/digit.
+///
+/// Returns `None` only if `key` maps to nothing at all (a key
+/// [`special_key_notation`] and [`single_char`] both reject -- function
+/// keys, media keys, etc. -- vanishingly unlikely to reach here but kept
+/// total rather than panicking).
+pub fn ctrl_w_continuation(key: Key, modifiers: Modifiers) -> Option<String> {
+    if modifiers.ctrl {
+        if let Some(c) = single_char(key) {
+            return Some(format!("<C-w><C-{c}>"));
+        }
+    }
+    if let Some(special) = special_key_notation(key) {
+        return Some(format!("<C-w>{special}"));
+    }
+    let c = single_char(key)?;
+    Some(format!("<C-w>{c}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::nvim::grid::{Cell, HlAttr};
-    use egui::Modifiers;
 
     #[test]
     fn cols_rows_for_size_floors_and_clamps_to_one() {
@@ -480,5 +572,64 @@ mod tests {
                 hl_id: 0
             }
         );
+    }
+
+    #[test]
+    fn ctrl_w_continuation_plain_letter_forwards_bare_char() {
+        assert_eq!(
+            ctrl_w_continuation(Key::Q, Modifiers::NONE),
+            Some("<C-w>q".to_string())
+        );
+        assert_eq!(
+            ctrl_w_continuation(Key::O, Modifiers::NONE),
+            Some("<C-w>o".to_string())
+        );
+        assert_eq!(
+            ctrl_w_continuation(Key::W, Modifiers::NONE),
+            Some("<C-w>w".to_string())
+        );
+    }
+
+    #[test]
+    fn ctrl_w_continuation_vertical_motion_always_forwards() {
+        assert_eq!(
+            ctrl_w_continuation(Key::J, Modifiers::NONE),
+            Some("<C-w>j".to_string())
+        );
+        assert_eq!(
+            ctrl_w_continuation(Key::K, Modifiers::NONE),
+            Some("<C-w>k".to_string())
+        );
+        assert_eq!(
+            ctrl_w_continuation(Key::ArrowUp, Modifiers::NONE),
+            Some("<C-w><Up>".to_string())
+        );
+        assert_eq!(
+            ctrl_w_continuation(Key::ArrowDown, Modifiers::NONE),
+            Some("<C-w><Down>".to_string())
+        );
+    }
+
+    #[test]
+    fn ctrl_w_continuation_ctrl_letter_nests_c_notation() {
+        assert_eq!(
+            ctrl_w_continuation(Key::W, Modifiers::CTRL),
+            Some("<C-w><C-w>".to_string())
+        );
+    }
+
+    #[test]
+    fn ctrl_w_continuation_special_key_nests_angle_notation() {
+        assert_eq!(
+            ctrl_w_continuation(Key::Escape, Modifiers::NONE),
+            Some("<C-w><Esc>".to_string())
+        );
+    }
+
+    #[test]
+    fn single_char_handles_letters_and_digits_lowercased() {
+        assert_eq!(single_char(Key::A), Some('a'));
+        assert_eq!(single_char(Key::Num1), Some('1'));
+        assert_eq!(single_char(Key::Escape), None);
     }
 }

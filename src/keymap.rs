@@ -21,6 +21,12 @@ pub enum KeyInput {
     Enter,
     /// The Escape key.
     Esc,
+    /// An arrow key, reusing [`Direction`] rather than a dedicated enum --
+    /// only meaningful today as the second half of the `Ctrl-w` pane-switch
+    /// chord (`Ctrl-w Right`/`Ctrl-w Left` alias `Ctrl-w l`/`Ctrl-w h`, see
+    /// [`resolve_pending`]); unbound everywhere else (arrows outside a
+    /// chord fall through every match arm to [`KeyOutcome::None`]).
+    Arrow(Direction),
 }
 
 /// A prefix key remembered across [`map_key`] calls to complete a chord.
@@ -192,14 +198,18 @@ fn resolve_pending(pending: Pending, key: KeyInput, ctx: KeyContext) -> KeyOutco
         (Pending::Char('['), Screen::Graph, Pane::File, KeyInput::Char('f')) => {
             KeyOutcome::Msg(Msg::FilePrevFile)
         }
-        (Pending::CtrlW, Screen::Graph, _, KeyInput::Char('l')) => {
+        (Pending::CtrlW, Screen::Graph, _, KeyInput::Char('l'))
+        | (Pending::CtrlW, Screen::Graph, _, KeyInput::Arrow(Direction::Right)) => {
             if ctx.file_open {
                 KeyOutcome::Msg(Msg::PaneRight)
             } else {
                 KeyOutcome::None
             }
         }
-        (Pending::CtrlW, Screen::Graph, _, KeyInput::Char('h')) => KeyOutcome::Msg(Msg::PaneLeft),
+        (Pending::CtrlW, Screen::Graph, _, KeyInput::Char('h'))
+        | (Pending::CtrlW, Screen::Graph, _, KeyInput::Arrow(Direction::Left)) => {
+            KeyOutcome::Msg(Msg::PaneLeft)
+        }
         _ => KeyOutcome::None,
     }
 }
@@ -548,6 +558,61 @@ mod tests {
         assert_eq!(
             map_key(KeyInput::Char('h'), ctx),
             KeyOutcome::Msg(Msg::PaneLeft)
+        );
+    }
+
+    #[test]
+    fn ctrl_w_then_right_arrow_aliases_l() {
+        let mut ctx = graph_ctx();
+        ctx.pending = Some(Pending::CtrlW);
+        assert_eq!(
+            map_key(KeyInput::Arrow(Direction::Right), ctx),
+            KeyOutcome::None,
+            "no file pane open yet"
+        );
+
+        ctx.file_open = true;
+        assert_eq!(
+            map_key(KeyInput::Arrow(Direction::Right), ctx),
+            KeyOutcome::Msg(Msg::PaneRight)
+        );
+    }
+
+    #[test]
+    fn ctrl_w_then_left_arrow_aliases_h() {
+        let mut ctx = file_pane_ctx();
+        ctx.pending = Some(Pending::CtrlW);
+        assert_eq!(
+            map_key(KeyInput::Arrow(Direction::Left), ctx),
+            KeyOutcome::Msg(Msg::PaneLeft)
+        );
+    }
+
+    #[test]
+    fn arrows_are_unbound_outside_a_chord() {
+        let ctx = graph_ctx();
+        for dir in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Up,
+            Direction::Down,
+        ] {
+            assert_eq!(map_key(KeyInput::Arrow(dir), ctx), KeyOutcome::None);
+        }
+    }
+
+    #[test]
+    fn ctrl_w_then_up_or_down_arrow_clears_chord_with_no_message() {
+        let mut ctx = graph_ctx();
+        ctx.pending = Some(Pending::CtrlW);
+        assert_eq!(
+            map_key(KeyInput::Arrow(Direction::Up), ctx),
+            KeyOutcome::None
+        );
+        ctx.pending = Some(Pending::CtrlW);
+        assert_eq!(
+            map_key(KeyInput::Arrow(Direction::Down), ctx),
+            KeyOutcome::None
         );
     }
 
