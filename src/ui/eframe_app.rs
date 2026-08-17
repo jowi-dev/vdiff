@@ -18,7 +18,7 @@ use egui::{Align2, Context, Key};
 
 use crate::core::app::{update, App, Cmd, Msg, Screen};
 use crate::core::diff_state::{DiffPaneState, FileEntry};
-use crate::graph::layout::LayoutResult;
+use crate::graph::layout::{layout, LayoutResult};
 use crate::graph::model::{NodeId, ProjectGraph};
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome};
 use crate::pipeline::file_diff::load_file_diff;
@@ -106,7 +106,8 @@ impl VdiffApp {
 
     /// Execute a [`Cmd`]: `LoadDiff` reads file content via `diff_loader`
     /// and reports the result back through the reducer as `DiffLoaded`/
-    /// `LoadFailed`.
+    /// `LoadFailed`; `Relayout` rebuilds `self.layout` from
+    /// [`App::visible_graph`] now that `self.app.layers` changed shape.
     fn execute(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::None => {}
@@ -114,6 +115,9 @@ impl VdiffApp {
                 Ok(state) => self.dispatch(Msg::DiffLoaded(state)),
                 Err(message) => self.dispatch(Msg::LoadFailed(message)),
             },
+            Cmd::Relayout => {
+                self.layout = layout(&self.app.visible_graph());
+            }
         }
     }
 
@@ -276,7 +280,7 @@ impl eframe::App for VdiffApp {
 
 /// Translate an egui key press to vdiff's toolkit-independent [`KeyInput`].
 /// Pure and unit-tested: only the keys [`crate::keymap::map_key`] cares
-/// about (h/j/k/l/g/d/r, Enter, Esc) map to anything; everything else is
+/// about (h/j/k/l/g/d/r/t, Enter, Esc) map to anything; everything else is
 /// `None`.
 pub fn egui_key_to_input(key: Key) -> Option<KeyInput> {
     match key {
@@ -287,6 +291,7 @@ pub fn egui_key_to_input(key: Key) -> Option<KeyInput> {
         Key::G => Some(KeyInput::Char('g')),
         Key::D => Some(KeyInput::Char('d')),
         Key::R => Some(KeyInput::Char('r')),
+        Key::T => Some(KeyInput::Char('t')),
         Key::Enter => Some(KeyInput::Enter),
         Key::Escape => Some(KeyInput::Esc),
         _ => None,
@@ -308,6 +313,7 @@ mod tests {
             (Key::G, KeyInput::Char('g')),
             (Key::D, KeyInput::Char('d')),
             (Key::R, KeyInput::Char('r')),
+            (Key::T, KeyInput::Char('t')),
             (Key::Enter, KeyInput::Enter),
             (Key::Escape, KeyInput::Esc),
         ];

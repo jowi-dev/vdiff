@@ -8,6 +8,7 @@ use vdiff::core::app::{App, Screen};
 use vdiff::graph::filter::focus_on_changes;
 use vdiff::graph::layout::layout;
 use vdiff::graph::model::{NodeId, ProjectGraph};
+use vdiff::graph::test_modules::hide_test_modules;
 use vdiff::pipeline::git2_repo::Git2Repo;
 use vdiff::pipeline::repo::GitRepo;
 use vdiff::pipeline::{build_graph, PipelineOptions};
@@ -111,7 +112,11 @@ fn run_gui(
     smoke: bool,
     diff_loader: DiffLoader,
 ) -> ExitCode {
-    let layout_result = layout(&graph);
+    // `show_tests` defaults to false, so the layout/layers vdiff opens on
+    // must be built from the test-hidden graph, not the raw (possibly
+    // test-heavy) one -- see `App::visible_graph`.
+    let visible = hide_test_modules(&graph).0;
+    let layout_result = layout(&visible);
     // The first node of the first layer, not `graph.sorted_roots()[0]` --
     // roots can be synthetic namespace containers, which are never drawn or
     // focusable (see `graph::layers`).
@@ -128,6 +133,7 @@ fn run_gui(
         screen: Screen::Graph,
         diff: None,
         picker: None,
+        show_tests: false,
     };
 
     let title = format!("vdiff — {}", repo_dir_name(repo_path));

@@ -63,7 +63,8 @@ pub enum KeyOutcome {
 ///    itself guards `Diff*` messages to [`Screen::Diff`].
 /// 3. Otherwise, per `ctx.screen`:
 ///    - [`Screen::Graph`]: `h`/`j`/`k`/`l` -> [`Msg::FocusMove`], `Enter` ->
-///      [`Msg::OpenDiff`], `g` -> [`KeyOutcome::Pending`].
+///      [`Msg::OpenDiff`], `g` -> [`KeyOutcome::Pending`], `t` ->
+///      [`Msg::ToggleTests`].
 ///    - [`Screen::Diff`]: `Esc` -> [`Msg::CloseDiff`], `j`/`k` ->
 ///      [`Msg::DiffScroll`], `s` -> [`Msg::DiffToggleMode`], `]`/`[` ->
 ///      [`KeyOutcome::Pending`].
@@ -100,6 +101,7 @@ pub fn map_key(key: KeyInput, ctx: KeyContext) -> KeyOutcome {
             KeyInput::Char('l') => KeyOutcome::Msg(Msg::FocusMove(Direction::Right)),
             KeyInput::Enter => KeyOutcome::Msg(Msg::OpenDiff),
             KeyInput::Char('g') => KeyOutcome::Pending('g'),
+            KeyInput::Char('t') => KeyOutcome::Msg(Msg::ToggleTests),
             _ => KeyOutcome::None,
         },
         Screen::Diff => match key {
@@ -170,6 +172,11 @@ mod tests {
             (KeyInput::Enter, graph_ctx(), KeyOutcome::Msg(Msg::OpenDiff)),
             (KeyInput::Esc, graph_ctx(), KeyOutcome::None),
             (KeyInput::Char('q'), graph_ctx(), KeyOutcome::None),
+            (
+                KeyInput::Char('t'),
+                graph_ctx(),
+                KeyOutcome::Msg(Msg::ToggleTests),
+            ),
             // 'g' starts a chord.
             (KeyInput::Char('g'), graph_ctx(), KeyOutcome::Pending('g')),
             // Picker open: j/k/Enter/Esc, regardless of screen field.

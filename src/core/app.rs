@@ -8,7 +8,9 @@
 
 pub use crate::core::diff_state::DiffPaneState;
 use crate::core::focus::{dep_targets, dependent_sources, move_focus, Direction};
+use crate::graph::layers::assign_layers;
 use crate::graph::model::{NodeId, ProjectGraph};
+use crate::graph::test_modules::hide_test_modules;
 
 /// Which screen is currently shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +55,13 @@ pub struct App {
     pub diff: Option<DiffPaneState>,
     /// The edge-following picker overlay, `None` when closed.
     pub picker: Option<EdgePicker>,
+    /// Whether Elixir/Rust test modules (see
+    /// [`crate::graph::test_modules::is_test_module`]) are shown. Defaults
+    /// to `false` -- half the nodes in a typical change set are test
+    /// modules, and hiding them by default is what makes the layered graph
+    /// read as a call-stack story rather than a wall of noise. Toggled by
+    /// [`Msg::ToggleTests`] (`t` on [`Screen::Graph`]).
+    pub show_tests: bool,
 }
 
 impl App {
@@ -61,6 +70,21 @@ impl App {
     /// unknown id. [`Msg::FocusSet`] rejects any target that isn't.
     fn is_drawn(&self, id: &NodeId) -> bool {
         self.layers.iter().any(|layer| layer.contains(id))
+    }
+
+    /// The graph actually drawn: `self.graph` as-is if [`Self::show_tests`],
+    /// or with every test module pruned out (see
+    /// [`crate::graph::test_modules::hide_test_modules`]) otherwise. `self.graph`
+    /// itself never changes -- it's always the full, focus-filtered graph --
+    /// so this is what [`Msg::ToggleTests`] recomputes `layers` from, and
+    /// what the caller should re-run [`crate::graph::layout::layout`] over
+    /// after a [`Cmd::Relayout`].
+    pub fn visible_graph(&self) -> ProjectGraph {
+        if self.show_tests {
+            self.graph.clone()
+        } else {
+            hide_test_modules(&self.graph).0
+        }
     }
 }
 
@@ -116,6 +140,11 @@ pub enum Msg {
     /// not stored -- [`App`] has no status/error field yet (can come
     /// later).
     LoadFailed(String),
+    /// `t`: flip [`App::show_tests`], recompute `layers` from
+    /// [`App::visible_graph`], and re-seat focus if it landed on a node that
+    /// just got hidden. Only acted on on [`Screen::Graph`] with no picker
+    /// open, matching every other graph-view message.
+    ToggleTests,
 }
 
 /// I/O the caller should perform as a result of [`update`]. `update` never
@@ -127,6 +156,10 @@ pub enum Cmd {
     /// Load diff state for the given node, reporting back via
     /// [`Msg::DiffLoaded`]/[`Msg::LoadFailed`].
     LoadDiff(NodeId),
+    /// `App::layers` changed shape (currently only [`Msg::ToggleTests`]) --
+    /// the caller must rebuild its [`crate::graph::layout::LayoutResult`]
+    /// from [`App::visible_graph`] before painting again.
+    Relayout,
 }
 
 /// Advance `app` in response to `msg`, returning the new state and any
@@ -197,7 +230,54 @@ pub fn update(mut app: App, msg: Msg) -> (App, Cmd) {
             with_diff_pane(&mut app, |diff| diff.shift_file(-1));
             (app, Cmd::None)
         }
+        Msg::ToggleTests => toggle_tests(app),
     }
+}
+
+/// Handle [`Msg::ToggleTests`]: flip `show_tests`, recompute `layers` from
+/// [`App::visible_graph`], and re-seat focus (see [`reseat_focus`]) if it's
+/// no longer drawn.
+fn toggle_tests(mut app: App) -> (App, Cmd) {
+    if !on_graph_with_no_picker(&app) {
+        return (app, Cmd::None);
+    }
+    app.show_tests = !app.show_tests;
+    let old_layers = std::mem::take(&mut app.layers);
+    app.layers = assign_layers(&app.visible_graph());
+    if !app.is_drawn(&app.focus) {
+        app.focus = reseat_focus(&old_layers, &app.layers, &app.focus);
+    }
+    (app, Cmd::Relayout)
+}
+
+/// Find `id`'s `(layer_idx, pos_idx)` in `layers`, or `None` if absent.
+fn locate(layers: &[Vec<NodeId>], id: &NodeId) -> Option<(usize, usize)> {
+    for (layer_idx, row) in layers.iter().enumerate() {
+        if let Some(pos_idx) = row.iter().position(|n| n == id) {
+            return Some((layer_idx, pos_idx));
+        }
+    }
+    None
+}
+
+/// Pick a new focus after `focus` was hidden by a `layers` rebuild: land on
+/// the node at the same `(layer_idx, pos_idx)` in `new_layers` (both
+/// clamped to bounds) it held in `old_layers`, or `new_layers[0][0]` if
+/// `focus` wasn't found in `old_layers` at all or `new_layers` is empty.
+fn reseat_focus(old_layers: &[Vec<NodeId>], new_layers: &[Vec<NodeId>], focus: &NodeId) -> NodeId {
+    if new_layers.is_empty() {
+        return focus.clone();
+    }
+    let Some((old_layer_idx, old_pos_idx)) = locate(old_layers, focus) else {
+        return new_layers[0][0].clone();
+    };
+    let layer_idx = old_layer_idx.min(new_layers.len() - 1);
+    let row = &new_layers[layer_idx];
+    if row.is_empty() {
+        return new_layers[0][0].clone();
+    }
+    let pos_idx = old_pos_idx.min(row.len() - 1);
+    row[pos_idx].clone()
 }
 
 /// Shared guard for the `Diff*` messages that mutate the open diff pane:
@@ -375,6 +455,7 @@ mod tests {
             screen: Screen::Graph,
             diff: None,
             picker: None,
+            show_tests: false,
         }
     }
 
@@ -702,5 +783,108 @@ mod tests {
         assert_eq!(app.diff.as_ref().unwrap().file_index, 0, "clamped: 1 file");
         let (app, _) = update(app, Msg::DiffPrevFile);
         assert_eq!(app.diff.unwrap().file_index, 0);
+    }
+
+    /// `graph_fixture` plus one isolated test module (`test_x`, files under
+    /// `test/`, no edges) -- lands in its own trailing layer when shown,
+    /// disappears entirely when hidden.
+    fn graph_fixture_with_test_node() -> ProjectGraph {
+        let mut g = graph_fixture();
+        let test_id = NodeId::from("test_x");
+        g.nodes.insert(
+            test_id.clone(),
+            ModuleNode {
+                id: test_id.clone(),
+                display_name: "TestX".to_string(),
+                parent: None,
+                children: vec![],
+                status: GitStatus::Unchanged,
+                files: vec![crate::graph::model::FileRef {
+                    path: PathBuf::from("test/test_x_test.exs"),
+                    base_blob: Some("b".to_string()),
+                    head_blob: Some("h".to_string()),
+                }],
+            },
+        );
+        g.roots.push(test_id);
+        g
+    }
+
+    #[test]
+    fn toggle_tests_reveals_hidden_test_node_and_recomputes_layers() {
+        let g = graph_fixture_with_test_node();
+        let visible = crate::graph::test_modules::hide_test_modules(&g).0;
+        let app = App {
+            graph: g,
+            layers: crate::graph::layers::assign_layers(&visible),
+            focus: NodeId::from("leaf_a"),
+            screen: Screen::Graph,
+            diff: None,
+            picker: None,
+            show_tests: false,
+        };
+        assert!(!app
+            .layers
+            .iter()
+            .flatten()
+            .any(|id| id == &NodeId::from("test_x")));
+
+        let (app, cmd) = update(app, Msg::ToggleTests);
+
+        assert!(app.show_tests);
+        assert_eq!(cmd, Cmd::Relayout);
+        assert!(
+            app.layers
+                .iter()
+                .flatten()
+                .any(|id| id == &NodeId::from("test_x")),
+            "test_x should now be drawn"
+        );
+        assert_eq!(app.focus, NodeId::from("leaf_a"), "focus unaffected");
+    }
+
+    #[test]
+    fn toggle_tests_reseats_focus_when_the_focused_node_becomes_hidden() {
+        let g = graph_fixture_with_test_node();
+        let app = App {
+            layers: crate::graph::layers::assign_layers(&g),
+            graph: g,
+            focus: NodeId::from("test_x"),
+            screen: Screen::Graph,
+            diff: None,
+            picker: None,
+            show_tests: true,
+        };
+
+        let (app, cmd) = update(app, Msg::ToggleTests);
+
+        assert!(!app.show_tests);
+        assert_eq!(cmd, Cmd::Relayout);
+        assert_ne!(app.focus, NodeId::from("test_x"));
+        assert!(
+            app.layers.iter().flatten().any(|id| id == &app.focus),
+            "reseated focus must be a drawn node"
+        );
+    }
+
+    #[test]
+    fn toggle_tests_noop_when_picker_open() {
+        let mut app = app_at("leaf_a");
+        app.picker = Some(EdgePicker {
+            candidates: vec![NodeId::from("target_x")],
+            selected: 0,
+        });
+        let (app, cmd) = update(app, Msg::ToggleTests);
+        assert!(!app.show_tests);
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn toggle_tests_noop_off_graph_screen() {
+        let mut app = app_at("leaf_a");
+        app.screen = Screen::Diff;
+        let (app, cmd) = update(app, Msg::ToggleTests);
+        assert!(!app.show_tests);
+        assert_eq!(cmd, Cmd::None);
     }
 }
