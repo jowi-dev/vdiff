@@ -292,3 +292,62 @@ fn renamed_and_edited_file_is_modified_at_new_path_with_no_deleted_old_node() {
         "old path must not surface as a phantom Deleted node"
     );
 }
+
+/// vdiff's change set is `git diff <base>` -- base vs. the working
+/// directory, not base vs. the HEAD commit -- so an uncommitted edit to a
+/// tracked file must appear as `Modified` even though `HEAD` (the
+/// `feature` branch tip) never changed after the initial commit.
+#[test]
+fn uncommitted_worktree_edit_appears_as_modified_without_a_commit() {
+    let tmp = TempDir::new().expect("create tempdir");
+    let dir = tmp.path();
+
+    git(dir, &["init", "-b", "main"]);
+    write(dir, "lib/my_app/repo.ex", "defmodule MyApp.Repo do\nend\n");
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-m", "initial"]);
+
+    git(dir, &["checkout", "-b", "feature"]);
+    // Uncommitted, unstaged -- deliberately no `git add`/`git commit` here.
+    write(
+        dir,
+        "lib/my_app/repo.ex",
+        "defmodule MyApp.Repo do\n  # dirty worktree edit\nend\n",
+    );
+
+    let graph = dump_json(dir, None);
+
+    let repo_node = graph
+        .node(&NodeId::from("elixir:MyApp.Repo"))
+        .expect("Repo node");
+    assert_eq!(repo_node.status, GitStatus::Modified);
+}
+
+/// An untracked new file (never `git add`ed) must appear as `Added`, same
+/// as a committed one -- `changed_files` has to include untracked files
+/// for base-vs-worktree semantics to mean what `git diff <base>` means.
+#[test]
+fn untracked_new_file_appears_as_added() {
+    let tmp = TempDir::new().expect("create tempdir");
+    let dir = tmp.path();
+
+    git(dir, &["init", "-b", "main"]);
+    write(dir, "lib/my_app/repo.ex", "defmodule MyApp.Repo do\nend\n");
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-m", "initial"]);
+
+    git(dir, &["checkout", "-b", "feature"]);
+    // Untracked -- deliberately no `git add` here.
+    write(
+        dir,
+        "lib/my_app/mailer.ex",
+        "defmodule MyApp.Mailer do\nend\n",
+    );
+
+    let graph = dump_json(dir, None);
+
+    let mailer_node = graph
+        .node(&NodeId::from("elixir:MyApp.Mailer"))
+        .expect("Mailer node");
+    assert_eq!(mailer_node.status, GitStatus::Added);
+}

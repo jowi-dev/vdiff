@@ -6,22 +6,31 @@
 //! whichever exists first. `base_override`, when given, is tried directly
 //! via `revparse_single` instead.
 //!
-//! `head_content`/`list_tracked_files` read the checked-out worktree and
-//! the HEAD commit's tree respectively; `base_blob`/`base_blob_oid` read
-//! `base_oid`'s tree. `head_content` and `base_blob` both read raw bytes and
-//! lossy-decode as UTF-8 (`String::from_utf8_lossy`), so a non-UTF8 file
-//! (a binary asset) degrades to garbage text for extraction rather than
-//! erroring `build_graph` out entirely. Known limitation: `head_blob_oid`
-//! is sourced from the HEAD commit's tree, not a live hash of the worktree
-//! file -- if the worktree has uncommitted changes beyond HEAD,
-//! `head_content` still returns the accurate live content for parsing, but
-//! the recorded blob id won't match it exactly. Fine for the
-//! reviewed-branch workflow this tool targets (committed changes), a known
-//! gap otherwise.
+//! vdiff's change set is `git diff <base>` -- `base_oid` vs. the working
+//! directory (including staged changes and untracked files), not vs. the
+//! HEAD commit -- everywhere, on purpose: the embedded nvim pane makes
+//! editing-during-review a first-class flow, so a dirty worktree has to
+//! show up as changes rather than being invisible in the graph while
+//! still visible as diff marks in an opened file. `changed_files` uses
+//! `diff_tree_to_workdir_with_index` accordingly; `head_content` already
+//! read the worktree (that part was always right); `head_blob_oid` now
+//! hashes the worktree file's live bytes (`Oid::hash_object`, no object-db
+//! write) rather than reading the HEAD tree, so it agrees with
+//! `head_content`/`changed_files` on what "exists at head" means -- a
+//! worktree-only new file gets `head_blob_oid = Some(..)` and is never
+//! mistaken for deleted. `list_tracked_files`/`base_blob`/`base_blob_oid`
+//! still read the HEAD tree/`base_oid`'s tree respectively -- both
+//! unambiguous, unaffected by this distinction. `head_content` and
+//! `base_blob` both read raw bytes and lossy-decode as UTF-8
+//! (`String::from_utf8_lossy`), so a non-UTF8 file (a binary asset)
+//! degrades to garbage text for extraction rather than erroring
+//! `build_graph` out entirely.
 
 use std::path::{Path, PathBuf};
 
-use git2::{Delta, DiffFindOptions, ObjectType, Oid, Repository, TreeWalkMode, TreeWalkResult};
+use git2::{
+    Delta, DiffFindOptions, DiffOptions, ObjectType, Oid, Repository, TreeWalkMode, TreeWalkResult,
+};
 
 use crate::pipeline::error::{PipelineError, Result};
 use crate::pipeline::repo::{Change, FileDelta, GitRepo};
@@ -108,10 +117,17 @@ impl GitRepo for Git2Repo {
 
     fn changed_files(&self, base_oid: &str) -> Result<Vec<FileDelta>> {
         let base_tree = self.tree_at(base_oid)?;
-        let head_tree = self.repo.head()?.peel_to_tree()?;
+        // `git diff <base>` semantics: base tree vs. working directory,
+        // including the index (staged changes) and untracked files -- see
+        // the module doc for why this, not base-vs-HEAD, is vdiff's change
+        // set. `recurse_untracked_dirs` matters too: without it, a brand
+        // new untracked *directory* shows up as one opaque delta for the
+        // directory itself rather than one per file inside it.
+        let mut opts = DiffOptions::new();
+        opts.include_untracked(true).recurse_untracked_dirs(true);
         let mut diff = self
             .repo
-            .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)?;
+            .diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut opts))?;
         let mut find_opts = DiffFindOptions::new();
         find_opts.renames(true);
         diff.find_similar(Some(&mut find_opts))?;
@@ -121,7 +137,12 @@ impl GitRepo for Git2Repo {
             let new_path = delta.new_file().path().map(Path::to_path_buf);
             let old_path = delta.old_file().path().map(Path::to_path_buf);
             match delta.status() {
-                Delta::Added => {
+                // `Untracked` -- a brand-new file with no index entry at
+                // all -- is reported distinctly from `Added` (present in
+                // the index/workdir but absent from the diff base's tree)
+                // by `diff_tree_to_workdir_with_index`; both mean the same
+                // thing for vdiff's purposes.
+                Delta::Added | Delta::Untracked => {
                     if let Some(path) = new_path {
                         deltas.push(FileDelta {
                             path,
@@ -197,12 +218,28 @@ impl GitRepo for Git2Repo {
         Ok(tree.get_path(path).ok().map(|entry| entry.id().to_string()))
     }
 
+    /// Hashes the worktree file's live bytes (`git2::Oid::hash_object` --
+    /// computes the blob id a `git add` of this content would produce,
+    /// without writing anything to the object database) rather than
+    /// reading the HEAD tree, so this agrees with `head_content` and
+    /// `changed_files`'s `git diff <base>` semantics on what "exists at
+    /// head" means (see the module doc): a worktree-only new file gets
+    /// `Some(oid)` here, not `None` as it would from the HEAD tree, and
+    /// `None` means "absent from the worktree", not "absent from HEAD".
     fn head_blob_oid(&self, path: &Path) -> Result<Option<String>> {
-        let head_tree = self.repo.head()?.peel_to_tree()?;
-        Ok(head_tree
-            .get_path(path)
-            .ok()
-            .map(|entry| entry.id().to_string()))
+        let Some(workdir) = self.repo.workdir() else {
+            return Ok(None);
+        };
+        match std::fs::read(workdir.join(path)) {
+            Ok(bytes) => Ok(Some(
+                Oid::hash_object(ObjectType::Blob, &bytes)?.to_string(),
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(PipelineError::Io {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
     }
 }
 

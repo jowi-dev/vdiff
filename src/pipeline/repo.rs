@@ -38,7 +38,10 @@ pub trait GitRepo {
     /// `main`, else `master`.
     fn default_base_oid(&self, base_override: Option<&str>) -> Result<String>;
 
-    /// Every file that differs between `base_oid` and HEAD, with rename
+    /// Every file that differs between `base_oid` and the working
+    /// directory (`git diff <base>` semantics -- staged changes and
+    /// untracked files both count, not just committed ones; see
+    /// [`crate::pipeline::git2_repo`]'s module doc for why), with rename
     /// detection on.
     fn changed_files(&self, base_oid: &str) -> Result<Vec<FileDelta>>;
 
@@ -58,8 +61,15 @@ pub trait GitRepo {
     /// [`GitRepo::base_blob`], which returns content for extraction.
     fn base_blob_oid(&self, base_oid: &str, path: &Path) -> Result<Option<String>>;
 
-    /// `path`'s blob id (hex) in the checked-out worktree/HEAD, or `None`
-    /// if absent. Populates [`crate::graph::model::FileRef::head_blob`].
+    /// `path`'s blob id (hex) in the checked-out worktree -- what its
+    /// content would hash to if added right now, not necessarily anything
+    /// actually in the object database -- or `None` if the file is absent
+    /// from the worktree. Populates
+    /// [`crate::graph::model::FileRef::head_blob`]; `None` there means
+    /// "deleted" to every downstream consumer (the diff pane, the file
+    /// viewer, the nvim pane), so this has to agree with
+    /// [`GitRepo::head_content`]/[`GitRepo::changed_files`] on what
+    /// "exists at head" means.
     fn head_blob_oid(&self, path: &Path) -> Result<Option<String>>;
 }
 
