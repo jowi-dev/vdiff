@@ -108,8 +108,10 @@ fn add_ancestors(graph: &ProjectGraph, keep: &mut HashSet<NodeId>) {
 /// Rebuild `graph` containing only `keep`'s nodes: edges with a dropped
 /// endpoint are dropped, `children`/`roots` are filtered to kept ids
 /// (preserving their existing order), and `parent` links are left as-is
-/// (every kept node's ancestors are kept too, by construction).
-fn prune(graph: &ProjectGraph, keep: &HashSet<NodeId>) -> ProjectGraph {
+/// (every kept node's ancestors are kept too, by construction). `pub(crate)`
+/// so other prune-shaped filters (see [`crate::graph::test_modules`]) can
+/// reuse it instead of re-implementing the same rebuild.
+pub(crate) fn prune(graph: &ProjectGraph, keep: &HashSet<NodeId>) -> ProjectGraph {
     let nodes: HashMap<NodeId, ModuleNode> = graph
         .nodes
         .iter()

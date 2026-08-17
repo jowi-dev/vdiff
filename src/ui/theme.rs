@@ -9,6 +9,12 @@ use egui::{Color32, Stroke};
 
 use crate::graph::model::GitStatus;
 
+// `abbreviated_label` is a pure string function with no egui dependency --
+// it lives in `crate::graph::labels` so `crate::graph::layout` can use it
+// too (label-fit box sizing), and is re-exported here so existing
+// `theme::abbreviated_label` call sites keep working.
+pub use crate::graph::labels::abbreviated_label;
+
 /// The central panel's background.
 pub const CANVAS_BG: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x1e);
 
@@ -48,6 +54,39 @@ pub fn leaf_border_stroke(status: GitStatus) -> Stroke {
 pub fn edge_stroke() -> Stroke {
     Stroke::new(1.0, EDGE_COLOR)
 }
+
+/// Stroke for edges that don't touch the focused node: same hue as
+/// [`edge_stroke`], but faint (~25% alpha) so the hairball recedes and the
+/// focused node's own edges (see [`edge_stroke_outgoing`]/
+/// [`edge_stroke_incoming`]) read as the story.
+pub fn edge_stroke_dim() -> Stroke {
+    Stroke::new(1.0, Color32::from_rgba_unmultiplied(0x66, 0x66, 0x66, 64))
+}
+
+/// Warm accent for edges leaving the focused node (it depends on the
+/// target).
+pub const EDGE_OUTGOING: Color32 = Color32::from_rgb(0xe0, 0x8a, 0x3d);
+
+/// Cool accent for edges arriving at the focused node (the source depends
+/// on it).
+pub const EDGE_INCOMING: Color32 = Color32::from_rgb(0x4d, 0xc8, 0xe8);
+
+/// Stroke for edges out of the focused node -- "focused depends on".
+pub fn edge_stroke_outgoing() -> Stroke {
+    Stroke::new(2.0, EDGE_OUTGOING)
+}
+
+/// Stroke for edges into the focused node -- "depends on focused".
+pub fn edge_stroke_incoming() -> Stroke {
+    Stroke::new(2.0, EDGE_INCOMING)
+}
+
+/// Color of the small "tested" badge glyph drawn on a node that has a
+/// changed test module covering it (see
+/// [`crate::graph::test_modules::nodes_with_changed_tests`]). A muted green,
+/// distinct from [`leaf_fill`]'s `Added` green so it doesn't read as a
+/// status change.
+pub const TESTED_BADGE_COLOR: Color32 = Color32::from_rgb(0x6a, 0xc9, 0x6a);
 
 /// Faint horizontal line color separating one layer's band from the next.
 pub const BAND_SEPARATOR: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x2c);
@@ -100,84 +139,9 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Color32 {
     )
 }
 
-/// Abbreviate `id`'s qualified name for display by stripping its top-level
-/// root's own qualified prefix: `elixir:App.Leads.Lead` under root
-/// `elixir:App` becomes `Leads.Lead`. `id` naming `root_id` itself (the
-/// root's own module) shows `display_name` plain, matching every other
-/// node's own name. Falls back to `id`'s body (language prefix stripped)
-/// if it doesn't actually start with the root's prefix (shouldn't happen
-/// for a well-formed graph, but avoids stripping the wrong thing).
-pub fn abbreviated_label(id: &str, root_id: &str, display_name: &str) -> String {
-    let id_body = strip_lang_prefix(id);
-    let root_body = strip_lang_prefix(root_id);
-
-    if id_body == root_body {
-        return display_name.to_string();
-    }
-
-    let sep = lang_separator(id);
-    let prefix = format!("{root_body}{sep}");
-    match id_body.strip_prefix(&prefix) {
-        Some(rest) => rest.to_string(),
-        None => id_body.to_string(),
-    }
-}
-
-/// Strip a `lang:` namespace prefix (`elixir:`, `rust:`, `file:` -- see
-/// [`crate::graph::builder`]) off an id string, if present.
-fn strip_lang_prefix(id: &str) -> &str {
-    match id.find(':') {
-        Some(idx) => &id[idx + 1..],
-        None => id,
-    }
-}
-
-/// The path separator a given id's language namespace uses between
-/// segments, so [`abbreviated_label`] strips exactly the root prefix and
-/// not part of the next segment's name.
-fn lang_separator(id: &str) -> &'static str {
-    if id.starts_with("rust:") {
-        "::"
-    } else if id.starts_with("file:") {
-        "/"
-    } else {
-        // elixir: and anything unrecognized.
-        "."
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn abbreviated_label_strips_elixir_root_prefix() {
-        assert_eq!(
-            abbreviated_label("elixir:App.Leads.Lead", "elixir:App", "Lead"),
-            "Leads.Lead"
-        );
-    }
-
-    #[test]
-    fn abbreviated_label_shows_plain_name_for_the_root_itself() {
-        assert_eq!(abbreviated_label("elixir:App", "elixir:App", "App"), "App");
-    }
-
-    #[test]
-    fn abbreviated_label_strips_rust_root_prefix() {
-        assert_eq!(
-            abbreviated_label("rust:crate_a::foo::bar", "rust:crate_a", "bar"),
-            "foo::bar"
-        );
-    }
-
-    #[test]
-    fn abbreviated_label_falls_back_to_full_body_when_not_prefixed() {
-        assert_eq!(
-            abbreviated_label("elixir:Other.Thing", "elixir:App", "Thing"),
-            "Other.Thing"
-        );
-    }
 
     #[test]
     fn root_hue_color_is_deterministic() {
