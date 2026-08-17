@@ -272,6 +272,32 @@ mod tests {
         assert!((after.y - cursor.y).abs() < 0.001);
     }
 
+    /// The general anchor-invariance property `zoom` must hold: whatever
+    /// world point sits under `anchor` before the call still maps to
+    /// `anchor` after, for a transform that already carries a non-identity
+    /// pan and scale (the trivial default-transform case above can pass
+    /// even with a wrong-coordinate-frame formula, since offset starts at
+    /// zero -- this one can't).
+    #[test]
+    fn zoom_at_keeps_world_point_under_anchor_with_prior_pan_and_scale() {
+        let mut t = Transform {
+            scale: 2.0,
+            offset: Vec2::new(30.0, -15.0),
+        };
+        let anchor = Pos2::new(120.0, 80.0);
+        let world_under_anchor = LPos {
+            x: (anchor.x - t.offset.x) / t.scale,
+            y: (anchor.y - t.offset.y) / t.scale,
+        };
+        assert_eq!(t.to_screen_pos(world_under_anchor), anchor);
+
+        t.zoom(1.6, anchor);
+
+        let after = t.to_screen_pos(world_under_anchor);
+        assert!((after.x - anchor.x).abs() < 0.001, "x drifted: {after:?}");
+        assert!((after.y - anchor.y).abs() < 0.001, "y drifted: {after:?}");
+    }
+
     #[test]
     fn clamp_into_view_is_noop_when_already_visible() {
         let viewport = EguiRect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));

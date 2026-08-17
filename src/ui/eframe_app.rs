@@ -1,9 +1,16 @@
 //! [`eframe::App`] glue: owns [`core::App`] plus view-only state (the pan/
-//! zoom [`Transform`] and the pending `g`-chord char), translates egui key
-//! events into [`crate::keymap::KeyInput`], threads them through
-//! [`crate::keymap::map_key`] and [`crate::core::app::update`], and executes
-//! the resulting [`Cmd`]. All I/O and toolkit-specific state lives here --
-//! `core::App`/`update` stay pure.
+//! zoom [`Transform`], the last-followed focus, and the pending `g`-chord
+//! char), translates egui key events into [`crate::keymap::KeyInput`],
+//! threads them through [`crate::keymap::map_key`] and
+//! [`crate::core::app::update`], and executes the resulting [`Cmd`]. All
+//! I/O and toolkit-specific state lives here -- `core::App`/`update` stay
+//! pure.
+//!
+//! Keyboard zoom (`+`/`=`/`-`) is the one exception to the `map_key`
+//! pipeline: it only ever changes the view-only `Transform`, never
+//! `core::App`, so it's handled directly in [`VdiffApp::handle_zoom_keys`]
+//! instead of growing `crate::keymap::KeyInput` with a variant the reducer
+//! would never act on.
 
 use std::time::{Duration, Instant};
 
@@ -21,6 +28,9 @@ use crate::ui::graph_view::{self, Transform};
 
 /// How long `--smoke` keeps the window open before closing it.
 const SMOKE_DURATION: Duration = Duration::from_secs(2);
+
+/// Scale multiplier applied per `+`/`-` keyboard zoom press.
+const ZOOM_KEY_FACTOR: f32 = 1.2;
 
 /// Everything [`Cmd::LoadDiff`] needs to read file content from git: the
 /// repository and the diff base it was resolved against at startup. Lives
@@ -145,6 +155,48 @@ impl VdiffApp {
         }
     }
 
+    /// `+`/`=` zoom in, `-` zooms out, both anchored on the focused node's
+    /// rect center. This is view-only: it only ever changes
+    /// [`Self::transform`], never [`core::App`] state, so -- unlike
+    /// [`Self::handle_keys`] -- it bypasses [`map_key`]/the reducer
+    /// entirely instead of adding these as [`crate::keymap::KeyInput`]
+    /// variants. Only meaningful on [`Screen::Graph`], where a `Transform`
+    /// and focused node's layout rect exist.
+    fn handle_zoom_keys(&mut self, ctx: &Context) {
+        if self.app.screen != Screen::Graph {
+            return;
+        }
+        let presses: Vec<Key> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::Key {
+                        key: key @ (Key::Plus | Key::Equals | Key::Minus),
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    } => Some(*key),
+                    _ => None,
+                })
+                .collect()
+        });
+        if presses.is_empty() {
+            return;
+        }
+        let Some(focus_rect) = self.layout.rects.get(&self.app.focus) else {
+            return;
+        };
+        let anchor = self.transform.to_screen_pos(focus_rect.center());
+        for key in presses {
+            let factor = if key == Key::Minus {
+                1.0 / ZOOM_KEY_FACTOR
+            } else {
+                ZOOM_KEY_FACTOR
+            };
+            self.transform.zoom(factor, anchor);
+        }
+    }
+
     /// Floating j/k/Enter/Esc picker for [`crate::core::app::Msg::FollowDeps`]/
     /// [`crate::core::app::Msg::FollowDependents`], listing candidate
     /// display names with the selected one highlighted. Fixed/centered, not
@@ -195,6 +247,7 @@ impl eframe::App for VdiffApp {
         }
 
         self.handle_keys(ctx);
+        self.handle_zoom_keys(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
