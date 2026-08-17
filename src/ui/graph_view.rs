@@ -1,8 +1,11 @@
-//! Paints the node graph on a central panel with [`egui::Painter`] directly
-//! (rects, title text, straight edge lines) rather than a node-graph widget
-//! -- see the plan's Chunk D decision: our nodes are nested cluster boxes
-//! with cross-cluster edges, which a flat pin-to-pin widget (egui_snarl)
-//! fights rather than helps.
+//! Paints the layered-dependency graph on a central panel with
+//! [`egui::Painter`] directly (rects, labels, straight edge lines) rather
+//! than a node-graph widget. Namespace containment is no longer drawn as
+//! nested boxes (see [`crate::graph::layers`]/[`crate::graph::layout`]):
+//! every node is a flat, leaf-sized box positioned by dependency layer, with
+//! a colored left-edge stripe conveying which top-level root it belongs to
+//! and an abbreviated qualified label. A small legend row pinned at the top
+//! of the canvas maps each root's name to its hue.
 //!
 //! Pan/zoom is view-only state ([`Transform`]) that lives in the eframe
 //! glue, never in [`crate::core::app::App`] -- the core stays geometry-free.
@@ -10,7 +13,7 @@
 use egui::{Align2, Color32, FontId, Pos2, Rect as EguiRect, Sense, StrokeKind, Ui, Vec2};
 
 use crate::core::app::App;
-use crate::graph::layout::{LayoutResult, Pos as LPos, Rect as LRect, TITLE_H};
+use crate::graph::layout::{LayoutResult, Pos as LPos, Rect as LRect};
 use crate::graph::model::{GitStatus, NodeId, ProjectGraph};
 use crate::ui::theme;
 
@@ -18,6 +21,14 @@ use crate::ui::theme;
 pub const MIN_SCALE: f32 = 0.1;
 /// Zoom upper bound (500%).
 pub const MAX_SCALE: f32 = 5.0;
+
+/// Width of a node's colored left-edge stripe conveying its top-level root
+/// (screen-space pixels, independent of zoom -- a thin stripe stays legible
+/// at every scale rather than shrinking away when zoomed out).
+const STRIPE_W: f32 = 4.0;
+
+/// Height reserved for the legend row pinned at the top of the canvas.
+const LEGEND_H: f32 = 22.0;
 
 /// Pan/zoom applied to every layout-space point at paint time: `screen =
 /// layout * scale + offset`.
@@ -65,10 +76,10 @@ impl Transform {
     }
 }
 
-/// Paint the graph into `ui`'s available space: background, edges, then
-/// node rects parent-before-child (containment gives natural z-order),
-/// leaf/title labels. Handles pan (drag) and zoom (scroll) on the empty
-/// canvas, and auto-pans so a newly focused node comes into view.
+/// Paint the graph into `ui`'s available space: background, edges, node
+/// rects, then the pinned legend row on top. Handles pan (drag) and zoom
+/// (scroll) on the empty canvas, and auto-pans so a newly focused node comes
+/// into view.
 ///
 /// `last_focus` is view-only state (owned by the eframe glue, not
 /// [`crate::core::app::App`]) that remembers which node the auto-pan last
@@ -104,10 +115,15 @@ pub fn show(
     let painter = ui.painter_at(response.rect);
     painter.rect_filled(response.rect, 0.0, theme::CANVAS_BG);
 
+    paint_band_separators(&painter, layout, transform, response.rect);
     paint_edges(&painter, layout, transform);
-    for root in app.graph.sorted_roots() {
-        paint_node(&painter, &app.graph, layout, transform, &root, &app.focus);
+    for layer in &layout.layers {
+        for id in layer {
+            paint_node(&painter, &app.graph, layout, transform, id, &app.focus);
+        }
     }
+
+    paint_legend(&painter, &app.graph, layout, response.rect);
 }
 
 /// Drag pans the view; scroll zooms around the pointer position.
@@ -156,8 +172,55 @@ fn paint_edges(painter: &egui::Painter, layout: &LayoutResult, transform: &Trans
     }
 }
 
-/// Recursively paint `id`'s rect, then its children (parents painted first
-/// gives correct back-to-front z-order since children nest inside).
+/// A faint horizontal line between each pair of adjacent layers, spanning
+/// the viewport width, at the midpoint between one layer's lowest rect
+/// bottom and the next layer's highest rect top. Skips a boundary if either
+/// layer is empty (shouldn't happen, but `layout.layers` is caller data).
+fn paint_band_separators(
+    painter: &egui::Painter,
+    layout: &LayoutResult,
+    transform: &Transform,
+    viewport: EguiRect,
+) {
+    for pair in layout.layers.windows(2) {
+        let (above, below) = (&pair[0], &pair[1]);
+        let Some(above_bottom) = layer_extent(above, layout).map(|(_, bottom)| bottom) else {
+            continue;
+        };
+        let Some(below_top) = layer_extent(below, layout).map(|(top, _)| top) else {
+            continue;
+        };
+        let mid_y = (above_bottom + below_top) / 2.0;
+        let screen_y = transform.to_screen_pos(LPos { x: 0.0, y: mid_y }).y;
+        painter.line_segment(
+            [
+                Pos2::new(viewport.left(), screen_y),
+                Pos2::new(viewport.right(), screen_y),
+            ],
+            theme::band_separator_stroke(),
+        );
+    }
+}
+
+/// The `(min top, max bottom)` layout-space y-extent of `layer`'s rects, or
+/// `None` if none of its ids have a rect.
+fn layer_extent(layer: &[NodeId], layout: &LayoutResult) -> Option<(f32, f32)> {
+    layer.iter().filter_map(|id| layout.rects.get(id)).fold(
+        None,
+        |acc: Option<(f32, f32)>, rect| {
+            let top = rect.origin.y;
+            let bottom = rect.origin.y + rect.size.h;
+            Some(match acc {
+                Some((min_top, max_bottom)) => (min_top.min(top), max_bottom.max(bottom)),
+                None => (top, bottom),
+            })
+        },
+    )
+}
+
+/// Paint `id`'s rect: status fill/border, a left-edge stripe in its
+/// top-level root's hue, and an abbreviated label. Draws the focus ring on
+/// top if `id` is `focus`.
 fn paint_node(
     painter: &egui::Painter,
     graph: &ProjectGraph,
@@ -174,44 +237,28 @@ fn paint_node(
     };
     let screen_rect = transform.to_screen_rect(*rect);
 
-    if node.children.is_empty() {
-        painter.rect(
-            screen_rect,
-            2.0,
-            theme::leaf_fill(node.status),
-            theme::leaf_border_stroke(node.status),
-            StrokeKind::Inside,
-        );
-        painter.text(
-            screen_rect.center(),
-            Align2::CENTER_CENTER,
-            &node.display_name,
-            FontId::proportional(12.0 * transform.scale.max(0.3)),
-            label_color(node.status),
-        );
-    } else {
-        painter.rect(
-            screen_rect,
-            2.0,
-            theme::container_fill(node.status),
-            theme::container_border(node.status),
-            StrokeKind::Inside,
-        );
-        let title_rect = EguiRect::from_min_size(
-            screen_rect.min,
-            Vec2::new(screen_rect.width(), TITLE_H * transform.scale),
-        );
-        painter.text(
-            title_rect.center(),
-            Align2::CENTER_CENTER,
-            &node.display_name,
-            FontId::proportional(12.0 * transform.scale.max(0.3)),
-            label_color(node.status),
-        );
-        for child in graph.sorted_children(id) {
-            paint_node(painter, graph, layout, transform, &child, focus);
-        }
-    }
+    painter.rect(
+        screen_rect,
+        2.0,
+        theme::leaf_fill(node.status),
+        theme::leaf_border_stroke(node.status),
+        StrokeKind::Inside,
+    );
+
+    let root_id = graph.top_level_root(id);
+    let stripe_color = theme::root_hue_color(&root_id.to_string());
+    let stripe_rect =
+        EguiRect::from_min_size(screen_rect.min, Vec2::new(STRIPE_W, screen_rect.height()));
+    painter.rect_filled(stripe_rect, 0.0, stripe_color);
+
+    let label = theme::abbreviated_label(&id.to_string(), &root_id.to_string(), &node.display_name);
+    painter.text(
+        screen_rect.center(),
+        Align2::CENTER_CENTER,
+        &label,
+        FontId::proportional(12.0 * transform.scale.max(0.3)),
+        label_color(node.status),
+    );
 
     if id == focus {
         painter.rect_stroke(
@@ -220,6 +267,46 @@ fn paint_node(
             theme::focus_ring_stroke(),
             StrokeKind::Inside,
         );
+    }
+}
+
+/// A small legend row pinned at the top-left of the viewport (screen space,
+/// unaffected by pan/zoom): every distinct top-level root's name in its
+/// [`theme::root_hue_color`], root ids sorted for a stable left-to-right
+/// order across frames.
+fn paint_legend(
+    painter: &egui::Painter,
+    graph: &ProjectGraph,
+    layout: &LayoutResult,
+    viewport: EguiRect,
+) {
+    let mut roots: Vec<NodeId> = layout
+        .layers
+        .iter()
+        .flatten()
+        .map(|id| graph.top_level_root(id))
+        .collect();
+    roots.sort();
+    roots.dedup();
+
+    let mut cursor_x = viewport.left() + 8.0;
+    let text_y = viewport.top() + LEGEND_H / 2.0;
+    for root_id in roots {
+        let name = graph
+            .node(&root_id)
+            .map(|n| n.display_name.clone())
+            .unwrap_or_else(|| root_id.to_string());
+        let color = theme::root_hue_color(&root_id.to_string());
+
+        let swatch =
+            EguiRect::from_min_size(Pos2::new(cursor_x, text_y - 5.0), Vec2::new(10.0, 10.0));
+        painter.rect_filled(swatch, 2.0, color);
+        cursor_x += 14.0;
+
+        let galley = painter.layout_no_wrap(name.clone(), FontId::proportional(12.0), color);
+        let text_pos = Pos2::new(cursor_x, text_y - galley.size().y / 2.0);
+        painter.galley(text_pos, galley, color);
+        cursor_x += 16.0 + name.len() as f32 * 6.5;
     }
 }
 
@@ -319,5 +406,35 @@ mod tests {
         let focus = EguiRect::from_min_size(Pos2::new(780.0, 100.0), Vec2::new(50.0, 50.0));
         let delta = clamp_into_view(focus, viewport);
         assert_eq!(delta, Vec2::new(800.0 - 830.0, 0.0));
+    }
+
+    #[test]
+    fn layer_extent_covers_every_rect_in_the_layer() {
+        use crate::graph::layout::Size;
+        use std::collections::HashMap;
+
+        let mut rects = HashMap::new();
+        rects.insert(
+            NodeId::from("a"),
+            LRect {
+                origin: LPos { x: 0.0, y: 10.0 },
+                size: Size { w: 10.0, h: 20.0 },
+            },
+        );
+        rects.insert(
+            NodeId::from("b"),
+            LRect {
+                origin: LPos { x: 0.0, y: 5.0 },
+                size: Size { w: 10.0, h: 20.0 },
+            },
+        );
+        let layout = LayoutResult {
+            rects,
+            edges: vec![],
+            layers: vec![vec![NodeId::from("a"), NodeId::from("b")]],
+        };
+
+        let extent = layer_extent(&layout.layers[0], &layout);
+        assert_eq!(extent, Some((5.0, 30.0)));
     }
 }

@@ -112,13 +112,18 @@ fn run_gui(
     diff_loader: DiffLoader,
 ) -> ExitCode {
     let layout_result = layout(&graph);
-    let focus = graph
-        .sorted_roots()
-        .into_iter()
-        .next()
+    // The first node of the first layer, not `graph.sorted_roots()[0]` --
+    // roots can be synthetic namespace containers, which are never drawn or
+    // focusable (see `graph::layers`).
+    let focus = layout_result
+        .layers
+        .first()
+        .and_then(|layer| layer.first())
+        .cloned()
         .unwrap_or_else(|| NodeId::from(""));
     let app = App {
         graph,
+        layers: layout_result.layers.clone(),
         focus,
         screen: Screen::Graph,
         diff: None,
