@@ -5,5 +5,6 @@ pub mod core;
 pub mod diffing;
 pub mod graph;
 pub mod keymap;
+pub mod nvim;
 pub mod pipeline;
 pub mod ui;
