@@ -26,7 +26,7 @@
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -50,6 +50,12 @@ pub enum NvimCmd {
     /// places the cursor there afterwards (1-based, matching `:line`
     /// semantics) via a follow-up `nvim_win_set_cursor`.
     OpenFile(PathBuf, Option<u64>),
+    /// Run an arbitrary Ex command via `nvim_command` -- used for
+    /// `--nvim-cmd` init commands (see `main.rs`) after every attach/
+    /// respawn. Fire-and-forget like every other [`NvimCmd`]; errors
+    /// aren't observed here (see [`NvimSession::call`] for the
+    /// request/response path `--nvim-cmd` actually uses to log them).
+    Ex(String),
 }
 
 /// Whether an `nvim` binary is on `PATH` -- gates `--nvim` falling back to
@@ -60,10 +66,28 @@ pub fn nvim_available() -> bool {
 
 /// A live embedded-nvim session: owns the child process, the writer/reader
 /// threads, and the shared grid they publish redraws into.
+///
+/// Liveness: `alive` starts `true` and flips to `false` (never back) the
+/// moment either thread notices the process is gone -- the reader hits EOF
+/// on `stdout`, or the writer fails to write/flush `stdin` (e.g. a broken
+/// pipe after `nvim` exits, which on this platform surfaces as an `EPIPE`
+/// `io::Error` rather than a signal, since Rust's runtime ignores
+/// `SIGPIPE` for the process). Neither thread ever panics on child exit --
+/// both simply stop their loop and flip the flag. `NvimSession::send` also
+/// flips it if the command channel itself has closed (writer thread
+/// already gone), covering the "wrote a bad frame and broke the pipe
+/// ourselves" case too. This is the fix for the `ZZ` lockup: previously
+/// nothing observed a dead child at all, so the UI kept believing the nvim
+/// pane was live -- key events kept forwarding into a dead channel
+/// (harmlessly swallowed, but with zero feedback) and the grid never
+/// stopped showing its last frame before quit. See
+/// [`crate::ui::eframe_app::VdiffApp`] for how `is_alive` now drives an
+/// automatic return to the graph pane and a respawn-on-next-open.
 pub struct NvimSession {
     child: Child,
     cmd_tx: Sender<NvimCmd>,
     grid: Arc<Mutex<GridState>>,
+    alive: Arc<AtomicBool>,
     _writer: JoinHandle<()>,
     _reader: JoinHandle<()>,
 }
@@ -96,30 +120,44 @@ impl NvimSession {
 
         let grid = Arc::new(Mutex::new(GridState::new(cols as usize, rows as usize)));
         let (cmd_tx, cmd_rx) = mpsc::channel::<NvimCmd>();
+        let alive = Arc::new(AtomicBool::new(true));
 
+        let writer_alive = alive.clone();
         let writer = thread::spawn(move || {
-            run_writer(stdin, cmd_rx, cols, rows);
+            run_writer(stdin, cmd_rx, cols, rows, writer_alive);
         });
 
         let grid_for_reader = grid.clone();
+        let reader_alive = alive.clone();
         let reader = thread::spawn(move || {
-            run_reader(stdout, grid_for_reader, repaint);
+            run_reader(stdout, grid_for_reader, repaint, reader_alive);
         });
 
         Ok(NvimSession {
             child,
             cmd_tx,
             grid,
+            alive,
             _writer: writer,
             _reader: reader,
         })
     }
 
-    /// Queue a command for the writer thread. Silently dropped if the
-    /// session has already torn down (writer thread gone) -- fine for a
-    /// spike, matches the "swallow errors" posture the whole module takes.
+    /// Queue a command for the writer thread. If the channel is already
+    /// closed (writer thread gone -- it exits the moment a write fails),
+    /// flips [`Self::is_alive`] to `false` as a safety net: whatever the
+    /// reason the writer's gone, a send that can't be delivered means this
+    /// session can no longer talk to nvim, full stop.
     pub fn send(&self, cmd: NvimCmd) {
-        let _ = self.cmd_tx.send(cmd);
+        if self.cmd_tx.send(cmd).is_err() {
+            self.alive.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether the session still believes `nvim` is alive and reachable.
+    /// See the struct doc for exactly what flips this to `false`.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
     }
 
     /// The shared grid state, for the renderer to lock and read each
@@ -141,16 +179,32 @@ impl Drop for NvimSession {
 }
 
 /// The writer thread's body: attach the UI, then loop draining `cmd_rx`
-/// into `nvim_*` requests until the channel closes (session dropped).
-fn run_writer(mut stdin: ChildStdin, cmd_rx: mpsc::Receiver<NvimCmd>, cols: u16, rows: u16) {
+/// into `nvim_*` requests until the channel closes (session dropped) or a
+/// write fails (child gone) -- either way, the loop just ends; it never
+/// panics. `alive` is flipped to `false` the moment a write fails,
+/// including the initial `nvim_ui_attach` (a `spawn()` that raced an
+/// instant crash should look dead immediately, not linger as "alive" until
+/// the first real command).
+fn run_writer(
+    mut stdin: ChildStdin,
+    cmd_rx: mpsc::Receiver<NvimCmd>,
+    cols: u16,
+    rows: u16,
+    alive: Arc<AtomicBool>,
+) {
     let msgid = AtomicU64::new(0);
     let attach_opts = Value::Map(vec![(Value::from("ext_linegrid"), Value::from(true))]);
-    let _ = send_request(
+    if send_request(
         &mut stdin,
         &msgid,
         "nvim_ui_attach",
         vec![Value::from(cols), Value::from(rows), attach_opts],
-    );
+    )
+    .is_err()
+    {
+        alive.store(false, Ordering::SeqCst);
+        return;
+    }
 
     for cmd in cmd_rx {
         let result = match cmd {
@@ -164,8 +218,15 @@ fn run_writer(mut stdin: ChildStdin, cmd_rx: mpsc::Receiver<NvimCmd>, cols: u16,
                 vec![Value::from(cols), Value::from(rows)],
             ),
             NvimCmd::OpenFile(path, line) => send_open_file(&mut stdin, &msgid, &path, line),
+            NvimCmd::Ex(command) => send_request(
+                &mut stdin,
+                &msgid,
+                "nvim_command",
+                vec![Value::from(command)],
+            ),
         };
         if result.is_err() {
+            alive.store(false, Ordering::SeqCst);
             break;
         }
     }
@@ -230,9 +291,17 @@ fn send_request(
 }
 
 /// The reader thread's body: decode msgpack values off `stdout` in a loop
-/// until the pipe closes, applying `redraw` notifications to `grid` and
-/// calling `repaint` after every batch that contains a `flush`.
-fn run_reader(stdout: impl Read, grid: Arc<Mutex<GridState>>, repaint: impl Fn()) {
+/// until the pipe closes (`nvim` exited -- `read_value` returns `Err` on
+/// EOF, which just ends the `while let` normally; no panic), applying
+/// `redraw` notifications to `grid` and calling `repaint` after every batch
+/// that contains a `flush`. Flips `alive` to `false` once the loop ends,
+/// however it ended.
+fn run_reader(
+    stdout: impl Read,
+    grid: Arc<Mutex<GridState>>,
+    repaint: impl Fn(),
+    alive: Arc<AtomicBool>,
+) {
     let mut reader = BufReader::new(stdout);
     while let Ok(value) = rmpv::decode::read_value(&mut reader) {
         if let Some(events) = redraw_events(&value) {
@@ -247,6 +316,8 @@ fn run_reader(stdout: impl Read, grid: Arc<Mutex<GridState>>, repaint: impl Fn()
             }
         }
     }
+    alive.store(false, Ordering::SeqCst);
+    repaint(); // wake the UI thread up so it notices `is_alive() == false` promptly.
 }
 
 /// If `message` is a `redraw` notification (`[2, "redraw", params]`), parse

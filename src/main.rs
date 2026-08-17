@@ -13,7 +13,7 @@ use vdiff::nvim::session::nvim_available;
 use vdiff::pipeline::git2_repo::Git2Repo;
 use vdiff::pipeline::repo::GitRepo;
 use vdiff::pipeline::{build_graph, PipelineOptions};
-use vdiff::ui::eframe_app::{DiffLoader, VdiffApp};
+use vdiff::ui::eframe_app::{DiffLoader, NvimConfig, VdiffApp};
 use vdiff::ui::nvim_pane::NvimPane;
 
 fn main() -> ExitCode {
@@ -181,7 +181,12 @@ fn run_gui(
                 layout_result,
                 smoke,
                 diff_loader,
-                nvim,
+                NvimConfig {
+                    pane: nvim,
+                    cwd: repo_root.clone(),
+                    init_cmds: Vec::new(),
+                    egui_ctx: cc.egui_ctx.clone(),
+                },
             )))
         }),
     );

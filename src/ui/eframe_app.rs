@@ -154,31 +154,66 @@ pub struct VdiffApp {
     started_at: Instant,
     diff_loader: DiffLoader,
     /// The live embedded-nvim session, if `--nvim` was given and an `nvim`
-    /// binary was found (see `main.rs`'s startup decision). `Some` for the
-    /// lifetime of the app -- there's no way to turn nvim mode on/off after
-    /// launch in this spike.
+    /// binary was found (see `main.rs`'s startup decision). Once `Some`,
+    /// stays `Some` for the lifetime of the app even if the underlying
+    /// process dies -- see [`Self::logic`]/[`Self::respawn_nvim`]; a dead
+    /// session is replaced in place, never dropped down to `None` (unless
+    /// the respawn itself fails to spawn, which is treated as reverting to
+    /// the built-in viewer for the rest of the run).
     nvim: Option<NvimPane>,
     /// Whether the previous nvim-mode keypress was `Ctrl-w`, awaiting a
-    /// completing `h`/`l` -- the local, nvim-side equivalent of
+    /// completing key -- the local, nvim-side equivalent of
     /// [`crate::keymap::Pending::CtrlW`] (kept separately rather than
     /// reusing `pending_key`, since nvim-mode input bypasses `map_key`
     /// entirely; see [`Self::handle_nvim_keys`]).
     nvim_ctrl_w_pending: bool,
+    /// `nvim --embed`'s working directory, remembered for
+    /// [`Self::respawn_nvim`] (the initial spawn happens in `main.rs`,
+    /// before a `VdiffApp` exists to remember it itself).
+    nvim_cwd: std::path::PathBuf,
+    /// Ex commands to run after every `nvim_ui_attach` -- the initial spawn
+    /// and every respawn (see `--nvim-cmd` in `main.rs`'s CLI).
+    nvim_init_cmds: Vec<String>,
+    /// The egui context, kept around so [`Self::respawn_nvim`] can spawn a
+    /// fresh [`NvimPane`] (which needs a `Context` to request repaints)
+    /// outside of a paint callback.
+    egui_ctx: Context,
+}
+
+/// Everything [`VdiffApp::new`] needs to set up (and later respawn) the
+/// embedded-nvim spike, bundled to keep the constructor's arg count sane.
+/// `pane` is `None` when `--nvim` wasn't given or no `nvim` binary was
+/// found -- see `main.rs`'s startup decision -- in which case the rest of
+/// the fields are unused.
+pub struct NvimConfig {
+    /// An already-spawned embedded session, or `None` to run in the
+    /// built-in-viewer-only mode this struct otherwise doesn't touch.
+    pub pane: Option<NvimPane>,
+    /// `nvim --embed`'s working directory, remembered for
+    /// [`VdiffApp::respawn_nvim`] (the initial spawn happens in `main.rs`,
+    /// before a `VdiffApp` exists to remember it itself).
+    pub cwd: std::path::PathBuf,
+    /// Ex commands to run after every `nvim_ui_attach` -- the initial spawn
+    /// and every respawn (see `--nvim-cmd` in `main.rs`'s CLI).
+    pub init_cmds: Vec<String>,
+    /// The egui context, kept around so [`VdiffApp::respawn_nvim`] can spawn
+    /// a fresh [`NvimPane`] (which needs a `Context` to request repaints)
+    /// outside of a paint callback.
+    pub egui_ctx: Context,
 }
 
 impl VdiffApp {
     /// Build a fresh GUI app wrapping an already-constructed [`App`] and its
     /// [`LayoutResult`]. `smoke` enables the self-closing startup self-test
     /// (see the module-level `--smoke` flag in `main.rs`). `diff_loader`
-    /// backs [`Cmd::LoadDiff`]. `nvim`, if `Some`, is an already-spawned
-    /// embedded session that replaces the built-in file viewer's pane --
-    /// see the module doc.
+    /// backs [`Cmd::LoadDiff`]. `nvim` carries everything the embedded-nvim
+    /// spike needs -- see [`NvimConfig`]'s doc.
     pub fn new(
         app: App,
         layout: LayoutResult,
         smoke: bool,
         diff_loader: DiffLoader,
-        nvim: Option<NvimPane>,
+        nvim: NvimConfig,
     ) -> Self {
         Self {
             app,
@@ -189,8 +224,11 @@ impl VdiffApp {
             smoke,
             started_at: Instant::now(),
             diff_loader,
-            nvim,
+            nvim: nvim.pane,
             nvim_ctrl_w_pending: false,
+            nvim_cwd: nvim.cwd,
+            nvim_init_cmds: nvim.init_cmds,
+            egui_ctx: nvim.egui_ctx,
         }
     }
 
@@ -220,21 +258,27 @@ impl VdiffApp {
         }
     }
 
-    /// Handle [`Cmd::LoadFile`]: in nvim mode, tell the session to open the
-    /// node's first file (line 1) via [`NvimPane::open_file`] and feed the
-    /// reducer an empty [`FileViewState`] just to keep its
+    /// Handle [`Cmd::LoadFile`]: in nvim mode, respawn first if the session
+    /// died since it was last used (see [`Self::respawn_nvim`]), then tell
+    /// it to open the node's first file (line 1) via [`NvimPane::open_file`]
+    /// and feed the reducer an empty [`FileViewState`] just to keep its
     /// `file_view.is_some()` invariants satisfied (see the module doc);
     /// otherwise the built-in viewer's real load, unchanged.
     fn load_file(&mut self, node: NodeId) {
-        if let Some(nvim) = &self.nvim {
-            if let Some(path) = self
-                .app
-                .graph
-                .node(&node)
-                .and_then(|module| module.files.first())
-                .map(|file_ref| file_ref.path.clone())
-            {
-                nvim.open_file(path, Some(1));
+        if self.nvim.is_some() {
+            if self.nvim.as_ref().is_some_and(|nvim| !nvim.is_alive()) {
+                self.respawn_nvim();
+            }
+            if let Some(nvim) = &self.nvim {
+                if let Some(path) = self
+                    .app
+                    .graph
+                    .node(&node)
+                    .and_then(|module| module.files.first())
+                    .map(|file_ref| file_ref.path.clone())
+                {
+                    nvim.open_file(path, Some(1));
+                }
             }
             self.dispatch(Msg::FileLoaded(FileViewState::new(node, Vec::new())));
             return;
@@ -242,6 +286,28 @@ impl VdiffApp {
         match self.diff_loader.load_file_view(&self.app.graph, &node) {
             Ok(state) => self.dispatch(Msg::FileLoaded(state)),
             Err(message) => self.dispatch(Msg::FileLoadFailed(message)),
+        }
+    }
+
+    /// Tear down the dead session (dropping it kills/reaps the child --
+    /// see [`crate::nvim::session::NvimSession`]'s `Drop`) and spawn a
+    /// fresh one at the same size, re-running [`Self::nvim_init_cmds`]. On
+    /// spawn failure, logs a warning and leaves `self.nvim` as `None` --
+    /// [`Self::load_file`]'s nvim branch is skipped from then on, so the
+    /// rest of this run falls back to the built-in viewer.
+    fn respawn_nvim(&mut self) {
+        let (cols, rows) = self.nvim.as_ref().map_or((80, 24), NvimPane::size);
+        self.nvim = None; // drop the old session (kills/reaps the child) before spawning the new one.
+        match NvimPane::spawn(&self.nvim_cwd, cols, rows, self.egui_ctx.clone()) {
+            Ok(pane) => {
+                for cmd in &self.nvim_init_cmds {
+                    pane.send(NvimCmd::Ex(cmd.clone()));
+                }
+                self.nvim = Some(pane);
+            }
+            Err(err) => {
+                eprintln!("warning: failed to respawn nvim: {err}");
+            }
         }
     }
 
@@ -289,6 +355,20 @@ impl VdiffApp {
                 KeyOutcome::Pending(pending) => self.pending_key = Some(pending),
                 KeyOutcome::None => {}
             }
+        }
+    }
+
+    /// The fix for the `ZZ` lockup's user-facing half: if the nvim pane has
+    /// died (see [`NvimPane::is_alive`]) while it still holds keyboard
+    /// focus, dispatch [`Msg::PaneLeft`] *before* this frame's key handling
+    /// runs -- so a dead session can never trap the user on [`Pane::File`]
+    /// with no working keys to escape with (previously, `Ctrl-w h` was the
+    /// only way out, and nothing told the user that). A no-op once focus is
+    /// already back on the graph, or the pane never died.
+    fn reclaim_focus_from_dead_nvim(&mut self) {
+        let dead = self.nvim.as_ref().is_some_and(|nvim| !nvim.is_alive());
+        if dead && self.app.pane == Pane::File {
+            self.dispatch(Msg::PaneLeft);
         }
     }
 
@@ -472,6 +552,7 @@ impl eframe::App for VdiffApp {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
+        self.reclaim_focus_from_dead_nvim();
         self.handle_keys(ctx);
         self.handle_zoom_keys(ctx);
     }

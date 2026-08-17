@@ -74,13 +74,45 @@ impl NvimPane {
     pub fn grid(&self) -> Arc<Mutex<GridState>> {
         self.session.grid()
     }
+
+    /// Whether the underlying session still believes `nvim` is alive (see
+    /// [`NvimSession::is_alive`]). `false` after e.g. `ZZ`/`:q` exits the
+    /// process -- the eframe glue uses this to bounce focus back to the
+    /// graph pane and to decide whether [`Self::open_file`] needs a
+    /// respawn first.
+    pub fn is_alive(&self) -> bool {
+        self.session.is_alive()
+    }
+
+    /// The cols/rows last sent to nvim -- read by the eframe glue when
+    /// respawning, so the replacement session starts at the same size
+    /// rather than snapping back to a default and immediately resizing.
+    pub fn size(&self) -> (u16, u16) {
+        (self.cols, self.rows)
+    }
 }
+
+/// The message shown in place of the grid once nvim has exited (`ZZ`, `:q`,
+/// a crash, ...) and the glue hasn't respawned it yet. `eframe_app` moves
+/// keyboard focus off this pane the moment it notices [`NvimPane::is_alive`]
+/// is `false` (see [`crate::ui::eframe_app::VdiffApp::logic`]), so this text
+/// is only ever visible for at most one frame in practice -- but it's the
+/// fallback if that race ever loses, rather than silently painting a
+/// stale, frozen-looking grid.
+const DEAD_MESSAGE: &str = "nvim exited — move focus or press Enter to relaunch";
 
 /// Paint `pane`'s current grid into the remaining space of `ui`, resizing
 /// the nvim UI first if the available space implies a different cols/rows
 /// than last frame. `focused` draws the block cursor -- matches the
-/// built-in file viewer's `focused`-gated border/cursor convention.
+/// built-in file viewer's `focused`-gated border/cursor convention. If the
+/// session has died (see [`NvimPane::is_alive`]), paints [`DEAD_MESSAGE`]
+/// instead of the (stale) grid.
 pub fn show(ui: &mut Ui, pane: &mut NvimPane, focused: bool) {
+    if !pane.is_alive() {
+        ui.centered_and_justified(|ui| ui.label(DEAD_MESSAGE));
+        return;
+    }
+
     let font_id = FontId::monospace(FONT_SIZE);
     let ctx = ui.ctx().clone();
     let row_height = ctx.fonts_mut(|f| f.row_height(&font_id));
