@@ -399,6 +399,160 @@ pub fn ctrl_w_continuation(key: Key, modifiers: Modifiers) -> Option<String> {
     Some(format!("<C-w>{c}"))
 }
 
+/// One decision produced by [`process_nvim_events`] for the eframe glue to
+/// execute. Boundary-checking isn't resolved here -- it needs a live
+/// `at_boundary` RPC round-trip, which is impure -- so
+/// [`CtrlWBoundary`](NvimAction::CtrlWBoundary) just carries what the
+/// caller needs to resolve it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NvimAction {
+    /// Send this nvim key notation via `nvim_input`, forwarded as-is.
+    Input(String),
+    /// A completed `Ctrl-w h`/`Ctrl-w l`/`Ctrl-w Left`/`Ctrl-w Right`.
+    /// Caller: query `NvimPane::at_boundary(dir)`; at the boundary,
+    /// dispatch `Msg::PaneLeft` if `hop_left` (a no-op at the right
+    /// boundary -- there's no pane further right than the nvim pane);
+    /// otherwise send `forward_seq` so nvim moves between its own splits.
+    CtrlWBoundary {
+        dir: &'static str,
+        hop_left: bool,
+        forward_seq: &'static str,
+    },
+}
+
+/// Process one frame's raw egui input events for the nvim pane, given
+/// whether a `Ctrl-w` chord was left armed from the previous frame (see
+/// [`crate::ui::eframe_app::VdiffApp::handle_nvim_keys`]). Returns the
+/// actions to execute, in order, and the chord-armed state to carry into
+/// the next frame's call.
+///
+/// This is the one place that has to get egui's `Key`/`Text` event pairing
+/// right for the `Ctrl-w` chord specifically (ordinary forwarding's
+/// dedup -- drop `Key` for printables, forward `Text` -- doesn't care about
+/// event order at all, since a plain printable `Key` press already
+/// translates to `None` regardless of state; see
+/// [`translate_event_for_nvim`]). Two failure modes fixed here:
+///
+/// 1. egui delivers a *release* `Key` event too (`pressed: false`) for
+///    every press, including `Ctrl-w` itself. Treating "any `Key` event
+///    while armed" as the completing keystroke means the `Ctrl-w`
+///    *release* disarms the chord before the user's next real keypress
+///    ever arrives -- so `h` lands after the chord is already gone and
+///    forwards as a plain `h` (cursor-left) instead of completing it.
+///    Fixed by only ever treating `pressed: true` `Key` events as
+///    significant while armed; releases (and anything else) are ignored
+///    without disarming.
+/// 2. Once the chord *is* completed by the `h` `Key` press, egui's paired
+///    `Text("h")` event still shows up right after -- and ordinary
+///    forwarding would send it verbatim, double-firing the keystroke (once
+///    as the chord's resolution, once as a leaked literal `h`). Fixed by
+///    suppressing exactly one following `Text` event after a chord
+///    consumes a `Key`.
+pub fn process_nvim_events(events: &[Event], pending: bool) -> (Vec<NvimAction>, bool) {
+    let mut actions = Vec::new();
+    let mut pending = pending;
+    // Set the frame a `Key` event (chord arm or chord completion) was just
+    // acted on instead of falling through to ordinary forwarding -- the
+    // very next event gets one chance to be that key's paired `Text` event
+    // (dropped silently if so) before this reverts to normal handling.
+    // Needed regardless of whether egui delivers `Key` before or after
+    // `Text` for the same press: if `Text` comes first, the `_ => {}` arm
+    // below (while `pending`) already ignores it without disarming, so the
+    // `Key` still resolves the chord when it arrives; if `Key` comes first,
+    // this flag is what stops the trailing `Text` from also forwarding as
+    // a literal keystroke.
+    let mut suppress_text = false;
+    for event in events {
+        if suppress_text {
+            suppress_text = false;
+            if matches!(event, Event::Text(_)) {
+                continue;
+            }
+            // Not the paired Text after all -- handle this event normally below.
+        }
+
+        if pending {
+            match event {
+                // A release (including Ctrl-w's own) is not a completing
+                // keystroke -- ignore it without disarming, so the chord
+                // survives until a real *press* arrives.
+                Event::Key { pressed: false, .. } => {}
+                Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => {
+                    pending = false;
+                    suppress_text = true;
+                    push_chord_completion(&mut actions, *key, *modifiers);
+                }
+                // No legitimate way to complete the chord via a bare
+                // `Text` event (every physical press keys also emits a
+                // `Key` event) -- ignore anything else while armed.
+                _ => {}
+            }
+            continue;
+        }
+
+        if let Event::Key {
+            key: Key::W,
+            pressed: true,
+            modifiers,
+            ..
+        } = event
+        {
+            if modifiers.ctrl {
+                pending = true;
+                suppress_text = true; // defensive: swallow a Text companion if one ever shows up.
+                continue;
+            }
+        }
+
+        if let Some(text) = translate_event_for_nvim(event) {
+            actions.push(NvimAction::Input(text));
+        }
+    }
+    (actions, pending)
+}
+
+/// The second half of the `Ctrl-w` chord, once a completing `Key` press has
+/// been identified: boundary-aware for `h`/`l`/arrow-left/right (see
+/// [`NvimAction::CtrlWBoundary`]), always-forward for `j`/`k`/arrow-up/down
+/// (vertical splits are entirely nvim-internal -- vdiff has no pane above
+/// or below), and `<C-w><key>` via [`ctrl_w_continuation`] for everything
+/// else (restores the rest of nvim's `Ctrl-w` repertoire -- `q`, `o`, `w`,
+/// `Ctrl-w`, ... -- rather than silently dropping it).
+fn push_chord_completion(actions: &mut Vec<NvimAction>, key: Key, modifiers: Modifiers) {
+    match key {
+        Key::H => actions.push(NvimAction::CtrlWBoundary {
+            dir: "h",
+            hop_left: true,
+            forward_seq: "<C-w>h",
+        }),
+        Key::ArrowLeft => actions.push(NvimAction::CtrlWBoundary {
+            dir: "h",
+            hop_left: true,
+            forward_seq: "<C-w><Left>",
+        }),
+        Key::L => actions.push(NvimAction::CtrlWBoundary {
+            dir: "l",
+            hop_left: false,
+            forward_seq: "<C-w>l",
+        }),
+        Key::ArrowRight => actions.push(NvimAction::CtrlWBoundary {
+            dir: "l",
+            hop_left: false,
+            forward_seq: "<C-w><Right>",
+        }),
+        _ => {
+            if let Some(seq) = ctrl_w_continuation(key, modifiers) {
+                actions.push(NvimAction::Input(seq));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,5 +785,186 @@ mod tests {
         assert_eq!(single_char(Key::A), Some('a'));
         assert_eq!(single_char(Key::Num1), Some('1'));
         assert_eq!(single_char(Key::Escape), None);
+    }
+
+    /// A real per-press egui event pair: the `Key` press egui always
+    /// sends, plus (for printable keys) the companion `Text` event that
+    /// carries the actual character -- and, since egui reports releases
+    /// too, the matching `Key` release. This is the exact sequence a
+    /// physical `Ctrl-w` press-then-release, or an unmodified letter
+    /// press-then-release, produces; `process_nvim_events` has to handle
+    /// it, not the idealized "one Key event per press" a naive test would
+    /// use instead.
+    fn press_and_release(key: Key, modifiers: Modifiers, text: Option<&str>) -> Vec<Event> {
+        let mut events = vec![Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }];
+        if let Some(text) = text {
+            events.push(Event::Text(text.to_string()));
+        }
+        events.push(Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers,
+        });
+        events
+    }
+
+    #[test]
+    fn ctrl_w_then_h_hops_left_at_boundary_across_real_event_sequence() {
+        // Ctrl-w: Key-down(ctrl) + Key-up, no Text (ctrl suppresses it).
+        let mut events = press_and_release(Key::W, Modifiers::CTRL, None);
+        // h: Key-down + Text("h") + Key-up, exactly what egui emits for an
+        // unmodified printable key.
+        events.extend(press_and_release(Key::H, Modifiers::NONE, Some("h")));
+
+        let (actions, pending) = process_nvim_events(&events, false);
+
+        assert!(!pending, "chord must be disarmed after completing");
+        assert_eq!(
+            actions,
+            vec![NvimAction::CtrlWBoundary {
+                dir: "h",
+                hop_left: true,
+                forward_seq: "<C-w>h",
+            }],
+            "exactly one action: the boundary check -- no leaked literal 'h' input, \
+             and the Ctrl-w release must not have disarmed the chord before h arrived"
+        );
+    }
+
+    #[test]
+    fn ctrl_w_then_arrow_left_hops_left_across_real_event_sequence() {
+        let mut events = press_and_release(Key::W, Modifiers::CTRL, None);
+        // ArrowLeft: Key-down + Key-up, no Text (arrows never produce text).
+        events.extend(press_and_release(Key::ArrowLeft, Modifiers::NONE, None));
+
+        let (actions, pending) = process_nvim_events(&events, false);
+
+        assert!(!pending);
+        assert_eq!(
+            actions,
+            vec![NvimAction::CtrlWBoundary {
+                dir: "h",
+                hop_left: true,
+                forward_seq: "<C-w><Left>",
+            }]
+        );
+    }
+
+    #[test]
+    fn ctrl_w_then_l_across_real_event_sequence() {
+        let mut events = press_and_release(Key::W, Modifiers::CTRL, None);
+        events.extend(press_and_release(Key::L, Modifiers::NONE, Some("l")));
+
+        let (actions, pending) = process_nvim_events(&events, false);
+
+        assert!(!pending);
+        assert_eq!(
+            actions,
+            vec![NvimAction::CtrlWBoundary {
+                dir: "l",
+                hop_left: false,
+                forward_seq: "<C-w>l",
+            }]
+        );
+    }
+
+    #[test]
+    fn ctrl_w_then_q_forwards_continuation_across_real_event_sequence() {
+        let mut events = press_and_release(Key::W, Modifiers::CTRL, None);
+        events.extend(press_and_release(Key::Q, Modifiers::NONE, Some("q")));
+
+        let (actions, pending) = process_nvim_events(&events, false);
+
+        assert!(!pending);
+        assert_eq!(actions, vec![NvimAction::Input("<C-w>q".to_string())]);
+    }
+
+    #[test]
+    fn ctrl_w_arm_alone_produces_no_action_and_stays_pending_into_next_frame() {
+        // The Ctrl-w press+release can land in one frame with the
+        // completing key arriving only on the *next* frame's event batch --
+        // pending must carry across that boundary.
+        let events = press_and_release(Key::W, Modifiers::CTRL, None);
+        let (actions, pending) = process_nvim_events(&events, false);
+        assert_eq!(actions, vec![]);
+        assert!(pending, "chord must stay armed across the frame boundary");
+    }
+
+    #[test]
+    fn plain_h_with_no_pending_chord_forwards_normally() {
+        let events = press_and_release(Key::H, Modifiers::NONE, Some("h"));
+        let (actions, pending) = process_nvim_events(&events, false);
+        assert!(!pending);
+        assert_eq!(actions, vec![NvimAction::Input("h".to_string())]);
+    }
+
+    #[test]
+    fn ctrl_w_then_h_does_not_leak_the_paired_text_event_even_if_it_arrives_first() {
+        // Defends the order-independence claim in `process_nvim_events`'s
+        // doc: if Text("h") somehow arrives before its Key press within
+        // the armed frame, it must be ignored (not treated as a
+        // completion, not forwarded) rather than disarming or leaking.
+        let mut events = press_and_release(Key::W, Modifiers::CTRL, None);
+        events.push(Event::Text("h".to_string()));
+        events.push(Event::Key {
+            key: Key::H,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        });
+
+        let (actions, pending) = process_nvim_events(&events, false);
+
+        assert!(!pending);
+        assert_eq!(
+            actions,
+            vec![NvimAction::CtrlWBoundary {
+                dir: "h",
+                hop_left: true,
+                forward_seq: "<C-w>h",
+            }],
+            "no leaked literal 'h', chord still completes on the Key press"
+        );
+    }
+
+    #[test]
+    fn chord_persists_across_multiple_release_events_before_the_real_completion() {
+        // Both halves of the chord can generate more than one release-ish
+        // event in pathological orderings -- none of them should disarm.
+        let events = vec![
+            Event::Key {
+                key: Key::W,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::CTRL,
+            },
+            Event::Key {
+                key: Key::W,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: Modifiers::CTRL,
+            },
+            Event::Key {
+                key: Key::W,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+        ];
+        let (actions, pending) = process_nvim_events(&events, false);
+        assert_eq!(actions, vec![]);
+        assert!(pending);
     }
 }

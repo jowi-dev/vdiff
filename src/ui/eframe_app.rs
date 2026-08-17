@@ -15,9 +15,11 @@
 //! The embedded-nvim spike (`--nvim`, see [`crate::nvim`]) is the other
 //! exception: when [`VdiffApp::nvim`] is `Some` and keyboard focus is on
 //! [`Pane::File`], raw egui input bypasses `map_key` entirely in favor of
-//! [`VdiffApp::handle_nvim_keys`] -- see that method's doc for why, and for
-//! the two bindings (`Ctrl-w h`/`Ctrl-w l`) it still intercepts locally
-//! rather than forwarding to nvim. `core::App`/`update` never learn nvim
+//! [`VdiffApp::handle_nvim_keys`], which delegates the actual event
+//! processing to the pure [`crate::ui::nvim_pane::process_nvim_events`] --
+//! see that function's doc for why the `Ctrl-w` pane-switch chord in
+//! particular needs to be handled against real egui event sequences
+//! rather than per-event here. `core::App`/`update` never learn nvim
 //! mode exists: [`Cmd::LoadFile`] is translated to
 //! [`crate::nvim::session::NvimCmd::OpenFile`] here in [`VdiffApp::execute`],
 //! with an empty [`FileViewState`] dispatched back through the reducer just
@@ -27,7 +29,7 @@
 
 use std::time::{Duration, Instant};
 
-use egui::{Align2, Context, Event, Key, Modifiers};
+use egui::{Align2, Context, Key, Modifiers};
 
 use crate::core::app::{update, App, Cmd, Msg, Pane, Screen};
 use crate::core::diff_state::{DiffPaneState, FileEntry};
@@ -42,7 +44,7 @@ use crate::pipeline::repo::GitRepo;
 use crate::ui::diff_view;
 use crate::ui::file_view;
 use crate::ui::graph_view::{self, Transform};
-use crate::ui::nvim_pane::{self, NvimPane};
+use crate::ui::nvim_pane::{self, NvimAction, NvimPane};
 
 /// How long `--smoke` keeps the window open before closing it.
 const SMOKE_DURATION: Duration = Duration::from_secs(2);
@@ -324,21 +326,7 @@ impl VdiffApp {
             self.handle_nvim_keys(ctx);
             return;
         }
-        let presses: Vec<(Key, Modifiers)> = ctx.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|event| match event {
-                    egui::Event::Key {
-                        key,
-                        pressed: true,
-                        repeat: false,
-                        modifiers,
-                        ..
-                    } => Some((*key, *modifiers)),
-                    _ => None,
-                })
-                .collect()
-        });
+        let presses = ctx.input(|i| extract_key_presses(&i.events));
 
         for (key, modifiers) in presses {
             let Some(input) = egui_key_to_input(key, modifiers) else {
@@ -375,95 +363,48 @@ impl VdiffApp {
         }
     }
 
-    /// The nvim-mode input path: every raw egui event this frame either
-    /// starts/completes the local `Ctrl-w` chord (see
-    /// [`Self::complete_nvim_ctrl_w_chord`] for what each completion does)
-    /// or gets translated by
-    /// [`crate::ui::nvim_pane::translate_event_for_nvim`] and sent to the
-    /// session as [`NvimCmd::Input`]. `map_key`/the reducer are bypassed
-    /// entirely for everything else -- nvim owns its own modal keymap, and
-    /// `core::App`'s `File*` messages (scroll, half-page, change/file jump)
-    /// have nothing to act on here since there's no [`FileViewState`]
-    /// content backing this pane.
+    /// The nvim-mode input path: hands this frame's raw egui events to the
+    /// pure [`nvim_pane::process_nvim_events`] (see that function's doc for
+    /// why the `Ctrl-w` chord specifically needs to be handled there,
+    /// against real event sequences, rather than per-event here), stores
+    /// the chord-armed state it returns for next frame, then executes each
+    /// resulting [`NvimAction`] -- forwarding input as-is, or resolving a
+    /// boundary check via [`NvimPane::at_boundary`] (impure -- an RPC round
+    /// trip -- which is why it isn't done inside the pure function itself).
+    /// `map_key`/the reducer are bypassed entirely for everything else --
+    /// nvim owns its own modal keymap, and `core::App`'s `File*` messages
+    /// (scroll, half-page, change/file jump) have nothing to act on here
+    /// since there's no [`FileViewState`] content backing this pane.
     fn handle_nvim_keys(&mut self, ctx: &Context) {
         let events = ctx.input(|i| i.events.clone());
-        for event in &events {
-            if self.nvim_ctrl_w_pending {
-                self.nvim_ctrl_w_pending = false;
-                if let Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } = event
-                {
-                    self.complete_nvim_ctrl_w_chord(*key, *modifiers);
-                }
-                continue;
-            }
-            if let Event::Key {
-                key: Key::W,
-                pressed: true,
-                modifiers,
-                ..
-            } = event
-            {
-                if modifiers.ctrl {
-                    self.nvim_ctrl_w_pending = true;
-                    continue;
-                }
-            }
-            if let Some(text) = nvim_pane::translate_event_for_nvim(event) {
-                if let Some(nvim) = &self.nvim {
-                    nvim.send(NvimCmd::Input(text));
-                }
-            }
+        let (actions, pending) = nvim_pane::process_nvim_events(&events, self.nvim_ctrl_w_pending);
+        self.nvim_ctrl_w_pending = pending;
+        for action in actions {
+            self.execute_nvim_action(action);
         }
     }
 
-    /// The second half of the nvim-mode `Ctrl-w` chord: boundary-aware for
-    /// `h`/`l`/`ArrowLeft`/`ArrowRight` (query nvim's own `winnr()` via
-    /// [`NvimPane::at_boundary`] -- at the edge, hop panes; not at the
-    /// edge, nvim has internal splits to move between, so forward
-    /// `<C-w>h`/`<C-w>l`/`<C-w><Left>`/`<C-w><Right>` instead), always
-    /// forwarded for `j`/`k`/`ArrowUp`/`ArrowDown` (vertical splits are
-    /// entirely nvim-internal -- vdiff has no pane above or below), and
-    /// forwarded as `<C-w><key>` via
-    /// [`crate::ui::nvim_pane::ctrl_w_continuation`] for everything else
-    /// (restores the rest of nvim's `Ctrl-w` repertoire -- `q`, `o`, `w`,
-    /// ... -- that this project's older blanket "clear the chord silently"
-    /// behavior used to swallow; see that function's doc for the one
-    /// accepted tradeoff, insert-mode `Ctrl-w` word-delete timing).
-    fn complete_nvim_ctrl_w_chord(&mut self, key: Key, modifiers: Modifiers) {
+    /// Execute one [`NvimAction`] from [`Self::handle_nvim_keys`]. A no-op
+    /// if the nvim pane isn't actually live (shouldn't happen --
+    /// `handle_nvim_keys` is only called while `self.nvim.is_some()` -- but
+    /// defended rather than assumed).
+    fn execute_nvim_action(&mut self, action: NvimAction) {
         let Some(nvim) = &self.nvim else { return };
-        match key {
-            Key::H | Key::ArrowLeft => {
-                if nvim.at_boundary("h") {
-                    self.dispatch(Msg::PaneLeft);
+        match action {
+            NvimAction::Input(text) => nvim.send(NvimCmd::Input(text)),
+            NvimAction::CtrlWBoundary {
+                dir,
+                hop_left,
+                forward_seq,
+            } => {
+                if nvim.at_boundary(dir) {
+                    if hop_left {
+                        self.dispatch(Msg::PaneLeft);
+                    }
+                    // At the right boundary already: nothing further right
+                    // to hop to (there's no pane past the nvim pane).
                 } else {
-                    let seq = if key == Key::H {
-                        "<C-w>h"
-                    } else {
-                        "<C-w><Left>"
-                    };
-                    nvim.send(NvimCmd::Input(seq.to_string()));
-                }
-            }
-            Key::L | Key::ArrowRight => {
-                if !nvim.at_boundary("l") {
-                    let seq = if key == Key::L {
-                        "<C-w>l"
-                    } else {
-                        "<C-w><Right>"
-                    };
-                    nvim.send(NvimCmd::Input(seq.to_string()));
-                }
-                // At the right boundary already: nothing further right to
-                // hop to (there's no pane past the nvim pane), so no-op.
-            }
-            _ => {
-                if let Some(seq) = nvim_pane::ctrl_w_continuation(key, modifiers) {
-                    nvim.send(NvimCmd::Input(seq));
+                    nvim.send(NvimCmd::Input(forward_seq.to_string()));
                 }
             }
         }
@@ -617,6 +558,32 @@ impl eframe::App for VdiffApp {
     }
 }
 
+/// Filter this frame's raw egui events down to actual key *presses*
+/// (`pressed: true`, `repeat: false`), discarding releases and everything
+/// that isn't [`Event::Key`] (in particular `Event::Text`, which
+/// [`egui_key_to_input`]/`map_key`'s discrete-key chords never consult).
+/// This is what makes the built-in-viewer/graph-side `Ctrl-w h`/`Ctrl-w l`
+/// chord immune to the bug [`crate::ui::nvim_pane::process_nvim_events`]'s
+/// doc describes for the nvim-mode chord: releases (including `Ctrl-w`'s
+/// own) never even reach [`map_key`]'s pending-chord check here, so they
+/// can't disarm it, and there's no `Text` forwarding path to leak through
+/// in the first place.
+fn extract_key_presses(events: &[egui::Event]) -> Vec<(Key, Modifiers)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::Key {
+                key,
+                pressed: true,
+                repeat: false,
+                modifiers,
+                ..
+            } => Some((*key, *modifiers)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Translate an egui key press (with its modifiers) to vdiff's
 /// toolkit-independent [`KeyInput`]. Pure and unit-tested: with Ctrl held,
 /// only `w`/`d`/`u` map to anything ([`KeyInput::Ctrl`]); otherwise the
@@ -756,6 +723,110 @@ mod tests {
                 "key={key:?} (ctrl held)"
             );
         }
+    }
+
+    #[test]
+    fn extract_key_presses_drops_releases_and_text_from_a_real_ctrl_w_l_sequence() {
+        // The exact event sequence a physical Ctrl-w, release, l, release
+        // produces (including l's paired Text event) -- the graph-side
+        // chord must see only the two presses, in order, with everything
+        // else (both releases, and l's Text) filtered out.
+        let events = vec![
+            egui::Event::Key {
+                key: Key::W,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::CTRL,
+            },
+            egui::Event::Key {
+                key: Key::W,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: Modifiers::CTRL,
+            },
+            egui::Event::Key {
+                key: Key::L,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+            egui::Event::Text("l".to_string()),
+            egui::Event::Key {
+                key: Key::L,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+        ];
+
+        assert_eq!(
+            extract_key_presses(&events),
+            vec![(Key::W, Modifiers::CTRL), (Key::L, Modifiers::NONE)]
+        );
+    }
+
+    #[test]
+    fn ctrl_w_then_l_completes_the_graph_side_chord_across_a_real_event_sequence() {
+        // End-to-end through the same pipeline `handle_keys` drives:
+        // extract_key_presses -> egui_key_to_input -> map_key. A file pane
+        // must be open for `Ctrl-w l` to resolve to PaneRight (see
+        // `KeyContext::file_open`).
+        let events = vec![
+            egui::Event::Key {
+                key: Key::W,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::CTRL,
+            },
+            egui::Event::Key {
+                key: Key::W,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: Modifiers::CTRL,
+            },
+            egui::Event::Key {
+                key: Key::L,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+            egui::Event::Text("l".to_string()),
+        ];
+
+        let mut ctx = KeyContext {
+            screen: Screen::Graph,
+            pane: Pane::Graph,
+            file_open: true,
+            picker_open: false,
+            pending: None,
+        };
+        let mut outcomes = Vec::new();
+        for (key, modifiers) in extract_key_presses(&events) {
+            let Some(input) = egui_key_to_input(key, modifiers) else {
+                continue;
+            };
+            let outcome = map_key(input, ctx);
+            ctx.pending = None;
+            if let KeyOutcome::Pending(pending) = outcome {
+                ctx.pending = Some(pending);
+            }
+            outcomes.push(outcome);
+        }
+
+        assert_eq!(
+            outcomes,
+            vec![
+                KeyOutcome::Pending(Pending::CtrlW),
+                KeyOutcome::Msg(Msg::PaneRight),
+            ]
+        );
     }
 
     /// One node backed by an added file (`new.rs`, no base content) and a
