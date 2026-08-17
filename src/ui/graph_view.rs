@@ -407,13 +407,22 @@ fn paint_root_legend(
     }
 }
 
-/// Row 2: the test-module hidden/shown hint (only drawn once there are any
-/// test modules to mention at all), then the two edge-color swatches.
+/// Row 2: the `Enter`/`d` pane-open hint, the test-module hidden/shown hint
+/// (only drawn once there are any test modules to mention at all), then the
+/// two edge-color swatches.
 fn paint_hint_row(painter: &egui::Painter, app: &App, viewport: EguiRect) {
     const HINT_COLOR: Color32 = Color32::from_rgb(0xaa, 0xaa, 0xaa);
 
     let mut cursor_x = viewport.left() + 8.0;
     let text_y = viewport.top() + LEGEND_H + LEGEND_H / 2.0;
+
+    cursor_x = paint_text(
+        painter,
+        "Enter: file   d: diff",
+        cursor_x,
+        text_y,
+        HINT_COLOR,
+    ) + 20.0;
 
     let (_, hidden_count) = hide_test_modules(&app.graph);
     if hidden_count > 0 {
