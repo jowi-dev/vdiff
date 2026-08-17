@@ -323,18 +323,26 @@ fn run_writer(
                 method,
                 params,
                 reply,
-            } => match send_request(&mut stdin, &msgid, &method, params) {
-                Ok(id) => {
-                    if let Ok(mut pending) = pending.lock() {
-                        pending.insert(id, reply);
+            } => {
+                // Reserve the id and register the reply channel *before*
+                // writing the request -- see `write_request`'s doc for why
+                // this ordering (not send_request's allocate-then-write)
+                // matters here specifically.
+                let id = msgid.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut pending) = pending.lock() {
+                    pending.insert(id, reply.clone());
+                }
+                match write_request(&mut stdin, id, &method, params) {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        if let Ok(mut pending) = pending.lock() {
+                            pending.remove(&id);
+                        }
+                        let _ = reply.send(None);
+                        Err(err)
                     }
-                    Ok(())
                 }
-                Err(err) => {
-                    let _ = reply.send(None);
-                    Err(err)
-                }
-            },
+            }
             NvimCmd::DiffSplit { path, base_content } => {
                 send_diff_split(&mut stdin, &msgid, &path, &base_content)
             }
@@ -533,13 +541,14 @@ fn send_diff_split(
     .map(|_| ())
 }
 
-/// Encode and write one msgpack-rpc request: `[0, msgid, method, params]`,
-/// returning the `msgid` used. Most callers (`nvim_input`, `nvim_cmd`, ...)
-/// fire-and-forget and ignore it -- responses to those just get drained off
-/// the wire by the reader thread without a `pending` entry to match against
-/// (see [`redraw_or_response`]). [`NvimCmd::Call`] is the one caller that
-/// registers `id` in `pending` so the reader can deliver the response
-/// somewhere.
+/// Allocate the next msgid and encode+write one msgpack-rpc request:
+/// `[0, msgid, method, params]`, returning the `msgid` used. Most callers
+/// (`nvim_input`, `nvim_cmd`, ...) fire-and-forget and ignore it --
+/// responses to those just get drained off the wire by the reader thread
+/// without a `pending` entry to match against. [`NvimCmd::Call`] doesn't
+/// use this directly -- see [`write_request`]'s doc for why it needs the
+/// id allocated (and registered in `pending`) *before* the write, not
+/// after.
 fn send_request(
     stdin: &mut ChildStdin,
     msgid: &AtomicU64,
@@ -547,6 +556,26 @@ fn send_request(
     params: Vec<Value>,
 ) -> io::Result<u64> {
     let id = msgid.fetch_add(1, Ordering::SeqCst);
+    write_request(stdin, id, method, params)?;
+    Ok(id)
+}
+
+/// Encode and write one msgpack-rpc request with an already-allocated
+/// `id`: `[0, id, method, params]`. Split out from [`send_request`]
+/// specifically for [`NvimCmd::Call`], which has to register its reply
+/// channel in `pending` *before* this write (and its `flush`) happen --
+/// otherwise a fast enough response can arrive and be processed by the
+/// reader thread before the writer thread gets around to inserting the
+/// entry the reader looks up, silently dropping a response nobody was
+/// "waiting" on yet and leaving the caller to eat its full timeout for no
+/// reason. Every other [`NvimCmd`] fires-and-forgets and doesn't care
+/// about this ordering at all.
+fn write_request(
+    stdin: &mut ChildStdin,
+    id: u64,
+    method: &str,
+    params: Vec<Value>,
+) -> io::Result<()> {
     let msg = Value::Array(vec![
         Value::from(0),
         Value::from(id),
@@ -554,8 +583,7 @@ fn send_request(
         Value::Array(params),
     ]);
     rmpv::encode::write_value(stdin, &msg).map_err(io::Error::other)?;
-    stdin.flush()?;
-    Ok(id)
+    stdin.flush()
 }
 
 /// The reader thread's body: decode msgpack values off `stdout` in a loop
