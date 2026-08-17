@@ -91,6 +91,11 @@ pub enum NvimCmd {
         params: Vec<Value>,
         reply: Sender<Option<Value>>,
     },
+    /// Open (or refresh, if already open -- see [`DIFF_SPLIT_LUA`]) a
+    /// read-only scratch buffer holding `base_content` in a vertical split
+    /// left of the window currently showing `path`, and turn on `diffthis`
+    /// in both -- the `:VdiffDiff`/`d` diffsplit-against-merge-base.
+    DiffSplit { path: PathBuf, base_content: String },
 }
 
 /// Whether an `nvim` binary is on `PATH` -- gates `--nvim` falling back to
@@ -123,6 +128,10 @@ pub struct NvimSession {
     cmd_tx: Sender<NvimCmd>,
     grid: Arc<Mutex<GridState>>,
     alive: Arc<AtomicBool>,
+    /// Fed by the reader thread every time a `vdiff_diff` notification
+    /// arrives (the embedded `:VdiffDiff` Ex command's `rpcnotify`) --
+    /// drained by [`Self::take_diff_request`] on the UI thread each frame.
+    diff_requests: mpsc::Receiver<()>,
     _writer: JoinHandle<()>,
     _reader: JoinHandle<()>,
 }
@@ -164,6 +173,7 @@ impl NvimSession {
             run_writer(stdin, cmd_rx, cols, rows, writer_alive, writer_pending);
         });
 
+        let (diff_tx, diff_rx) = mpsc::channel::<()>();
         let grid_for_reader = grid.clone();
         let reader_alive = alive.clone();
         let reader_pending = pending.clone();
@@ -174,6 +184,7 @@ impl NvimSession {
                 repaint,
                 reader_alive,
                 reader_pending,
+                diff_tx,
             );
         });
 
@@ -182,6 +193,7 @@ impl NvimSession {
             cmd_tx,
             grid,
             alive,
+            diff_requests: diff_rx,
             _writer: writer,
             _reader: reader,
         })
@@ -229,6 +241,19 @@ impl NvimSession {
     /// frame.
     pub fn grid(&self) -> Arc<Mutex<GridState>> {
         self.grid.clone()
+    }
+
+    /// Whether at least one `:VdiffDiff` (`vdiff_diff` notification) has
+    /// arrived since the last call -- drains every queued one (there's no
+    /// reason to fire the diffsplit flow more than once even if several
+    /// piled up between frames) and reports whether there was anything to
+    /// drain.
+    pub fn take_diff_request(&self) -> bool {
+        let mut seen = false;
+        while self.diff_requests.try_recv().is_ok() {
+            seen = true;
+        }
+        seen
     }
 }
 
@@ -310,6 +335,9 @@ fn run_writer(
                     Err(err)
                 }
             },
+            NvimCmd::DiffSplit { path, base_content } => {
+                send_diff_split(&mut stdin, &msgid, &path, &base_content)
+            }
         };
         if result.is_err() {
             alive.store(false, Ordering::SeqCst);
@@ -340,23 +368,30 @@ local path, line, ranges = ...
 vim.api.nvim_set_hl(0, "VdiffChanged", { bg = "#1e3a1e" })
 vim.api.nvim_set_hl(0, "VdiffChangedSign", { fg = "#6ac96a" })
 local ns = vim.api.nvim_create_namespace("vdiff")
-local ok = pcall(vim.cmd, "edit " .. vim.fn.fnameescape(path))
+-- `:edit`'s own pcall result is deliberately not checked before marking:
+-- a BufReadPost/FileType autocommand throwing (e.g. an unrelated LSP
+-- client failing to start) makes `pcall` report failure even though the
+-- buffer switch itself already happened by that point in Vim's normal
+-- edit sequence -- gating marks on that would silently withhold them on
+-- a successful open just because of noise elsewhere in the user's
+-- config. `nvim_get_current_buf()` after the attempt is the actual
+-- source of truth for what to mark, whether or not `:edit` reported an
+-- error.
+pcall(vim.cmd, "edit " .. vim.fn.fnameescape(path))
 local buf = vim.api.nvim_get_current_buf()
 vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
-if ok then
-  for _, r in ipairs(ranges) do
-    vim.api.nvim_buf_set_extmark(buf, ns, r[1], 0, {
-      end_row = r[2],
-      end_col = 0,
-      hl_eol = true,
-      hl_group = "VdiffChanged",
-      sign_text = "▎",
-      sign_hl_group = "VdiffChangedSign",
-    })
-  end
-  if line then
-    pcall(vim.api.nvim_win_set_cursor, 0, { line, 0 })
-  end
+for _, r in ipairs(ranges) do
+  pcall(vim.api.nvim_buf_set_extmark, buf, ns, r[1], 0, {
+    end_row = r[2],
+    end_col = 0,
+    hl_eol = true,
+    hl_group = "VdiffChanged",
+    sign_text = "▎",
+    sign_hl_group = "VdiffChangedSign",
+  })
+end
+if line then
+  pcall(vim.api.nvim_win_set_cursor, 0, { line, 0 })
 end
 "##;
 
@@ -409,6 +444,95 @@ fn send_open_file(
     .map(|_| ())
 }
 
+/// Two Ex commands registered once per session (right after `nvim_ui_attach`
+/// -- see [`crate::ui::nvim_pane::NvimPane::register_vdiff_commands`],
+/// called from `main.rs` on the initial spawn and from
+/// [`crate::ui::eframe_app::VdiffApp::respawn_nvim`] after every respawn,
+/// since a fresh child starts with no user commands at all): `:VdiffDiff`
+/// notifies the embedder (channel 1 is always the sole stdio channel for
+/// an `--embed` session with one client) to run the diffsplit-against-
+/// merge-base flow for whatever file is currently open; `:VdiffDiffOff`
+/// is the manual cleanup path, closing every window showing one of this
+/// plugin's `vdiff-base://`-named scratch buffers. `<bar>` is Vim's escape
+/// for a literal `|` inside a `:command` replacement -- an unescaped `|`
+/// would otherwise terminate the command definition partway through.
+pub const VDIFF_DIFF_COMMAND: &str = "command! -bar VdiffDiff call rpcnotify(1, 'vdiff_diff')";
+pub const VDIFF_DIFF_OFF_COMMAND: &str = "command! -bar VdiffDiffOff diffoff! <bar> windo if bufname('%') =~# '^vdiff-base://' <bar> close <bar> endif";
+
+/// The Lua chunk [`NvimCmd::DiffSplit`] runs via `nvim_exec_lua`, receiving
+/// `path, content` as its varargs: finds (or creates) the read-only
+/// scratch buffer named `vdiff-base://<path>` holding `content`'s lines,
+/// and either reuses its existing window (re-running `:VdiffDiff`/`d` for
+/// the same file just refreshes the content -- idempotent, no split
+/// pile-up) or opens a new vertical split left of the current window and
+/// puts it there. `diffthis` in both windows afterward turns on real nvim
+/// diff mode (native `]c`/`[c`, folds, inline highlights) between them.
+/// Cursor ends back in the original (real-file) window.
+const DIFF_SPLIT_LUA: &str = r##"
+local path, content = ...
+local bufname = "vdiff-base://" .. path
+local lines = vim.split(content, "\n", { plain = true })
+if #lines > 0 and lines[#lines] == "" then
+  table.remove(lines)
+end
+
+local buf = vim.fn.bufnr(bufname)
+local existing_win = nil
+if buf ~= -1 then
+  for _, w in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_get_buf(w) == buf then
+      existing_win = w
+    end
+  end
+end
+
+if buf == -1 then
+  buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(buf, bufname)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].filetype = vim.filetype.match({ filename = path }) or ""
+end
+
+vim.bo[buf].modifiable = true
+vim.bo[buf].readonly = false
+vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+vim.bo[buf].modifiable = false
+vim.bo[buf].readonly = true
+
+local original_win = vim.api.nvim_get_current_win()
+if existing_win then
+  vim.api.nvim_set_current_win(existing_win)
+else
+  vim.cmd("leftabove vsplit")
+  vim.api.nvim_win_set_buf(0, buf)
+end
+vim.cmd("diffthis")
+vim.api.nvim_set_current_win(original_win)
+vim.cmd("diffthis")
+"##;
+
+/// Send [`NvimCmd::DiffSplit`] as one `nvim_exec_lua(DIFF_SPLIT_LUA, [path,
+/// base_content])` request.
+fn send_diff_split(
+    stdin: &mut ChildStdin,
+    msgid: &AtomicU64,
+    path: &Path,
+    base_content: &str,
+) -> io::Result<()> {
+    let args = vec![
+        Value::from(path.to_string_lossy().into_owned()),
+        Value::from(base_content),
+    ];
+    send_request(
+        stdin,
+        msgid,
+        "nvim_exec_lua",
+        vec![Value::from(DIFF_SPLIT_LUA), Value::Array(args)],
+    )
+    .map(|_| ())
+}
+
 /// Encode and write one msgpack-rpc request: `[0, msgid, method, params]`,
 /// returning the `msgid` used. Most callers (`nvim_input`, `nvim_cmd`, ...)
 /// fire-and-forget and ignore it -- responses to those just get drained off
@@ -449,6 +573,7 @@ fn run_reader(
     repaint: impl Fn(),
     alive: Arc<AtomicBool>,
     pending: PendingReplies,
+    diff_tx: Sender<()>,
 ) {
     let mut reader = BufReader::new(stdout);
     while let Ok(value) = rmpv::decode::read_value(&mut reader) {
@@ -457,19 +582,27 @@ fn run_reader(
         };
         match items.first().and_then(rmpv::Value::as_i64) {
             Some(1) => deliver_response(items, &pending),
-            Some(2) => {
-                if let Some(events) = parse_redraw_notification(items) {
-                    let flushed = events.iter().any(|e| matches!(e, RedrawEvent::Flush));
-                    if let Ok(mut grid) = grid.lock() {
-                        for event in &events {
-                            grid.apply(event);
+            Some(2) => match items.get(1).and_then(rmpv::Value::as_str) {
+                Some("redraw") => {
+                    if let Some(params) = items.get(2).and_then(rmpv::Value::as_array) {
+                        let events = parse_redraw_batch(params);
+                        let flushed = events.iter().any(|e| matches!(e, RedrawEvent::Flush));
+                        if let Ok(mut grid) = grid.lock() {
+                            for event in &events {
+                                grid.apply(event);
+                            }
+                        }
+                        if flushed {
+                            repaint();
                         }
                     }
-                    if flushed {
-                        repaint();
-                    }
                 }
-            }
+                Some("vdiff_diff") => {
+                    let _ = diff_tx.send(());
+                    repaint(); // wake the UI thread so it drains the request promptly.
+                }
+                _ => {} // an event this spike doesn't know about -- ignored, forward-compat.
+            },
             _ => {} // a request from nvim to us, or something malformed -- ignored either way.
         }
     }
@@ -478,18 +611,6 @@ fn run_reader(
         pending.clear(); // dropping the reply senders wakes any blocked `call()` immediately.
     }
     repaint(); // wake the UI thread up so it notices `is_alive() == false` promptly.
-}
-
-/// If `items` is a `redraw` notification's body (`["redraw", params]`,
-/// i.e. everything after the `[2, ...]` type tag already matched by the
-/// caller), parse its batch into events; `None` for anything else
-/// (silently ignored, matching the module's forward-compat/spike posture).
-fn parse_redraw_notification(items: &[Value]) -> Option<Vec<RedrawEvent>> {
-    if items.get(1)?.as_str()? != "redraw" {
-        return None;
-    }
-    let params = items.get(2)?.as_array()?;
-    Some(parse_redraw_batch(params))
 }
 
 /// Deliver a `[1, msgid, error, result]` response frame to whichever

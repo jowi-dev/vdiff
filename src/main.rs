@@ -172,6 +172,7 @@ fn run_gui(
                 // the first frame (see `NvimPane::maybe_resize`).
                 match NvimPane::spawn(&repo_root, 80, 24, cc.egui_ctx.clone()) {
                     Ok(pane) => {
+                        pane.register_vdiff_commands();
                         run_nvim_init_commands(&pane, &nvim_cmd);
                         Some(pane)
                     }

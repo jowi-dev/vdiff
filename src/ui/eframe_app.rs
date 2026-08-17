@@ -317,6 +317,7 @@ impl VdiffApp {
         self.nvim = None; // drop the old session (kills/reaps the child) before spawning the new one.
         match NvimPane::spawn(&self.nvim_cwd, cols, rows, self.egui_ctx.clone()) {
             Ok(pane) => {
+                pane.register_vdiff_commands();
                 for cmd in &self.nvim_init_cmds {
                     if let Err(message) = pane.run_init_command(cmd) {
                         eprintln!("warning: {message}");
@@ -334,7 +335,14 @@ impl VdiffApp {
     /// [`map_key`], updating the pending chord char and dispatching any
     /// resulting [`Msg`]. In nvim mode with keyboard focus on
     /// [`Pane::File`], delegates to [`Self::handle_nvim_keys`] instead --
-    /// see that method's doc.
+    /// see that method's doc. In nvim mode with focus on [`Pane::Graph`],
+    /// bare `d` (no chord in progress, no picker open) is intercepted
+    /// before it ever reaches `map_key` -- see
+    /// [`Self::should_open_nvim_diff`] -- and opens the focused node's
+    /// file in the nvim pane plus its diffsplit in one step, rather than
+    /// `map_key`'s normal `Msg::OpenDiff` (the full-screen built-in diff
+    /// view, which stays reachable via `d` exactly as before whenever nvim
+    /// mode is off).
     fn handle_keys(&mut self, ctx: &Context) {
         if self.nvim.is_some() && self.app.pane == Pane::File {
             self.handle_nvim_keys(ctx);
@@ -346,6 +354,10 @@ impl VdiffApp {
             let Some(input) = egui_key_to_input(key, modifiers) else {
                 continue;
             };
+            if self.should_open_nvim_diff(input) {
+                self.open_nvim_diff_for_focus();
+                continue;
+            }
             let ctx = KeyContext {
                 screen: self.app.screen,
                 pane: self.app.pane,
@@ -363,6 +375,37 @@ impl VdiffApp {
         }
     }
 
+    /// Whether `input` should be intercepted for the nvim-mode `d` ==
+    /// "open in nvim + diffsplit" binding instead of `map_key`'s normal
+    /// `Char('d')` -> `Msg::OpenDiff`: nvim mode active, on
+    /// [`Screen::Graph`]/[`Pane::Graph`] (never [`Pane::File`] -- that's
+    /// `handle_nvim_keys`'s territory and `d` there just forwards to nvim
+    /// as `dd`/etc.), and no chord or picker mid-flight (so `gd`'s `d` and
+    /// any other multi-key sequence ending in `d` are untouched). Pure
+    /// given `self`'s relevant fields -- kept as a method rather than a
+    /// free function since there's no value in threading five `&self`
+    /// fields through a standalone signature for a one-call predicate.
+    fn should_open_nvim_diff(&self, input: KeyInput) -> bool {
+        input == KeyInput::Char('d')
+            && self.nvim.is_some()
+            && self.app.screen == Screen::Graph
+            && self.app.pane == Pane::Graph
+            && self.app.picker.is_none()
+            && self.pending_key.is_none()
+    }
+
+    /// The nvim-mode `d` binding: open the focused node's file in the nvim
+    /// pane exactly like `Enter` (via [`Msg::OpenFile`] -- same marks,
+    /// same [`Self::nvim_current_file`] tracking), then immediately run
+    /// the same diffsplit [`Self::trigger_vdiff_diff`] runs for
+    /// `:VdiffDiff`, so the result is graph focus landing directly on the
+    /// nvim pane already in diff mode against the merge-base version --
+    /// one keystroke instead of open-then-`:VdiffDiff`.
+    fn open_nvim_diff_for_focus(&mut self) {
+        self.dispatch(Msg::OpenFile);
+        self.trigger_vdiff_diff();
+    }
+
     /// The fix for the `ZZ` lockup's user-facing half: if the nvim pane has
     /// died (see [`NvimPane::is_alive`]) while it still holds keyboard
     /// focus, dispatch [`Msg::PaneLeft`] *before* this frame's key handling
@@ -375,6 +418,44 @@ impl VdiffApp {
         if dead && self.app.pane == Pane::File {
             self.dispatch(Msg::PaneLeft);
         }
+    }
+
+    /// Drain any `:VdiffDiff` invocations that arrived since last frame
+    /// (see [`NvimPane::take_diff_request`] -- fed by the embedded
+    /// `:VdiffDiff` Ex command's `rpcnotify`) and run the diffsplit flow
+    /// once for however many piled up.
+    fn poll_vdiff_diff_requests(&mut self) {
+        let requested = self.nvim.as_ref().is_some_and(NvimPane::take_diff_request);
+        if requested {
+            self.trigger_vdiff_diff();
+        }
+    }
+
+    /// The diffsplit-against-merge-base flow itself, shared by
+    /// `:VdiffDiff` (typed inside nvim) and the nvim-mode `d` binding
+    /// (typed from the graph): read [`Self::nvim_current_file`]'s base
+    /// content via [`DiffLoader`]'s repo/base_oid (already held for the
+    /// built-in diff pane -- nothing new to load here), then hand it to
+    /// [`NvimPane::diffsplit`]. A missing base blob (an added file) reads
+    /// back `None`/empty content -- diffing against an empty buffer is
+    /// the correct, unsurprising result, not an error. No-ops with a
+    /// stderr warning if nothing's open yet (shouldn't happen in practice
+    /// -- `:VdiffDiff`/`d` both require a file already open to make sense
+    /// -- but the notification path in particular can't assume the glue's
+    /// state didn't move on by the time it's processed).
+    fn trigger_vdiff_diff(&mut self) {
+        let Some(nvim) = &self.nvim else { return };
+        let Some(file) = self.nvim_current_file.clone() else {
+            eprintln!("warning: :VdiffDiff requested with no file open in the nvim pane");
+            return;
+        };
+        let base_content = self
+            .diff_loader
+            .repo
+            .base_blob(&self.diff_loader.base_oid, &file.path)
+            .unwrap_or(None)
+            .unwrap_or_default();
+        nvim.diffsplit(file.path, base_content);
     }
 
     /// The nvim-mode input path: hands this frame's raw egui events to the
@@ -556,6 +637,7 @@ impl eframe::App for VdiffApp {
         }
 
         self.reclaim_focus_from_dead_nvim();
+        self.poll_vdiff_diff_requests();
         self.handle_keys(ctx);
         self.handle_zoom_keys(ctx);
     }

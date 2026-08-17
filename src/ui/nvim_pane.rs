@@ -151,6 +151,38 @@ impl NvimPane {
             )),
         }
     }
+
+    /// Register `:VdiffDiff`/`:VdiffDiffOff` in this session -- fresh
+    /// children (initial spawn, and every respawn) start with no user
+    /// commands at all, so this has to run every time a session comes up,
+    /// not just once at startup. Fire-and-forget like [`NvimCmd::Ex`]
+    /// generally -- a failure here (should never happen; these are static,
+    /// always-valid command strings) just means `:VdiffDiff` won't exist
+    /// this session, not a crash.
+    pub fn register_vdiff_commands(&self) {
+        self.send(NvimCmd::Ex(
+            crate::nvim::session::VDIFF_DIFF_COMMAND.to_string(),
+        ));
+        self.send(NvimCmd::Ex(
+            crate::nvim::session::VDIFF_DIFF_OFF_COMMAND.to_string(),
+        ));
+    }
+
+    /// Whether `:VdiffDiff` was invoked in this session since the last
+    /// call -- see [`NvimSession::take_diff_request`].
+    pub fn take_diff_request(&self) -> bool {
+        self.session.take_diff_request()
+    }
+
+    /// Open (or refresh) the diffsplit-against-merge-base view for
+    /// whatever file is currently open: a read-only scratch buffer holding
+    /// `base_content`, vertically split to the left, both windows in
+    /// `diffthis` mode. `path` names the scratch buffer (`vdiff-base://
+    /// <path>`) and picks its filetype for syntax highlighting -- see
+    /// [`NvimCmd::DiffSplit`].
+    pub fn diffsplit(&self, path: PathBuf, base_content: String) {
+        self.send(NvimCmd::DiffSplit { path, base_content });
+    }
 }
 
 /// The message shown in place of the grid once nvim has exited (`ZZ`, `:q`,
