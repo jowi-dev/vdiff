@@ -36,7 +36,7 @@ use crate::core::diff_state::{DiffPaneState, FileEntry};
 use crate::core::file_view::{FileViewEntry, FileViewState};
 use crate::core::focus::Direction;
 use crate::graph::layout::{layout, LayoutResult};
-use crate::graph::model::{FileRef, GitStatus, ModuleNode, NodeId, ProjectGraph};
+use crate::graph::model::{GitStatus, ModuleNode, NodeId, ProjectGraph};
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome, Pending};
 use crate::nvim::session::NvimCmd;
 use crate::pipeline::file_diff::{changed_head_ranges, load_file_diff};
@@ -181,12 +181,16 @@ pub struct VdiffApp {
     /// fresh [`NvimPane`] (which needs a `Context` to request repaints)
     /// outside of a paint callback.
     egui_ctx: Context,
-    /// The [`FileRef`] most recently opened in the nvim pane (`None` before
-    /// the first `OpenFile` in nvim mode, or whenever nvim mode is off).
-    /// `:VdiffDiff`/`d`'s diffsplit-against-merge-base needs to know which
-    /// file to diff and where to read its base blob from -- both live on
-    /// `FileRef` directly, so there's nothing else to track.
-    nvim_current_file: Option<FileRef>,
+    /// The path most recently opened in the nvim pane via graph navigation
+    /// (`None` before the first `OpenFile` in nvim mode, or whenever nvim
+    /// mode is off). Demoted to a fallback: `:VdiffDiff`/`d`'s diffsplit
+    /// asks nvim what buffer is *actually* current first (see
+    /// [`Self::trigger_vdiff_diff`]/[`nvim_pane::resolve_diffed_path`]) --
+    /// this is only consulted when that RPC query can't produce an answer
+    /// (timeout, dead session) or reports something that isn't a
+    /// diffable real file (an unnamed/scratch buffer). Without it, either
+    /// of those cases would have nothing to fall back to at all.
+    nvim_current_file: Option<std::path::PathBuf>,
 }
 
 /// Everything [`VdiffApp::new`] needs to set up (and later respawn) the
@@ -290,7 +294,7 @@ impl VdiffApp {
                         .graph
                         .node(&node)
                         .and_then(|module| module.files.first())
-                        .cloned();
+                        .map(|file_ref| file_ref.path.clone());
                     if let (Some(nvim), Some(file)) = (&self.nvim, state.current_file()) {
                         nvim.open_file(file.path.clone(), Some(1), file.changed_ranges.clone());
                     }
@@ -433,29 +437,46 @@ impl VdiffApp {
 
     /// The diffsplit-against-merge-base flow itself, shared by
     /// `:VdiffDiff` (typed inside nvim) and the nvim-mode `d` binding
-    /// (typed from the graph): read [`Self::nvim_current_file`]'s base
-    /// content via [`DiffLoader`]'s repo/base_oid (already held for the
-    /// built-in diff pane -- nothing new to load here), then hand it to
-    /// [`NvimPane::diffsplit`]. A missing base blob (an added file) reads
-    /// back `None`/empty content -- diffing against an empty buffer is
-    /// the correct, unsurprising result, not an error. No-ops with a
-    /// stderr warning if nothing's open yet (shouldn't happen in practice
-    /// -- `:VdiffDiff`/`d` both require a file already open to make sense
-    /// -- but the notification path in particular can't assume the glue's
-    /// state didn't move on by the time it's processed).
+    /// (typed from the graph). Resolves which file to diff from nvim's
+    /// *actual* current buffer first -- `NvimPane::current_buffer_name`
+    /// plus [`nvim_pane::resolve_diffed_path`] -- rather than trusting
+    /// [`Self::nvim_current_file`] blindly: that field is only ever
+    /// written when graph navigation opens a file, so if the user `:e`'d
+    /// or `Ctrl-w w`'d to a different buffer inside nvim itself, the old
+    /// code would diff the file it last opened, not the one actually on
+    /// screen -- a plausible-looking wrong diff. `nvim_current_file` is
+    /// now only a fallback for when that query can't produce a usable
+    /// answer (RPC timeout/dead session, or the current buffer is
+    /// unnamed/one of this plugin's own `vdiff-base://` scratch buffers --
+    /// see `resolve_diffed_path`'s doc for the full list).
+    ///
+    /// Reads the resolved path's base content via [`DiffLoader`]'s repo/
+    /// base_oid (already held for the built-in diff pane), then hands it
+    /// to [`NvimPane::diffsplit`]. This works for *any* file in the repo,
+    /// not just ones backing a graph node -- reviewing a file reached by
+    /// navigating inside nvim is still a valid diff request. A missing
+    /// base blob (an added file) reads back `None`/empty content --
+    /// diffing against an empty buffer is the correct, unsurprising
+    /// result, not an error. No-ops with a stderr warning if neither the
+    /// query nor the fallback produced a path (shouldn't happen in
+    /// practice, but the notification path can't assume the glue's state
+    /// didn't move on by the time it's processed).
     fn trigger_vdiff_diff(&mut self) {
         let Some(nvim) = &self.nvim else { return };
-        let Some(file) = self.nvim_current_file.clone() else {
+        let buf_name = nvim.current_buffer_name();
+        let path = nvim_pane::resolve_diffed_path(buf_name.as_deref(), &self.nvim_cwd)
+            .or_else(|| self.nvim_current_file.clone());
+        let Some(path) = path else {
             eprintln!("warning: :VdiffDiff requested with no file open in the nvim pane");
             return;
         };
         let base_content = self
             .diff_loader
             .repo
-            .base_blob(&self.diff_loader.base_oid, &file.path)
+            .base_blob(&self.diff_loader.base_oid, &path)
             .unwrap_or(None)
             .unwrap_or_default();
-        nvim.diffsplit(file.path, base_content);
+        nvim.diffsplit(path, base_content);
     }
 
     /// The nvim-mode input path: hands this frame's raw egui events to the
