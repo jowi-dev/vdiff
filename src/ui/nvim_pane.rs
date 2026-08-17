@@ -60,9 +60,14 @@ impl NvimPane {
         self.session.send(cmd);
     }
 
-    /// Open `path` at `line` (1-based), following graph focus.
-    pub fn open_file(&self, path: PathBuf, line: Option<u64>) {
-        self.session.send(NvimCmd::OpenFile(path, line));
+    /// Open `path` at `line` (1-based), following graph focus, marking
+    /// every changed-head-line range in `ranges` (0-based, inclusive --
+    /// see `pipeline::file_diff::changed_head_ranges`) with a highlight
+    /// and gutter sign. `ranges` empty is correct (and clears any marks
+    /// left over from whatever was in this buffer slot before) for an
+    /// unchanged node or a deleted one.
+    pub fn open_file(&self, path: PathBuf, line: Option<u64>, ranges: Vec<(usize, usize)>) {
+        self.session.send(NvimCmd::OpenFile { path, line, ranges });
     }
 
     /// Resize the nvim UI to `new_cols`x`new_rows` if that differs from the

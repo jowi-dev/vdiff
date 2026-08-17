@@ -55,11 +55,26 @@ pub enum NvimCmd {
     /// `nvim_ui_try_resize`.
     Resize(u16, u16),
     /// Open `path` (relative to the session's cwd is fine; absolute works
-    /// too) via `nvim_cmd`'s `args` array -- no shell/Vim-command escaping
-    /// needed, unlike building a `:edit <path>` string by hand. `line`
-    /// places the cursor there afterwards (1-based, matching `:line`
-    /// semantics) via a follow-up `nvim_win_set_cursor`.
-    OpenFile(PathBuf, Option<u64>),
+    /// too), place the cursor at `line` (1-based, matching `:line`
+    /// semantics) if given, and mark every changed-head-line range in
+    /// `ranges` (0-based, inclusive -- see
+    /// `pipeline::file_diff::changed_head_ranges`) with a highlighted
+    /// background and gutter sign. `ranges` empty (an unchanged node, or a
+    /// deleted one -- nothing at head to mark) still runs the open/cursor
+    /// half and clears any marks left over from a previous file in the
+    /// same buffer slot. All of this happens as one `nvim_exec_lua` call
+    /// (see [`OPEN_FILE_LUA`]) rather than a separate `edit` request
+    /// followed by separate extmark requests -- sequencing an `edit` then
+    /// marks over fire-and-forget one-way requests has no ordering
+    /// guarantee (the writer thread doesn't wait for `edit` to finish
+    /// before sending the next request), and building a `:edit <path>`
+    /// command string by hand needs `fnameescape`-style escaping this
+    /// sidesteps by handing `path` to Lua as a plain string argument.
+    OpenFile {
+        path: PathBuf,
+        line: Option<u64>,
+        ranges: Vec<(usize, usize)>,
+    },
     /// Run an arbitrary Ex command via `nvim_command` -- used for
     /// `--nvim-cmd` init commands (see `main.rs`) after every attach/
     /// respawn. Fire-and-forget like every other [`NvimCmd`]; errors
@@ -269,7 +284,9 @@ fn run_writer(
                 vec![Value::from(cols), Value::from(rows)],
             )
             .map(|_| ()),
-            NvimCmd::OpenFile(path, line) => send_open_file(&mut stdin, &msgid, &path, line),
+            NvimCmd::OpenFile { path, line, ranges } => {
+                send_open_file(&mut stdin, &msgid, &path, line, &ranges)
+            }
             NvimCmd::Ex(command) => send_request(
                 &mut stdin,
                 &msgid,
@@ -301,39 +318,95 @@ fn run_writer(
     }
 }
 
-/// `nvim_cmd({cmd: "edit", args: [path]}, {})`, then -- if `line` is set --
-/// `nvim_win_set_cursor(0, [line, 0])`. Using `nvim_cmd`'s `args` array
-/// rather than building a `:edit <path>` string sidesteps Vim-command
-/// escaping entirely (the alternative the spike's brief called out:
-/// `fnameescape` via `nvim_call_function`). Errors from either call (e.g.
-/// `E37` on a modified buffer) are swallowed -- this is a spike; the
-/// session just keeps running with whatever's already open.
+/// The Lua chunk [`NvimCmd::OpenFile`] runs via `nvim_exec_lua`, receiving
+/// `path, line, ranges` as its varargs (`...`): defines the two highlight
+/// groups (idempotent -- cheap enough to redefine on every open rather
+/// than tracking "already defined" state), opens `path` (via
+/// `vim.fn.fnameescape` + `:edit`, wrapped in `pcall` so a modified-buffer
+/// `E37` doesn't abort the whole chunk -- the marking/namespace-clearing
+/// below still needs to run against whatever buffer *is* current), clears
+/// the `vdiff` namespace in that buffer (so switching files, or
+/// re-opening an unchanged file, never leaves stale marks behind), places
+/// one extmark per `ranges` entry (already `(row, end_row)` pairs -- see
+/// [`range_to_extmark_rows`], `end_row` exclusive per the extmark API,
+/// `ranges`' own end being inclusive), and finally moves the cursor to
+/// `line` if given (also `pcall`-wrapped: a stale cursor position from
+/// the previous buffer's line count is a coordinate error, not a Vim
+/// command failure like `E37`, so this can't `pcall(vim.cmd, ...)` its way
+/// out the same way -- calling `nvim_win_set_cursor` with an out-of-range
+/// row raises a Lua error `pcall` still needs to catch).
+const OPEN_FILE_LUA: &str = r##"
+local path, line, ranges = ...
+vim.api.nvim_set_hl(0, "VdiffChanged", { bg = "#1e3a1e" })
+vim.api.nvim_set_hl(0, "VdiffChangedSign", { fg = "#6ac96a" })
+local ns = vim.api.nvim_create_namespace("vdiff")
+local ok = pcall(vim.cmd, "edit " .. vim.fn.fnameescape(path))
+local buf = vim.api.nvim_get_current_buf()
+vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+if ok then
+  for _, r in ipairs(ranges) do
+    vim.api.nvim_buf_set_extmark(buf, ns, r[1], 0, {
+      end_row = r[2],
+      end_col = 0,
+      hl_eol = true,
+      hl_group = "VdiffChanged",
+      sign_text = "▎",
+      sign_hl_group = "VdiffChangedSign",
+    })
+  end
+  if line then
+    pcall(vim.api.nvim_win_set_cursor, 0, { line, 0 })
+  end
+end
+"##;
+
+/// Convert one changed-line range (`(start, end)`, both 0-based head-line
+/// indices, inclusive -- as returned by
+/// `pipeline::file_diff::changed_head_ranges`) into the `(row, end_row)`
+/// pair [`OPEN_FILE_LUA`]'s `nvim_buf_set_extmark` call needs: `row`
+/// unchanged, `end_row` is `end + 1` -- extmark ranges are end-exclusive,
+/// unlike `changed_head_ranges`'s inclusive `end`. Pure and unit-tested;
+/// this is the one part of the marking pipeline that's easy to get an
+/// off-by-one wrong in and hard to notice by eye (an extmark with
+/// `end_row` one short silently drops the range's last line).
+pub fn range_to_extmark_rows(range: (usize, usize)) -> (u64, u64) {
+    let (start, end) = range;
+    (start as u64, end as u64 + 1)
+}
+
+/// Send [`NvimCmd::OpenFile`] as one `nvim_exec_lua(OPEN_FILE_LUA, [path,
+/// line, ranges])` request. `ranges` converts through
+/// [`range_to_extmark_rows`] before crossing the wire, so the Lua side
+/// never has to know about the inclusive/exclusive mismatch itself.
 fn send_open_file(
     stdin: &mut ChildStdin,
     msgid: &AtomicU64,
     path: &Path,
     line: Option<u64>,
+    ranges: &[(usize, usize)],
 ) -> io::Result<()> {
-    let cmd_dict = Value::Map(vec![
-        (Value::from("cmd"), Value::from("edit")),
-        (
-            Value::from("args"),
-            Value::Array(vec![Value::from(path.to_string_lossy().into_owned())]),
-        ),
-    ]);
-    send_request(stdin, msgid, "nvim_cmd", vec![cmd_dict, Value::Map(vec![])])?;
-    if let Some(line) = line {
-        send_request(
-            stdin,
-            msgid,
-            "nvim_win_set_cursor",
-            vec![
-                Value::from(0),
-                Value::Array(vec![Value::from(line), Value::from(0)]),
-            ],
-        )?;
-    }
-    Ok(())
+    let ranges_arg = Value::Array(
+        ranges
+            .iter()
+            .map(|&range| {
+                let (row, end_row) = range_to_extmark_rows(range);
+                Value::Array(vec![Value::from(row), Value::from(end_row)])
+            })
+            .collect(),
+    );
+    let line_arg = line.map_or(Value::Nil, Value::from);
+    let args = vec![
+        Value::from(path.to_string_lossy().into_owned()),
+        line_arg,
+        ranges_arg,
+    ];
+    send_request(
+        stdin,
+        msgid,
+        "nvim_exec_lua",
+        vec![Value::from(OPEN_FILE_LUA), Value::Array(args)],
+    )
+    .map(|_| ())
 }
 
 /// Encode and write one msgpack-rpc request: `[0, msgid, method, params]`,
@@ -441,4 +514,26 @@ fn deliver_response(items: &[Value], pending: &PendingReplies) {
         items.get(3).cloned()
     };
     let _ = reply.send(result);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_to_extmark_rows_end_is_exclusive() {
+        // A single-line range: start == end, so end_row is exactly one
+        // past it.
+        assert_eq!(range_to_extmark_rows((5, 5)), (5, 6));
+    }
+
+    #[test]
+    fn range_to_extmark_rows_multi_line() {
+        assert_eq!(range_to_extmark_rows((0, 3)), (0, 4));
+    }
+
+    #[test]
+    fn range_to_extmark_rows_preserves_start_row() {
+        assert_eq!(range_to_extmark_rows((42, 100)), (42, 101));
+    }
 }

@@ -36,7 +36,7 @@ use crate::core::diff_state::{DiffPaneState, FileEntry};
 use crate::core::file_view::{FileViewEntry, FileViewState};
 use crate::core::focus::Direction;
 use crate::graph::layout::{layout, LayoutResult};
-use crate::graph::model::{GitStatus, ModuleNode, NodeId, ProjectGraph};
+use crate::graph::model::{FileRef, GitStatus, ModuleNode, NodeId, ProjectGraph};
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome, Pending};
 use crate::nvim::session::NvimCmd;
 use crate::pipeline::file_diff::{changed_head_ranges, load_file_diff};
@@ -181,6 +181,12 @@ pub struct VdiffApp {
     /// fresh [`NvimPane`] (which needs a `Context` to request repaints)
     /// outside of a paint callback.
     egui_ctx: Context,
+    /// The [`FileRef`] most recently opened in the nvim pane (`None` before
+    /// the first `OpenFile` in nvim mode, or whenever nvim mode is off).
+    /// `:VdiffDiff`/`d`'s diffsplit-against-merge-base needs to know which
+    /// file to diff and where to read its base blob from -- both live on
+    /// `FileRef` directly, so there's nothing else to track.
+    nvim_current_file: Option<FileRef>,
 }
 
 /// Everything [`VdiffApp::new`] needs to set up (and later respawn) the
@@ -232,6 +238,7 @@ impl VdiffApp {
             nvim_cwd: nvim.cwd,
             nvim_init_cmds: nvim.init_cmds,
             egui_ctx: nvim.egui_ctx,
+            nvim_current_file: None,
         }
     }
 
@@ -262,28 +269,35 @@ impl VdiffApp {
     }
 
     /// Handle [`Cmd::LoadFile`]: in nvim mode, respawn first if the session
-    /// died since it was last used (see [`Self::respawn_nvim`]), then tell
-    /// it to open the node's first file (line 1) via [`NvimPane::open_file`]
-    /// and feed the reducer an empty [`FileViewState`] just to keep its
-    /// `file_view.is_some()` invariants satisfied (see the module doc);
-    /// otherwise the built-in viewer's real load, unchanged.
+    /// died since it was last used (see [`Self::respawn_nvim`]), then load
+    /// the real [`FileViewState`] (the same load the built-in viewer uses
+    /// -- its `changed_ranges`/`deleted` are exactly what
+    /// [`NvimPane::open_file`] needs to mark the buffer, so there's no
+    /// separate "nvim path" computation to keep in sync) and open the
+    /// first file in the session, tracking it in
+    /// [`Self::nvim_current_file`] for `:VdiffDiff`/`d`. Otherwise the
+    /// built-in viewer's load, unchanged -- same [`Msg::FileLoaded`]/
+    /// [`Msg::FileLoadFailed`] either way.
     fn load_file(&mut self, node: NodeId) {
         if self.nvim.is_some() {
             if self.nvim.as_ref().is_some_and(|nvim| !nvim.is_alive()) {
                 self.respawn_nvim();
             }
-            if let Some(nvim) = &self.nvim {
-                if let Some(path) = self
-                    .app
-                    .graph
-                    .node(&node)
-                    .and_then(|module| module.files.first())
-                    .map(|file_ref| file_ref.path.clone())
-                {
-                    nvim.open_file(path, Some(1));
+            match self.diff_loader.load_file_view(&self.app.graph, &node) {
+                Ok(state) => {
+                    self.nvim_current_file = self
+                        .app
+                        .graph
+                        .node(&node)
+                        .and_then(|module| module.files.first())
+                        .cloned();
+                    if let (Some(nvim), Some(file)) = (&self.nvim, state.current_file()) {
+                        nvim.open_file(file.path.clone(), Some(1), file.changed_ranges.clone());
+                    }
+                    self.dispatch(Msg::FileLoaded(state));
                 }
+                Err(message) => self.dispatch(Msg::FileLoadFailed(message)),
             }
-            self.dispatch(Msg::FileLoaded(FileViewState::new(node, Vec::new())));
             return;
         }
         match self.diff_loader.load_file_view(&self.app.graph, &node) {
