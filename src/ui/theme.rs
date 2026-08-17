@@ -39,18 +39,6 @@ pub fn leaf_border(status: GitStatus) -> Color32 {
     }
 }
 
-/// Container (non-leaf) box fill: translucent, so nested contents stay
-/// legible under it.
-pub fn container_fill(status: GitStatus) -> Color32 {
-    let c = leaf_fill(status);
-    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 0x50)
-}
-
-/// Container box border stroke.
-pub fn container_border(status: GitStatus) -> Stroke {
-    Stroke::new(1.5, leaf_border(status))
-}
-
 /// Leaf box border stroke.
 pub fn leaf_border_stroke(status: GitStatus) -> Stroke {
     Stroke::new(1.0, leaf_border(status))

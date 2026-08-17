@@ -67,8 +67,8 @@ impl App {
 /// Every event [`update`] can react to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Msg {
-    /// h/j/k/l tree-walk step. Only acted on on [`Screen::Graph`] with no
-    /// picker open.
+    /// h/j/k/l layer navigation step (see [`crate::core::focus`]). Only
+    /// acted on on [`Screen::Graph`] with no picker open.
     FocusMove(Direction),
     /// Jump focus directly to a node. Only acted on on [`Screen::Graph`]
     /// with no picker open, and only if the node exists in the graph.
