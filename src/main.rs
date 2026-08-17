@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use vdiff::cli::{self, Cli};
-use vdiff::core::app::{App, Screen};
+use vdiff::core::app::{App, Pane, Screen};
 use vdiff::graph::filter::focus_on_changes;
 use vdiff::graph::layout::layout;
 use vdiff::graph::model::{NodeId, ProjectGraph};
@@ -134,6 +134,9 @@ fn run_gui(
         diff: None,
         picker: None,
         show_tests: false,
+        file_view: None,
+        pane: Pane::Graph,
+        viewport_rows: 1,
     };
 
     let title = format!("vdiff — {}", repo_dir_name(repo_path));

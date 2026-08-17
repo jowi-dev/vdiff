@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::diffing::hunks::{diff_file, FileDiff, FileDiffEntry};
+use crate::diffing::hunks::{diff_file, FileDiff, FileDiffEntry, LinePair};
 use crate::graph::model::{FileRef, GitStatus, ProjectGraph};
 use crate::pipeline::repo::GitRepo;
 
@@ -36,6 +36,32 @@ pub fn load_file_diff(
     Ok(diff_file(&base_content, &head_content))
 }
 
+/// 0-based, inclusive head-line ranges covering every hunk in `diff` that
+/// touches head content -- i.e. contains at least one [`LinePair::Added`]
+/// or [`LinePair::Changed`] line. A hunk that's a pure deletion (only
+/// [`LinePair::Removed`]/[`LinePair::Unchanged`] lines) contributes no
+/// range, since it has no head-side lines to mark. Feeds
+/// [`crate::core::file_view::FileViewEntry::changed_ranges`] -- the file
+/// viewer's "which lines changed" markers, computed once at load time
+/// rather than the render layer walking hunks itself.
+pub fn changed_head_ranges(diff: &FileDiff) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for hunk in &diff.hunks {
+        let head_indices: Vec<u32> = hunk
+            .lines
+            .iter()
+            .filter_map(|line| match *line {
+                LinePair::Added { head } | LinePair::Changed { head, .. } => Some(head),
+                _ => None,
+            })
+            .collect();
+        if let (Some(&min), Some(&max)) = (head_indices.iter().min(), head_indices.iter().max()) {
+            ranges.push((min as usize, max as usize));
+        }
+    }
+    ranges
+}
+
 /// Every non-[`GitStatus::Unchanged`] node's files, diffed -- the
 /// `--dump json --include-diffs` payload. Keyed by node id (stringified);
 /// unchanged nodes (including synthetic ancestor nodes) are absent from the
@@ -63,10 +89,43 @@ pub fn diffs_for_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diffing::hunks::DiffHunk;
     use crate::graph::model::{ModuleNode, NodeId};
     use crate::pipeline::repo::FakeRepo;
     use std::collections::HashMap as StdHashMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn changed_head_ranges_covers_added_and_changed_lines_per_hunk() {
+        let diff = FileDiff {
+            hunks: vec![
+                DiffHunk {
+                    lines: vec![
+                        LinePair::Unchanged { base: 0, head: 0 },
+                        LinePair::Changed { base: 1, head: 1 },
+                        LinePair::Added { head: 2 },
+                        LinePair::Unchanged { base: 2, head: 3 },
+                    ],
+                },
+                DiffHunk {
+                    lines: vec![LinePair::Removed { base: 10 }],
+                },
+            ],
+            base_lines: vec![],
+            head_lines: vec![],
+        };
+        assert_eq!(
+            changed_head_ranges(&diff),
+            vec![(1, 2)],
+            "pure-deletion hunk contributes no range"
+        );
+    }
+
+    #[test]
+    fn changed_head_ranges_empty_for_no_hunks() {
+        let diff = FileDiff::default();
+        assert_eq!(changed_head_ranges(&diff), Vec::<(usize, usize)>::new());
+    }
 
     fn repo() -> FakeRepo {
         let mut base_files = StdHashMap::new();

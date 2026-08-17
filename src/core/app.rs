@@ -7,6 +7,7 @@
 //! in without `update` ever needing to touch git/egui itself.
 
 pub use crate::core::diff_state::DiffPaneState;
+use crate::core::file_view::FileViewState;
 use crate::core::focus::{dep_targets, dependent_sources, move_focus, Direction};
 use crate::graph::layers::assign_layers;
 use crate::graph::model::{NodeId, ProjectGraph};
@@ -15,10 +16,23 @@ use crate::graph::test_modules::hide_test_modules;
 /// Which screen is currently shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
-    /// The node graph.
+    /// The two-panel screen: the node graph, plus (once opened) the file
+    /// viewer pane -- see [`Pane`].
     Graph,
-    /// The diff pane for the node focused when it was opened.
+    /// The full-screen diff pane for the node focused when it was opened.
     Diff,
+}
+
+/// Which of [`Screen::Graph`]'s two panels has keyboard focus. Meaningful
+/// only once [`App::file_view`] is `Some`; while it's `None` the graph has
+/// the whole window and `pane` stays [`Pane::Graph`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    /// The node graph (left panel, or the whole window with no file pane
+    /// open).
+    Graph,
+    /// The file viewer (right panel).
+    File,
 }
 
 /// State for the floating j/k/Enter/Esc picker [`Msg::FollowDeps`]/
@@ -62,6 +76,21 @@ pub struct App {
     /// read as a call-stack story rather than a wall of noise. Toggled by
     /// [`Msg::ToggleTests`] (`t` on [`Screen::Graph`]).
     pub show_tests: bool,
+    /// The file viewer pane's loaded state, `None` while it's closed (or
+    /// [`Cmd::LoadFile`] is still in flight for the very first open --
+    /// [`Msg::OpenFile`] flips `pane` to [`Pane::File`] optimistically
+    /// before the load completes, since the load itself is a local file
+    /// read that finishes synchronously within the same dispatch).
+    pub file_view: Option<FileViewState>,
+    /// Which panel has keyboard focus on [`Screen::Graph`]. See [`Pane`].
+    pub pane: Pane,
+    /// The file pane's visible row count, fed in by the eframe glue each
+    /// frame from the actual rendered height (a plain UI-measured input,
+    /// not something `update` derives) -- [`Msg::FileHalfPage`] halves it
+    /// for `Ctrl-d`/`Ctrl-u` scrolling. Defaults to 1 so half-page math
+    /// never divides by (or scrolls by) zero before the first frame has
+    /// measured anything.
+    pub viewport_rows: usize,
 }
 
 impl App {
@@ -145,6 +174,46 @@ pub enum Msg {
     /// just got hidden. Only acted on on [`Screen::Graph`] with no picker
     /// open, matching every other graph-view message.
     ToggleTests,
+    /// `Enter` on [`Pane::Graph`]: open the file viewer pane for the focused
+    /// node, switching `pane` to [`Pane::File`] and emitting
+    /// [`Cmd::LoadFile`]. Only acted on on [`Screen::Graph`]/[`Pane::Graph`]
+    /// with no picker open.
+    OpenFile,
+    /// [`Cmd::LoadFile`] succeeded: store the loaded state. Fired both by
+    /// the initial [`Msg::OpenFile`] and by the live-preview reload that
+    /// follows focus while the pane is open (see [`Msg::FocusMove`]).
+    FileLoaded(FileViewState),
+    /// `Esc` on [`Pane::File`]: close the file viewer pane and return
+    /// keyboard focus to [`Pane::Graph`].
+    CloseFile,
+    /// `j`/`k` on [`Pane::File`]: scroll the current file by `delta` rows,
+    /// clamped. A no-op with no file pane open.
+    FileScroll(i32),
+    /// `Ctrl-d`/`Ctrl-u` on [`Pane::File`]: scroll by half of
+    /// [`App::viewport_rows`] rows in the direction of `delta` (`1`/`-1`).
+    /// A no-op with no file pane open.
+    FileHalfPage(i32),
+    /// `gg` on [`Pane::File`]: jump to the top of the current file.
+    FileJumpTop,
+    /// `G` on [`Pane::File`]: jump to the bottom of the current file.
+    FileJumpBottom,
+    /// `]c` on [`Pane::File`]: jump to the next changed range in the
+    /// current file.
+    FileNextChange,
+    /// `[c` on [`Pane::File`]: jump to the previous changed range in the
+    /// current file.
+    FilePrevChange,
+    /// `]f` on [`Pane::File`]: switch to the next file backing the node,
+    /// clamped.
+    FileNextFile,
+    /// `[f` on [`Pane::File`]: switch to the previous file backing the
+    /// node, clamped.
+    FilePrevFile,
+    /// `Ctrl-w h`: move keyboard focus to [`Pane::Graph`].
+    PaneLeft,
+    /// `Ctrl-w l`: move keyboard focus to [`Pane::File`]. A no-op if no
+    /// file pane is open.
+    PaneRight,
 }
 
 /// I/O the caller should perform as a result of [`update`]. `update` never
@@ -156,6 +225,11 @@ pub enum Cmd {
     /// Load diff state for the given node, reporting back via
     /// [`Msg::DiffLoaded`]/[`Msg::LoadFailed`].
     LoadDiff(NodeId),
+    /// Load file-viewer state for the given node, reporting back via
+    /// [`Msg::FileLoaded`]/[`Msg::LoadFailed`]. Emitted by [`Msg::OpenFile`]
+    /// and, while the file pane is already open, by any message that moves
+    /// `focus` (live preview -- see [`Msg::FocusMove`]).
+    LoadFile(NodeId),
     /// `App::layers` changed shape (currently only [`Msg::ToggleTests`]) --
     /// the caller must rebuild its [`crate::graph::layout::LayoutResult`]
     /// from [`App::visible_graph`] before painting again.
@@ -167,16 +241,22 @@ pub enum Cmd {
 pub fn update(mut app: App, msg: Msg) -> (App, Cmd) {
     match msg {
         Msg::FocusMove(dir) => {
-            if on_graph_with_no_picker(&app) {
-                app.focus = move_focus(&app.layers, &app.focus, dir);
+            if !on_graph_with_no_picker_and_graph_pane(&app) {
+                return (app, Cmd::None);
             }
-            (app, Cmd::None)
+            let old_focus = app.focus.clone();
+            app.focus = move_focus(&app.layers, &app.focus, dir);
+            let cmd = reload_file_on_focus_change(&app, &old_focus);
+            (app, cmd)
         }
         Msg::FocusSet(id) => {
-            if on_graph_with_no_picker(&app) && app.is_drawn(&id) {
-                app.focus = id;
+            if !on_graph_with_no_picker_and_graph_pane(&app) || !app.is_drawn(&id) {
+                return (app, Cmd::None);
             }
-            (app, Cmd::None)
+            let old_focus = app.focus.clone();
+            app.focus = id;
+            let cmd = reload_file_on_focus_change(&app, &old_focus);
+            (app, cmd)
         }
         Msg::FollowDeps => follow(app, dep_targets),
         Msg::FollowDependents => follow(app, dependent_sources),
@@ -185,8 +265,10 @@ pub fn update(mut app: App, msg: Msg) -> (App, Cmd) {
             (app, Cmd::None)
         }
         Msg::PickerSelect => {
+            let old_focus = app.focus.clone();
             picker_select(&mut app);
-            (app, Cmd::None)
+            let cmd = reload_file_on_focus_change(&app, &old_focus);
+            (app, cmd)
         }
         Msg::PickerCancel => {
             app.picker = None;
@@ -203,7 +285,14 @@ pub fn update(mut app: App, msg: Msg) -> (App, Cmd) {
             (app, Cmd::None)
         }
         Msg::LoadFailed(_message) => {
+            // Shared failure path for both `Cmd::LoadDiff` (return to the
+            // graph screen) and `Cmd::LoadFile` (close the file pane
+            // gracefully -- e.g. a node with no files, or a read error).
+            // Both resets are no-ops for the other Cmd's failure case, so
+            // one arm handles both without needing to know which fired.
             app.screen = Screen::Graph;
+            app.file_view = None;
+            app.pane = Pane::Graph;
             (app, Cmd::None)
         }
         Msg::DiffScroll(delta) => {
@@ -231,6 +320,68 @@ pub fn update(mut app: App, msg: Msg) -> (App, Cmd) {
             (app, Cmd::None)
         }
         Msg::ToggleTests => toggle_tests(app),
+        Msg::OpenFile => open_file(app),
+        Msg::FileLoaded(state) => {
+            app.file_view = Some(state);
+            (app, Cmd::None)
+        }
+        Msg::CloseFile => {
+            app.file_view = None;
+            app.pane = Pane::Graph;
+            (app, Cmd::None)
+        }
+        Msg::FileScroll(delta) => {
+            with_file_view(&mut app, |fv| {
+                let max = fv.total_rows().saturating_sub(1);
+                fv.scroll(delta, max);
+            });
+            (app, Cmd::None)
+        }
+        Msg::FileHalfPage(direction) => {
+            let half = (app.viewport_rows / 2).max(1) as i32;
+            with_file_view(&mut app, |fv| {
+                let max = fv.total_rows().saturating_sub(1);
+                fv.scroll(direction * half, max);
+            });
+            (app, Cmd::None)
+        }
+        Msg::FileJumpTop => {
+            with_file_view(&mut app, FileViewState::jump_top);
+            (app, Cmd::None)
+        }
+        Msg::FileJumpBottom => {
+            with_file_view(&mut app, |fv| {
+                let total = fv.total_rows();
+                fv.jump_bottom(total);
+            });
+            (app, Cmd::None)
+        }
+        Msg::FileNextChange => {
+            with_file_view(&mut app, FileViewState::next_change);
+            (app, Cmd::None)
+        }
+        Msg::FilePrevChange => {
+            with_file_view(&mut app, FileViewState::prev_change);
+            (app, Cmd::None)
+        }
+        Msg::FileNextFile => {
+            with_file_view(&mut app, |fv| fv.shift_file(1));
+            (app, Cmd::None)
+        }
+        Msg::FilePrevFile => {
+            with_file_view(&mut app, |fv| fv.shift_file(-1));
+            (app, Cmd::None)
+        }
+        Msg::PaneLeft => {
+            app.pane = Pane::Graph;
+            (app, Cmd::None)
+        }
+        Msg::PaneRight => {
+            if app.file_view.is_some() {
+                app.pane = Pane::File;
+            }
+            (app, Cmd::None)
+        }
     }
 }
 
@@ -238,7 +389,7 @@ pub fn update(mut app: App, msg: Msg) -> (App, Cmd) {
 /// [`App::visible_graph`], and re-seat focus (see [`reseat_focus`]) if it's
 /// no longer drawn.
 fn toggle_tests(mut app: App) -> (App, Cmd) {
-    if !on_graph_with_no_picker(&app) {
+    if !on_graph_with_no_picker_and_graph_pane(&app) {
         return (app, Cmd::None);
     }
     app.show_tests = !app.show_tests;
@@ -291,24 +442,49 @@ fn with_diff_pane(app: &mut App, f: impl FnOnce(&mut DiffPaneState)) {
     }
 }
 
-/// Whether `app` is in the state [`Msg::FocusMove`]/[`Msg::FocusSet`]/
-/// [`Msg::FollowDeps`]/[`Msg::FollowDependents`]/[`Msg::OpenDiff`] require:
-/// on [`Screen::Graph`], with no picker overlay open.
+/// Whether `app` is in the state [`Msg::OpenDiff`] requires: on
+/// [`Screen::Graph`], with no picker overlay open. Not pane-gated -- `d`
+/// opens the full-screen diff from either [`Pane::Graph`] or [`Pane::File`].
 fn on_graph_with_no_picker(app: &App) -> bool {
     app.screen == Screen::Graph && app.picker.is_none()
+}
+
+/// Whether `app` is in the state [`Msg::FocusMove`]/[`Msg::FocusSet`]/
+/// [`Msg::FollowDeps`]/[`Msg::FollowDependents`]/[`Msg::OpenFile`]/
+/// [`Msg::ToggleTests`] require: [`on_graph_with_no_picker`], plus keyboard
+/// focus on [`Pane::Graph`] -- these all act on graph navigation state that
+/// only [`Pane::Graph`]'s keymap bindings ever reach.
+fn on_graph_with_no_picker_and_graph_pane(app: &App) -> bool {
+    on_graph_with_no_picker(app) && app.pane == Pane::Graph
+}
+
+/// If `app.focus` differs from `old_focus` and the file pane is open,
+/// reload it for the new focus -- the "live preview" behavior described on
+/// [`Cmd::LoadFile`]. `Cmd::None` otherwise.
+fn reload_file_on_focus_change(app: &App, old_focus: &NodeId) -> Cmd {
+    if app.file_view.is_some() && &app.focus != old_focus {
+        Cmd::LoadFile(app.focus.clone())
+    } else {
+        Cmd::None
+    }
 }
 
 /// Shared handler for [`Msg::FollowDeps`]/[`Msg::FollowDependents`]: look up
 /// `candidates` via `edges_fn`, then no-op/jump/open-picker per how many
 /// there are.
 fn follow(mut app: App, edges_fn: impl Fn(&ProjectGraph, &NodeId) -> Vec<NodeId>) -> (App, Cmd) {
-    if !on_graph_with_no_picker(&app) {
+    if !on_graph_with_no_picker_and_graph_pane(&app) {
         return (app, Cmd::None);
     }
+    let old_focus = app.focus.clone();
     let candidates = edges_fn(&app.graph, &app.focus);
+    let mut cmd = Cmd::None;
     match candidates.len() {
         0 => {}
-        1 => app.focus = candidates.into_iter().next().expect("checked len == 1"),
+        1 => {
+            app.focus = candidates.into_iter().next().expect("checked len == 1");
+            cmd = reload_file_on_focus_change(&app, &old_focus);
+        }
         _ => {
             app.picker = Some(EdgePicker {
                 candidates,
@@ -316,7 +492,7 @@ fn follow(mut app: App, edges_fn: impl Fn(&ProjectGraph, &NodeId) -> Vec<NodeId>
             })
         }
     }
-    (app, Cmd::None)
+    (app, cmd)
 }
 
 /// Handle [`Msg::PickerMove`]: shift the open picker's selection by `delta`,
@@ -354,6 +530,32 @@ fn open_diff(mut app: App) -> (App, Cmd) {
     let focus = app.focus.clone();
     app.screen = Screen::Diff;
     (app, Cmd::LoadDiff(focus))
+}
+
+/// Shared guard for the `File*` messages that mutate the open file pane:
+/// only on [`Screen::Graph`] with a file pane loaded. A no-op otherwise.
+fn with_file_view(app: &mut App, f: impl FnOnce(&mut FileViewState)) {
+    if app.screen != Screen::Graph {
+        return;
+    }
+    if let Some(file_view) = app.file_view.as_mut() {
+        f(file_view);
+    }
+}
+
+/// Handle [`Msg::OpenFile`]: only on [`Screen::Graph`]/[`Pane::Graph`] with
+/// no picker open, switch keyboard focus to [`Pane::File`] and emit
+/// [`Cmd::LoadFile`] for the focused node. `pane` flips before the load
+/// completes (see [`App::file_view`]'s doc) rather than waiting for
+/// [`Msg::FileLoaded`] -- the caller's `Cmd::LoadFile` executor runs
+/// synchronously within the same dispatch, so there's no visible gap.
+fn open_file(mut app: App) -> (App, Cmd) {
+    if !on_graph_with_no_picker_and_graph_pane(&app) {
+        return (app, Cmd::None);
+    }
+    let focus = app.focus.clone();
+    app.pane = Pane::File;
+    (app, Cmd::LoadFile(focus))
 }
 
 #[cfg(test)]
@@ -456,6 +658,9 @@ mod tests {
             diff: None,
             picker: None,
             show_tests: false,
+            file_view: None,
+            pane: Pane::Graph,
+            viewport_rows: 20,
         }
     }
 
@@ -669,6 +874,15 @@ mod tests {
         assert_eq!(cmd, Cmd::None);
     }
 
+    #[test]
+    fn open_diff_works_from_file_pane_too() {
+        let mut app = app_at("leaf_a");
+        app.pane = Pane::File;
+        let (app, cmd) = update(app, Msg::OpenDiff);
+        assert_eq!(app.screen, Screen::Diff);
+        assert_eq!(cmd, Cmd::LoadDiff(NodeId::from("leaf_a")));
+    }
+
     /// An empty diff pane (no files loaded) for the given node -- enough
     /// for tests that only care about screen/pane-presence guards.
     fn empty_diff_pane(node: &str) -> DiffPaneState {
@@ -822,6 +1036,9 @@ mod tests {
             diff: None,
             picker: None,
             show_tests: false,
+            file_view: None,
+            pane: Pane::Graph,
+            viewport_rows: 20,
         };
         assert!(!app
             .layers
@@ -854,6 +1071,9 @@ mod tests {
             diff: None,
             picker: None,
             show_tests: true,
+            file_view: None,
+            pane: Pane::Graph,
+            viewport_rows: 20,
         };
 
         let (app, cmd) = update(app, Msg::ToggleTests);
@@ -886,5 +1106,261 @@ mod tests {
         let (app, cmd) = update(app, Msg::ToggleTests);
         assert!(!app.show_tests);
         assert_eq!(cmd, Cmd::None);
+    }
+
+    /// An empty file view (no files loaded) for the given node -- enough
+    /// for tests that only care about screen/pane-presence guards.
+    fn empty_file_view(node: &str) -> FileViewState {
+        FileViewState::new(NodeId::from(node), vec![])
+    }
+
+    /// A file view with one file of 5 lines, changed range `[2, 3]`, for
+    /// tests that exercise scroll/jump/change-nav/file-switch transitions.
+    fn loaded_file_view(node: &str) -> FileViewState {
+        use crate::core::file_view::FileViewEntry;
+
+        FileViewState::new(
+            NodeId::from(node),
+            vec![FileViewEntry {
+                path: PathBuf::from("f.rs"),
+                lines: vec!["a", "b", "c", "d", "e"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                changed_ranges: vec![(2, 3)],
+                deleted: false,
+            }],
+        )
+    }
+
+    #[test]
+    fn open_file_switches_pane_and_emits_load_file() {
+        let app = app_at("leaf_a");
+        let (app, cmd) = update(app, Msg::OpenFile);
+        assert_eq!(app.pane, Pane::File);
+        assert_eq!(cmd, Cmd::LoadFile(NodeId::from("leaf_a")));
+    }
+
+    #[test]
+    fn open_file_noop_when_picker_open() {
+        let mut app = app_at("leaf_a");
+        app.picker = Some(EdgePicker {
+            candidates: vec![NodeId::from("target_x")],
+            selected: 0,
+        });
+        let (app, cmd) = update(app, Msg::OpenFile);
+        assert_eq!(app.pane, Pane::Graph);
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn open_file_noop_when_already_on_file_pane() {
+        let mut app = app_at("leaf_a");
+        app.pane = Pane::File;
+        let (_app, cmd) = update(app, Msg::OpenFile);
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn file_loaded_stores_file_view() {
+        let app = app_at("leaf_a");
+        let (app, _) = update(app, Msg::FileLoaded(empty_file_view("leaf_a")));
+        assert_eq!(app.file_view, Some(empty_file_view("leaf_a")));
+    }
+
+    #[test]
+    fn close_file_clears_file_view_and_resets_pane() {
+        let mut app = app_at("leaf_a");
+        app.pane = Pane::File;
+        app.file_view = Some(empty_file_view("leaf_a"));
+        let (app, cmd) = update(app, Msg::CloseFile);
+        assert!(app.file_view.is_none());
+        assert_eq!(app.pane, Pane::Graph);
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn file_scroll_moves_row_with_file_view_open() {
+        let mut app = app_at("leaf_a");
+        app.file_view = Some(loaded_file_view("leaf_a"));
+        let (app, cmd) = update(app, Msg::FileScroll(1));
+        assert_eq!(app.file_view.unwrap().scroll_row, 1);
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn file_scroll_noop_with_no_file_view() {
+        let app = app_at("leaf_a");
+        let (app, _) = update(app, Msg::FileScroll(1));
+        assert!(app.file_view.is_none());
+    }
+
+    #[test]
+    fn file_scroll_noop_off_graph_screen() {
+        let mut app = app_at("leaf_a");
+        app.screen = Screen::Diff;
+        app.file_view = Some(loaded_file_view("leaf_a"));
+        let (app, _) = update(app, Msg::FileScroll(1));
+        assert_eq!(
+            app.file_view.unwrap().scroll_row,
+            0,
+            "no-op off Graph screen"
+        );
+    }
+
+    #[test]
+    fn file_half_page_scrolls_by_half_viewport_rows() {
+        let mut app = app_at("leaf_a");
+        app.file_view = Some(loaded_file_view("leaf_a"));
+        app.viewport_rows = 4; // half = 2
+        let (app, _) = update(app, Msg::FileHalfPage(1));
+        assert_eq!(app.file_view.as_ref().unwrap().scroll_row, 2);
+        let (app, _) = update(app, Msg::FileHalfPage(-1));
+        assert_eq!(app.file_view.unwrap().scroll_row, 0);
+    }
+
+    #[test]
+    fn file_half_page_uses_at_least_one_row_when_viewport_rows_is_small() {
+        let mut app = app_at("leaf_a");
+        app.file_view = Some(loaded_file_view("leaf_a"));
+        app.viewport_rows = 1; // half = max(0, 1) = 1
+        let (app, _) = update(app, Msg::FileHalfPage(1));
+        assert_eq!(app.file_view.unwrap().scroll_row, 1);
+    }
+
+    #[test]
+    fn file_jump_top_and_bottom() {
+        let mut app = app_at("leaf_a");
+        app.file_view = Some(loaded_file_view("leaf_a"));
+        app.file_view.as_mut().unwrap().scroll_row = 2;
+        let (app, _) = update(app, Msg::FileJumpTop);
+        assert_eq!(app.file_view.as_ref().unwrap().scroll_row, 0);
+        let (app, _) = update(app, Msg::FileJumpBottom);
+        assert_eq!(app.file_view.unwrap().scroll_row, 4);
+    }
+
+    #[test]
+    fn file_next_change_and_prev_change() {
+        let mut app = app_at("leaf_a");
+        app.file_view = Some(loaded_file_view("leaf_a"));
+        let (app, _) = update(app, Msg::FileNextChange);
+        assert_eq!(app.file_view.as_ref().unwrap().scroll_row, 2);
+        // Already at the only range's start -- `[c` has nothing earlier to
+        // jump to, so it's a no-op (matches `FileViewState::prev_change`'s
+        // "no wrap" contract, exercised directly in `core::file_view`).
+        let (app, _) = update(app, Msg::FilePrevChange);
+        assert_eq!(app.file_view.unwrap().scroll_row, 2);
+    }
+
+    #[test]
+    fn file_next_file_and_prev_file_clamp() {
+        let mut app = app_at("leaf_a");
+        app.file_view = Some(loaded_file_view("leaf_a"));
+        let (app, _) = update(app, Msg::FileNextFile);
+        assert_eq!(
+            app.file_view.as_ref().unwrap().file_index,
+            0,
+            "clamped: 1 file"
+        );
+        let (app, _) = update(app, Msg::FilePrevFile);
+        assert_eq!(app.file_view.unwrap().file_index, 0);
+    }
+
+    #[test]
+    fn pane_right_noop_with_no_file_view() {
+        let app = app_at("leaf_a");
+        let (app, _) = update(app, Msg::PaneRight);
+        assert_eq!(app.pane, Pane::Graph);
+    }
+
+    #[test]
+    fn pane_right_switches_pane_when_file_view_open() {
+        let mut app = app_at("leaf_a");
+        app.file_view = Some(empty_file_view("leaf_a"));
+        let (app, _) = update(app, Msg::PaneRight);
+        assert_eq!(app.pane, Pane::File);
+    }
+
+    #[test]
+    fn pane_left_switches_pane_back_to_graph() {
+        let mut app = app_at("leaf_a");
+        app.pane = Pane::File;
+        app.file_view = Some(empty_file_view("leaf_a"));
+        let (app, _) = update(app, Msg::PaneLeft);
+        assert_eq!(app.pane, Pane::Graph);
+    }
+
+    #[test]
+    fn load_failed_closes_file_pane_and_resets_pane() {
+        let mut app = app_at("leaf_a");
+        app.pane = Pane::File;
+        app.file_view = Some(empty_file_view("leaf_a"));
+        let (app, cmd) = update(app, Msg::LoadFailed("boom".to_string()));
+        assert!(app.file_view.is_none());
+        assert_eq!(app.pane, Pane::Graph);
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn focus_move_reloads_file_when_file_view_open() {
+        // Layer 0 is [leaf_a, leaf_b]: Right moves within that row.
+        let mut app = app_at("leaf_a");
+        app.file_view = Some(empty_file_view("leaf_a"));
+        let (app, cmd) = update(app, Msg::FocusMove(Direction::Right));
+        assert_eq!(app.focus, NodeId::from("leaf_b"));
+        assert_eq!(cmd, Cmd::LoadFile(NodeId::from("leaf_b")));
+    }
+
+    #[test]
+    fn focus_move_no_reload_when_no_file_view_open() {
+        let app = app_at("leaf_a");
+        let (app, cmd) = update(app, Msg::FocusMove(Direction::Right));
+        assert_eq!(app.focus, NodeId::from("leaf_b"));
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn focus_move_no_reload_when_focus_unchanged() {
+        // `target_x` is alone at the end of layer 1 -- moving Right is a
+        // no-op, so even with a file pane open there's nothing to reload.
+        let mut app = app_at("target_z");
+        app.file_view = Some(empty_file_view("target_z"));
+        let (app, cmd) = update(app, Msg::FocusMove(Direction::Right));
+        assert_eq!(app.focus, NodeId::from("target_z"));
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn focus_move_noop_when_pane_is_file() {
+        // Graph navigation only acts on Pane::Graph -- the keymap never
+        // sends FocusMove from Pane::File, but the guard defends it too.
+        let mut app = app_at("leaf_a");
+        app.pane = Pane::File;
+        app.file_view = Some(empty_file_view("leaf_a"));
+        let (app, cmd) = update(app, Msg::FocusMove(Direction::Right));
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn follow_deps_reloads_file_when_file_view_open() {
+        let mut app = app_at("leaf_a");
+        app.file_view = Some(empty_file_view("leaf_a"));
+        let (app, cmd) = update(app, Msg::FollowDeps);
+        assert_eq!(app.focus, NodeId::from("target_x"));
+        assert_eq!(cmd, Cmd::LoadFile(NodeId::from("target_x")));
+    }
+
+    #[test]
+    fn picker_select_reloads_file_when_file_view_open() {
+        let mut app = app_at("leaf_b");
+        app.file_view = Some(empty_file_view("leaf_b"));
+        app.picker = Some(EdgePicker {
+            candidates: vec![NodeId::from("target_x"), NodeId::from("target_y")],
+            selected: 1,
+        });
+        let (app, cmd) = update(app, Msg::PickerSelect);
+        assert_eq!(app.focus, NodeId::from("target_y"));
+        assert_eq!(cmd, Cmd::LoadFile(NodeId::from("target_y")));
     }
 }
