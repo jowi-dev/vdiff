@@ -167,8 +167,15 @@ pub enum Msg {
     DiffPrevFile,
     /// [`Cmd::LoadDiff`] failed; returns to the graph screen. The message is
     /// not stored -- [`App`] has no status/error field yet (can come
-    /// later).
+    /// later). Deliberately leaves [`App::file_view`]/[`App::pane`] alone --
+    /// a diff-load failure while the file pane is open in the background
+    /// (opened via `d` from [`Pane::File`], say) shouldn't close it.
     LoadFailed(String),
+    /// [`Cmd::LoadFile`] failed; closes the file pane gracefully (e.g. a
+    /// node with no files, or a read error) rather than leaving `pane` on
+    /// [`Pane::File`] with nothing loaded. The message is not stored, same
+    /// as [`Msg::LoadFailed`].
+    FileLoadFailed(String),
     /// `t`: flip [`App::show_tests`], recompute `layers` from
     /// [`App::visible_graph`], and re-seat focus if it landed on a node that
     /// just got hidden. Only acted on on [`Screen::Graph`] with no picker
@@ -285,12 +292,10 @@ pub fn update(mut app: App, msg: Msg) -> (App, Cmd) {
             (app, Cmd::None)
         }
         Msg::LoadFailed(_message) => {
-            // Shared failure path for both `Cmd::LoadDiff` (return to the
-            // graph screen) and `Cmd::LoadFile` (close the file pane
-            // gracefully -- e.g. a node with no files, or a read error).
-            // Both resets are no-ops for the other Cmd's failure case, so
-            // one arm handles both without needing to know which fired.
             app.screen = Screen::Graph;
+            (app, Cmd::None)
+        }
+        Msg::FileLoadFailed(_message) => {
             app.file_view = None;
             app.pane = Pane::Graph;
             (app, Cmd::None)
@@ -941,6 +946,22 @@ mod tests {
     }
 
     #[test]
+    fn load_failed_leaves_file_pane_alone() {
+        // A diff-load failure (e.g. `d` from Pane::File while the file pane
+        // is open in the background) shouldn't close the unrelated file
+        // pane -- only `Msg::FileLoadFailed` does that.
+        let mut app = app_at("leaf_a");
+        app.screen = Screen::Diff;
+        app.pane = Pane::File;
+        app.file_view = Some(empty_file_view("leaf_a"));
+        let (app, cmd) = update(app, Msg::LoadFailed("boom".to_string()));
+        assert_eq!(app.screen, Screen::Graph);
+        assert_eq!(app.pane, Pane::File);
+        assert!(app.file_view.is_some());
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
     fn diff_scroll_moves_row_on_diff_screen() {
         let mut app = app_at("leaf_a");
         app.screen = Screen::Diff;
@@ -1291,11 +1312,11 @@ mod tests {
     }
 
     #[test]
-    fn load_failed_closes_file_pane_and_resets_pane() {
+    fn file_load_failed_closes_file_pane_and_resets_pane() {
         let mut app = app_at("leaf_a");
         app.pane = Pane::File;
         app.file_view = Some(empty_file_view("leaf_a"));
-        let (app, cmd) = update(app, Msg::LoadFailed("boom".to_string()));
+        let (app, cmd) = update(app, Msg::FileLoadFailed("boom".to_string()));
         assert!(app.file_view.is_none());
         assert_eq!(app.pane, Pane::Graph);
         assert_eq!(cmd, Cmd::None);

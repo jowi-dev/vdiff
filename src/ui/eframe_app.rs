@@ -179,7 +179,7 @@ impl VdiffApp {
             },
             Cmd::LoadFile(node) => match self.diff_loader.load_file_view(&self.app.graph, &node) {
                 Ok(state) => self.dispatch(Msg::FileLoaded(state)),
-                Err(message) => self.dispatch(Msg::LoadFailed(message)),
+                Err(message) => self.dispatch(Msg::FileLoadFailed(message)),
             },
             Cmd::Relayout => {
                 self.layout = layout(&self.app.visible_graph());
