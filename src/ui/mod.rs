@@ -6,4 +6,5 @@ pub mod diff_view;
 pub mod eframe_app;
 pub mod file_view;
 pub mod graph_view;
+pub mod nvim_pane;
 pub mod theme;

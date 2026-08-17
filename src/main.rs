@@ -9,10 +9,12 @@ use vdiff::graph::filter::focus_on_changes;
 use vdiff::graph::layout::layout;
 use vdiff::graph::model::{NodeId, ProjectGraph};
 use vdiff::graph::test_modules::hide_test_modules;
+use vdiff::nvim::session::nvim_available;
 use vdiff::pipeline::git2_repo::Git2Repo;
 use vdiff::pipeline::repo::GitRepo;
 use vdiff::pipeline::{build_graph, PipelineOptions};
 use vdiff::ui::eframe_app::{DiffLoader, VdiffApp};
+use vdiff::ui::nvim_pane::NvimPane;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -67,7 +69,13 @@ fn main() -> ExitCode {
                 eprintln!("no changes vs {base_ref}");
                 return ExitCode::SUCCESS;
             }
-            run_gui(graph, &repo_path, cli.smoke, DiffLoader { repo, base_oid })
+            run_gui(
+                graph,
+                &repo_path,
+                cli.smoke,
+                cli.nvim,
+                DiffLoader { repo, base_oid },
+            )
         }
     }
 }
@@ -106,12 +114,21 @@ fn dump(
 /// name. `smoke` closes the window after a couple seconds instead of
 /// waiting for the user, for headless-ish startup verification.
 /// `diff_loader` backs `Cmd::LoadDiff` once a node's diff pane is opened.
+/// `want_nvim` is the `--nvim` flag: if set but no `nvim` binary is on
+/// `PATH`, prints a warning and falls back to the built-in file viewer
+/// rather than failing to start.
 fn run_gui(
     graph: ProjectGraph,
     repo_path: &Path,
     smoke: bool,
+    want_nvim: bool,
     diff_loader: DiffLoader,
 ) -> ExitCode {
+    if want_nvim && !nvim_available() {
+        eprintln!("warning: --nvim given but no `nvim` binary found on PATH; falling back to the built-in file viewer");
+    }
+    let want_nvim = want_nvim && nvim_available();
+    let repo_root = repo_path.to_path_buf();
     // `show_tests` defaults to false, so the layout/layers vdiff opens on
     // must be built from the test-hidden graph, not the raw (possibly
     // test-heavy) one -- see `App::visible_graph`.
@@ -144,12 +161,27 @@ fn run_gui(
     let result = eframe::run_native(
         &title,
         native_options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            let nvim = if want_nvim {
+                // Arbitrary starting size -- `nvim_pane::show` sends a real
+                // `Resize` the moment it measures the actual panel size on
+                // the first frame (see `NvimPane::maybe_resize`).
+                match NvimPane::spawn(&repo_root, 80, 24, cc.egui_ctx.clone()) {
+                    Ok(pane) => Some(pane),
+                    Err(err) => {
+                        eprintln!("warning: failed to spawn nvim: {err}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             Ok(Box::new(VdiffApp::new(
                 app,
                 layout_result,
                 smoke,
                 diff_loader,
+                nvim,
             )))
         }),
     );

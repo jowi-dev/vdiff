@@ -11,10 +11,23 @@
 //! `core::App`, so it's handled directly in [`VdiffApp::handle_zoom_keys`]
 //! instead of growing `crate::keymap::KeyInput` with a variant the reducer
 //! would never act on.
+//!
+//! The embedded-nvim spike (`--nvim`, see [`crate::nvim`]) is the other
+//! exception: when [`VdiffApp::nvim`] is `Some` and keyboard focus is on
+//! [`Pane::File`], raw egui input bypasses `map_key` entirely in favor of
+//! [`VdiffApp::handle_nvim_keys`] -- see that method's doc for why, and for
+//! the two bindings (`Ctrl-w h`/`Ctrl-w l`) it still intercepts locally
+//! rather than forwarding to nvim. `core::App`/`update` never learn nvim
+//! mode exists: [`Cmd::LoadFile`] is translated to
+//! [`crate::nvim::session::NvimCmd::OpenFile`] here in [`VdiffApp::execute`],
+//! with an empty [`FileViewState`] dispatched back through the reducer just
+//! to keep its `file_view.is_some()`-gated invariants (the file pane is
+//! open, `Ctrl-w l` has something to switch to) satisfied without teaching
+//! `core` a second file-viewing mode.
 
 use std::time::{Duration, Instant};
 
-use egui::{Align2, Context, Key, Modifiers};
+use egui::{Align2, Context, Event, Key, Modifiers};
 
 use crate::core::app::{update, App, Cmd, Msg, Pane, Screen};
 use crate::core::diff_state::{DiffPaneState, FileEntry};
@@ -22,11 +35,13 @@ use crate::core::file_view::{FileViewEntry, FileViewState};
 use crate::graph::layout::{layout, LayoutResult};
 use crate::graph::model::{GitStatus, ModuleNode, NodeId, ProjectGraph};
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome, Pending};
+use crate::nvim::session::NvimCmd;
 use crate::pipeline::file_diff::{changed_head_ranges, load_file_diff};
 use crate::pipeline::repo::GitRepo;
 use crate::ui::diff_view;
 use crate::ui::file_view;
 use crate::ui::graph_view::{self, Transform};
+use crate::ui::nvim_pane::{self, NvimPane};
 
 /// How long `--smoke` keeps the window open before closing it.
 const SMOKE_DURATION: Duration = Duration::from_secs(2);
@@ -138,14 +153,33 @@ pub struct VdiffApp {
     smoke: bool,
     started_at: Instant,
     diff_loader: DiffLoader,
+    /// The live embedded-nvim session, if `--nvim` was given and an `nvim`
+    /// binary was found (see `main.rs`'s startup decision). `Some` for the
+    /// lifetime of the app -- there's no way to turn nvim mode on/off after
+    /// launch in this spike.
+    nvim: Option<NvimPane>,
+    /// Whether the previous nvim-mode keypress was `Ctrl-w`, awaiting a
+    /// completing `h`/`l` -- the local, nvim-side equivalent of
+    /// [`crate::keymap::Pending::CtrlW`] (kept separately rather than
+    /// reusing `pending_key`, since nvim-mode input bypasses `map_key`
+    /// entirely; see [`Self::handle_nvim_keys`]).
+    nvim_ctrl_w_pending: bool,
 }
 
 impl VdiffApp {
     /// Build a fresh GUI app wrapping an already-constructed [`App`] and its
     /// [`LayoutResult`]. `smoke` enables the self-closing startup self-test
     /// (see the module-level `--smoke` flag in `main.rs`). `diff_loader`
-    /// backs [`Cmd::LoadDiff`].
-    pub fn new(app: App, layout: LayoutResult, smoke: bool, diff_loader: DiffLoader) -> Self {
+    /// backs [`Cmd::LoadDiff`]. `nvim`, if `Some`, is an already-spawned
+    /// embedded session that replaces the built-in file viewer's pane --
+    /// see the module doc.
+    pub fn new(
+        app: App,
+        layout: LayoutResult,
+        smoke: bool,
+        diff_loader: DiffLoader,
+        nvim: Option<NvimPane>,
+    ) -> Self {
         Self {
             app,
             layout,
@@ -155,6 +189,8 @@ impl VdiffApp {
             smoke,
             started_at: Instant::now(),
             diff_loader,
+            nvim,
+            nvim_ctrl_w_pending: false,
         }
     }
 
@@ -177,20 +213,48 @@ impl VdiffApp {
                 Ok(state) => self.dispatch(Msg::DiffLoaded(state)),
                 Err(message) => self.dispatch(Msg::LoadFailed(message)),
             },
-            Cmd::LoadFile(node) => match self.diff_loader.load_file_view(&self.app.graph, &node) {
-                Ok(state) => self.dispatch(Msg::FileLoaded(state)),
-                Err(message) => self.dispatch(Msg::FileLoadFailed(message)),
-            },
+            Cmd::LoadFile(node) => self.load_file(node),
             Cmd::Relayout => {
                 self.layout = layout(&self.app.visible_graph());
             }
         }
     }
 
+    /// Handle [`Cmd::LoadFile`]: in nvim mode, tell the session to open the
+    /// node's first file (line 1) via [`NvimPane::open_file`] and feed the
+    /// reducer an empty [`FileViewState`] just to keep its
+    /// `file_view.is_some()` invariants satisfied (see the module doc);
+    /// otherwise the built-in viewer's real load, unchanged.
+    fn load_file(&mut self, node: NodeId) {
+        if let Some(nvim) = &self.nvim {
+            if let Some(path) = self
+                .app
+                .graph
+                .node(&node)
+                .and_then(|module| module.files.first())
+                .map(|file_ref| file_ref.path.clone())
+            {
+                nvim.open_file(path, Some(1));
+            }
+            self.dispatch(Msg::FileLoaded(FileViewState::new(node, Vec::new())));
+            return;
+        }
+        match self.diff_loader.load_file_view(&self.app.graph, &node) {
+            Ok(state) => self.dispatch(Msg::FileLoaded(state)),
+            Err(message) => self.dispatch(Msg::FileLoadFailed(message)),
+        }
+    }
+
     /// Read this frame's key-press events, translate and route each through
     /// [`map_key`], updating the pending chord char and dispatching any
-    /// resulting [`Msg`].
+    /// resulting [`Msg`]. In nvim mode with keyboard focus on
+    /// [`Pane::File`], delegates to [`Self::handle_nvim_keys`] instead --
+    /// see that method's doc.
     fn handle_keys(&mut self, ctx: &Context) {
+        if self.nvim.is_some() && self.app.pane == Pane::File {
+            self.handle_nvim_keys(ctx);
+            return;
+        }
         let presses: Vec<(Key, Modifiers)> = ctx.input(|i| {
             i.events
                 .iter()
@@ -224,6 +288,55 @@ impl VdiffApp {
                 KeyOutcome::Msg(msg) => self.dispatch(msg),
                 KeyOutcome::Pending(pending) => self.pending_key = Some(pending),
                 KeyOutcome::None => {}
+            }
+        }
+    }
+
+    /// The nvim-mode input path: every raw egui event this frame either
+    /// completes/starts the local `Ctrl-w` chord (intercepted, never
+    /// forwarded -- `h` dispatches [`Msg::PaneLeft`], `l` dispatches
+    /// [`Msg::PaneRight`] exactly like [`map_key`]'s `Ctrl-w` binding does
+    /// for the built-in viewer, anything else clears the chord with no
+    /// effect) or gets translated by
+    /// [`crate::ui::nvim_pane::translate_event_for_nvim`] and sent to the
+    /// session as [`NvimCmd::Input`]. `map_key`/the reducer are bypassed
+    /// entirely for everything else -- nvim owns its own modal keymap, and
+    /// `core::App`'s `File*` messages (scroll, half-page, change/file jump)
+    /// have nothing to act on here since there's no [`FileViewState`]
+    /// content backing this pane.
+    fn handle_nvim_keys(&mut self, ctx: &Context) {
+        let events = ctx.input(|i| i.events.clone());
+        for event in &events {
+            if self.nvim_ctrl_w_pending {
+                self.nvim_ctrl_w_pending = false;
+                if let Event::Key {
+                    key, pressed: true, ..
+                } = event
+                {
+                    match key {
+                        Key::H => self.dispatch(Msg::PaneLeft),
+                        Key::L => self.dispatch(Msg::PaneRight),
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            if let Event::Key {
+                key: Key::W,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            {
+                if modifiers.ctrl {
+                    self.nvim_ctrl_w_pending = true;
+                    continue;
+                }
+            }
+            if let Some(text) = nvim_pane::translate_event_for_nvim(event) {
+                if let Some(nvim) = &self.nvim {
+                    nvim.send(NvimCmd::Input(text));
+                }
             }
         }
     }
@@ -307,22 +420,33 @@ impl VdiffApp {
         }
     }
 
-    /// [`Screen::Graph`] with [`App::file_view`] open: the right-hand file
-    /// pane on a resizable [`egui::SidePanel`], then the graph on whatever
-    /// [`egui::CentralPanel`] space remains. Records the row count
-    /// [`file_view::show`] fit into that space as
-    /// [`App::viewport_rows`], read one frame later by
-    /// [`Msg::FileHalfPage`] -- see that field's doc for why this can't be
-    /// computed any earlier.
+    /// [`Screen::Graph`] with [`App::file_view`] open: the right-hand pane
+    /// on a resizable [`egui::SidePanel`], then the graph on whatever
+    /// [`egui::CentralPanel`] space remains. In nvim mode the pane renders
+    /// [`nvim_pane::show`] instead of the built-in [`file_view::show`] --
+    /// see the module doc for why `App::file_view` being (emptily) `Some`
+    /// still gates this the same way for both. Records the row count
+    /// [`file_view::show`] fit into that space as [`App::viewport_rows`],
+    /// read one frame later by [`Msg::FileHalfPage`] -- see that field's
+    /// doc for why this can't be computed any earlier; not meaningful in
+    /// nvim mode (`Ctrl-d`/`Ctrl-u` are forwarded raw, see
+    /// [`Self::handle_nvim_keys`]), so left untouched there.
     fn show_two_panel(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        if let Some(file_view) = &self.app.file_view {
+        if self.app.file_view.is_some() {
             let focused = self.app.pane == Pane::File;
-            let response = egui::Panel::right("file_pane")
-                .resizable(true)
-                .default_size(ui.available_width() * 0.45)
-                .show(ui, |ui| file_view::show(ui, file_view, focused));
-            self.app.viewport_rows = response.inner;
+            if let Some(nvim) = self.nvim.as_mut() {
+                egui::Panel::right("file_pane")
+                    .resizable(true)
+                    .default_size(ui.available_width() * 0.45)
+                    .show(ui, |ui| nvim_pane::show(ui, nvim, focused));
+            } else if let Some(file_view) = self.app.file_view.as_ref() {
+                let response = egui::Panel::right("file_pane")
+                    .resizable(true)
+                    .default_size(ui.available_width() * 0.45)
+                    .show(ui, |ui| file_view::show(ui, file_view, focused));
+                self.app.viewport_rows = response.inner;
+            }
         }
         egui::CentralPanel::default().show(ui, |ui| {
             graph_view::show(

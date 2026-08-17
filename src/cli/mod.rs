@@ -43,6 +43,12 @@ pub struct Cli {
     /// the unfiltered graph, for both the GUI and `--dump`.
     #[arg(long)]
     pub all: bool,
+    /// Replace the built-in read-only file viewer with a real embedded
+    /// `nvim --embed` instance (see [`crate::nvim`]). Falls back to the
+    /// built-in viewer with a stderr warning if no `nvim` binary is found
+    /// on `PATH`.
+    #[arg(long)]
+    pub nvim: bool,
 }
 
 /// `--dump` output format.
