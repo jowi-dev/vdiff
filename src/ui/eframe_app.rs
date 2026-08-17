@@ -59,6 +59,9 @@ pub struct VdiffApp {
     app: App,
     layout: LayoutResult,
     transform: Transform,
+    /// The focus [`graph_view::show`]'s auto-pan last ran for -- lets it
+    /// fire only when focus actually changes rather than every repaint.
+    last_focus: Option<NodeId>,
     pending_key: Option<char>,
     smoke: bool,
     started_at: Instant,
@@ -75,6 +78,7 @@ impl VdiffApp {
             app,
             layout,
             transform: Transform::default(),
+            last_focus: None,
             pending_key: None,
             smoke,
             started_at: Instant::now(),
@@ -198,7 +202,13 @@ impl eframe::App for VdiffApp {
             Screen::Graph => {
                 let ctx = ui.ctx().clone();
                 egui::CentralPanel::default().show(ui, |ui| {
-                    graph_view::show(ui, &self.app, &self.layout, &mut self.transform);
+                    graph_view::show(
+                        ui,
+                        &self.app,
+                        &self.layout,
+                        &mut self.transform,
+                        &mut self.last_focus,
+                    );
                 });
                 self.show_picker(&ctx);
             }

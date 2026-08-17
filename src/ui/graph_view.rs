@@ -68,16 +68,37 @@ impl Transform {
 /// Paint the graph into `ui`'s available space: background, edges, then
 /// node rects parent-before-child (containment gives natural z-order),
 /// leaf/title labels. Handles pan (drag) and zoom (scroll) on the empty
-/// canvas, and auto-pans so the focused node stays visible.
-pub fn show(ui: &mut Ui, app: &App, layout: &LayoutResult, transform: &mut Transform) {
+/// canvas, and auto-pans so a newly focused node comes into view.
+///
+/// `last_focus` is view-only state (owned by the eframe glue, not
+/// [`crate::core::app::App`]) that remembers which node the auto-pan last
+/// ran for. The auto-pan only fires when `app.focus` differs from it --
+/// running `clamp_into_view` unconditionally on every repaint (including
+/// the continuous repaints egui schedules while the pointer merely moves
+/// over the canvas) fed the transform's own screen-space output back into
+/// itself every frame; sub-pixel rounding in that round trip kept nudging
+/// `transform.offset` back and forth instead of settling at zero, which
+/// painted as flicker on the node rects. Gating on a real focus change
+/// makes the pan run once per focus move and leaves the transform alone
+/// otherwise.
+pub fn show(
+    ui: &mut Ui,
+    app: &App,
+    layout: &LayoutResult,
+    transform: &mut Transform,
+    last_focus: &mut Option<NodeId>,
+) {
     let viewport = ui.max_rect();
     let response = ui.allocate_rect(viewport, Sense::click_and_drag());
 
     handle_pan_zoom(ui, &response, transform);
 
-    if let Some(focus_rect) = layout.rects.get(&app.focus) {
-        let screen_rect = transform.to_screen_rect(*focus_rect);
-        transform.pan(clamp_into_view(screen_rect, response.rect));
+    if last_focus.as_ref() != Some(&app.focus) {
+        if let Some(focus_rect) = layout.rects.get(&app.focus) {
+            let screen_rect = transform.to_screen_rect(*focus_rect);
+            transform.pan(clamp_into_view(screen_rect, response.rect));
+        }
+        *last_focus = Some(app.focus.clone());
     }
 
     let painter = ui.painter_at(response.rect);
