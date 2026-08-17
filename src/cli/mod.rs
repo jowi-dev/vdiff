@@ -37,6 +37,12 @@ pub struct Cli {
     /// without hanging around for a human to close it manually.
     #[arg(long, hide = true)]
     pub smoke: bool,
+    /// Show the full module graph, not just changes and connecting paths.
+    /// By default vdiff filters to a focused view (see
+    /// [`crate::graph::filter::focus_on_changes`]); this flag opts back into
+    /// the unfiltered graph, for both the GUI and `--dump`.
+    #[arg(long)]
+    pub all: bool,
 }
 
 /// `--dump` output format.

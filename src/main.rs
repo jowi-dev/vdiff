@@ -5,6 +5,7 @@ use clap::Parser;
 
 use vdiff::cli::{self, Cli};
 use vdiff::core::app::{App, Screen};
+use vdiff::graph::filter::focus_on_changes;
 use vdiff::graph::layout::layout;
 use vdiff::graph::model::{NodeId, ProjectGraph};
 use vdiff::pipeline::git2_repo::Git2Repo;
@@ -37,7 +38,7 @@ fn main() -> ExitCode {
     let repo: Box<dyn GitRepo> = Box::new(repo);
 
     let opts = PipelineOptions {
-        base_override: cli.base,
+        base_override: cli.base.clone(),
     };
     let graph = match build_graph(repo.as_ref(), &opts) {
         Ok(graph) => graph,
@@ -47,9 +48,26 @@ fn main() -> ExitCode {
         }
     };
 
+    // By default vdiff shows only the change set and the paths connecting
+    // it; `--all` opts back into the raw, unfiltered graph. Filtering
+    // happens once here, before both the dump and GUI paths, so layout and
+    // rendering never see the unfiltered graph unless asked to.
+    let graph = if cli.all {
+        graph
+    } else {
+        focus_on_changes(&graph)
+    };
+
     match cli.dump {
         Some(format) => dump(&graph, format, cli.include_diffs, repo.as_ref(), &base_oid),
-        None => run_gui(graph, &repo_path, cli.smoke, DiffLoader { repo, base_oid }),
+        None => {
+            if graph.nodes.is_empty() {
+                let base_ref = cli.base.as_deref().unwrap_or(&base_oid);
+                eprintln!("no changes vs {base_ref}");
+                return ExitCode::SUCCESS;
+            }
+            run_gui(graph, &repo_path, cli.smoke, DiffLoader { repo, base_oid })
+        }
     }
 }
 
