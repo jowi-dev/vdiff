@@ -18,7 +18,8 @@ pub use crate::graph::labels::abbreviated_label;
 /// The central panel's background.
 pub const CANVAS_BG: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x1e);
 
-/// Thin lines connecting dependency edges.
+/// Base hue for dependency edges not touching the focused node -- see
+/// [`edge_stroke_dim`], which dims it to ~25% alpha.
 pub const EDGE_COLOR: Color32 = Color32::from_rgb(0x66, 0x66, 0x66);
 
 /// Bright accent used for the focus ring, chosen to stand out against every
@@ -50,17 +51,13 @@ pub fn leaf_border_stroke(status: GitStatus) -> Stroke {
     Stroke::new(1.0, leaf_border(status))
 }
 
-/// Stroke used to paint dependency edges.
-pub fn edge_stroke() -> Stroke {
-    Stroke::new(1.0, EDGE_COLOR)
-}
-
 /// Stroke for edges that don't touch the focused node: same hue as
 /// [`edge_stroke`], but faint (~25% alpha) so the hairball recedes and the
 /// focused node's own edges (see [`edge_stroke_outgoing`]/
 /// [`edge_stroke_incoming`]) read as the story.
 pub fn edge_stroke_dim() -> Stroke {
-    Stroke::new(1.0, Color32::from_rgba_unmultiplied(0x66, 0x66, 0x66, 64))
+    let [r, g, b, _] = EDGE_COLOR.to_array();
+    Stroke::new(1.0, Color32::from_rgba_unmultiplied(r, g, b, 64))
 }
 
 /// Warm accent for edges leaving the focused node (it depends on the

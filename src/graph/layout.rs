@@ -17,14 +17,27 @@
 
 use std::collections::HashMap;
 
+use crate::graph::labels::abbreviated_label;
 use crate::graph::layers::assign_layers;
 use crate::graph::model::{DepEdge, NodeId, ProjectGraph};
 
-/// Fixed width of a node's box (every drawn node is leaf-sized now -- there
-/// are no more container boxes).
+/// Floor on a node's box width -- also the width used for a short label
+/// (see [`node_size`]).
 pub const LEAF_W: f32 = 120.0;
+/// Ceiling on a node's box width, so a long fully-qualified label still
+/// wraps rather than growing the box without bound.
+pub const MAX_LEAF_W: f32 = 280.0;
 /// Fixed height of a node's box.
 pub const LEAF_H: f32 = 60.0;
+/// Estimated pixel width of one character at a 12px proportional font --
+/// used both to size a node's box to its label (see [`node_size`]) and, in
+/// [`crate::ui::graph_view`], to decide when the painted label needs
+/// truncating. An estimate, not a real text measurement, but the same
+/// estimate on both sides keeps sizing and truncation consistent with each
+/// other.
+pub const CHAR_W: f32 = 7.2;
+/// Horizontal padding kept on each side of a label inside its box.
+pub const TEXT_PAD: f32 = 8.0;
 /// Gap left between sibling boxes on the same row, and between rows within
 /// a band.
 pub const PADDING: f32 = 8.0;
@@ -121,29 +134,21 @@ pub fn layout(graph: &ProjectGraph) -> LayoutResult {
     for layer in &layers {
         let items: Vec<(NodeId, Size)> = layer
             .iter()
-            .map(|id| {
-                (
-                    id.clone(),
-                    Size {
-                        w: LEAF_W,
-                        h: LEAF_H,
-                    },
-                )
-            })
+            .map(|id| (id.clone(), node_size(graph, id)))
             .collect();
         let (positions, band_size) = pack_row(&items);
-        for (id, pos) in positions {
+        // `pack_row` preserves input order in its returned positions, so
+        // zipping against `items` recovers each id's actual (variable) size
+        // -- `positions` itself only carries `Pos`, not `Size`.
+        for ((_, size), (id, pos)) in items.iter().zip(positions.iter()) {
             rects.insert(
-                id,
+                id.clone(),
                 Rect {
                     origin: Pos {
                         x: pos.x,
                         y: pos.y + cursor_y,
                     },
-                    size: Size {
-                        w: LEAF_W,
-                        h: LEAF_H,
-                    },
+                    size: *size,
                 },
             );
         }
@@ -156,6 +161,24 @@ pub fn layout(graph: &ProjectGraph) -> LayoutResult {
         rects,
         edges,
         layers,
+    }
+}
+
+/// A node's box size: fixed height, but width clamped to fit its painted
+/// label (the same [`abbreviated_label`] [`crate::ui::graph_view`] draws) --
+/// `label_char_count * CHAR_W + 2*TEXT_PAD`, floored at [`LEAF_W`] and
+/// capped at [`MAX_LEAF_W`]. Falls back to the bare id string if `id` isn't
+/// in `graph` (shouldn't happen for a drawn node, but keeps this total).
+fn node_size(graph: &ProjectGraph, id: &NodeId) -> Size {
+    let root_id = graph.top_level_root(id);
+    let label = match graph.node(id) {
+        Some(node) => abbreviated_label(&id.to_string(), &root_id.to_string(), &node.display_name),
+        None => id.to_string(),
+    };
+    let width = (label.chars().count() as f32 * CHAR_W + 2.0 * TEXT_PAD).clamp(LEAF_W, MAX_LEAF_W);
+    Size {
+        w: width,
+        h: LEAF_H,
     }
 }
 
@@ -410,5 +433,71 @@ mod tests {
                 h: LEAF_H
             }
         );
+    }
+
+    #[test]
+    fn a_long_label_widens_the_box_beyond_leaf_w_but_not_past_max_leaf_w() {
+        let graph = graph_from(
+            vec![leaf(
+                "a",
+                "a_very_long_display_name_that_should_widen_the_box_a_lot",
+                None,
+            )],
+            vec!["a"],
+        );
+
+        let result = layout(&graph);
+
+        let rect = result.rects[&NodeId::from("a")];
+        assert!(rect.size.w > LEAF_W, "long label should widen the box");
+        assert!(
+            rect.size.w <= MAX_LEAF_W,
+            "width must not exceed MAX_LEAF_W"
+        );
+        assert_eq!(rect.size.h, LEAF_H);
+    }
+
+    #[test]
+    fn a_short_label_keeps_the_box_at_the_leaf_w_floor() {
+        let graph = graph_from(vec![leaf("a", "x", None)], vec!["a"]);
+
+        let result = layout(&graph);
+
+        assert_eq!(result.rects[&NodeId::from("a")].size.w, LEAF_W);
+    }
+
+    #[test]
+    fn variable_width_rows_still_pack_without_overlap() {
+        // Mixed short/long labels in one unconnected (trailing) layer --
+        // `pack_row` must respect each item's actual width, not a fixed
+        // LEAF_W, when deciding wrap points and positions.
+        let names = [
+            "a",
+            "a_moderately_long_name",
+            "b",
+            "another_pretty_long_display_name_here",
+            "c",
+        ];
+        let entries: Vec<(NodeId, ModuleNode)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| leaf(&format!("n{i}"), name, None))
+            .collect();
+        let roots: Vec<&str> = (0..names.len()).map(|_| "").collect();
+        let mut graph = graph_from(entries, roots);
+        graph.roots = (0..names.len())
+            .map(|i| NodeId::from(format!("n{i}")))
+            .collect();
+
+        let result = layout(&graph);
+
+        let rects: Vec<Rect> = (0..names.len())
+            .map(|i| result.rects[&NodeId::from(format!("n{i}"))])
+            .collect();
+        for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
+                assert!(!rects[i].intersects(&rects[j]), "nodes {i} and {j} overlap");
+            }
+        }
     }
 }
