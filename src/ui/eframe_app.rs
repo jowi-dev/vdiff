@@ -14,16 +14,18 @@
 
 use std::time::{Duration, Instant};
 
-use egui::{Align2, Context, Key};
+use egui::{Align2, Context, Key, Modifiers};
 
-use crate::core::app::{update, App, Cmd, Msg, Screen};
+use crate::core::app::{update, App, Cmd, Msg, Pane, Screen};
 use crate::core::diff_state::{DiffPaneState, FileEntry};
+use crate::core::file_view::{FileViewEntry, FileViewState};
 use crate::graph::layout::{layout, LayoutResult};
-use crate::graph::model::{NodeId, ProjectGraph};
-use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome};
-use crate::pipeline::file_diff::load_file_diff;
+use crate::graph::model::{GitStatus, ModuleNode, NodeId, ProjectGraph};
+use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome, Pending};
+use crate::pipeline::file_diff::{changed_head_ranges, load_file_diff};
 use crate::pipeline::repo::GitRepo;
 use crate::ui::diff_view;
+use crate::ui::file_view;
 use crate::ui::graph_view::{self, Transform};
 
 /// How long `--smoke` keeps the window open before closing it.
@@ -62,6 +64,66 @@ impl DiffLoader {
 
         Ok(DiffPaneState::new(node.clone(), files))
     }
+
+    /// Load the file-viewer state for every file backing `node` in `graph`:
+    /// head content via [`GitRepo::head_content`], or -- for a deleted
+    /// file (no `head_blob`) -- base content via [`GitRepo::base_blob`],
+    /// flagged [`FileViewEntry::deleted`] so the renderer can say so.
+    /// `changed_ranges` come from [`load_file_diff`]'s hunks when the node
+    /// has actually changed and the file has content on either side --
+    /// deleted files (no head content to mark up) always get an empty
+    /// range list. Errors as a message string, matching
+    /// [`Msg::LoadFailed`]'s shape.
+    fn load_file_view(&self, graph: &ProjectGraph, node: &NodeId) -> Result<FileViewState, String> {
+        let module = graph
+            .node(node)
+            .ok_or_else(|| format!("node {node} not found in graph"))?;
+
+        let mut files = Vec::with_capacity(module.files.len());
+        for file_ref in &module.files {
+            files.push(self.load_file_view_entry(module, file_ref)?);
+        }
+
+        Ok(FileViewState::new(node.clone(), files))
+    }
+
+    /// Load one [`FileViewEntry`] -- see [`Self::load_file_view`].
+    fn load_file_view_entry(
+        &self,
+        module: &ModuleNode,
+        file_ref: &crate::graph::model::FileRef,
+    ) -> Result<FileViewEntry, String> {
+        let deleted = file_ref.head_blob.is_none();
+        let content = if deleted {
+            self.repo
+                .base_blob(&self.base_oid, &file_ref.path)
+                .map_err(|err| err.to_string())?
+                .unwrap_or_default()
+        } else {
+            self.repo
+                .head_content(&file_ref.path)
+                .map_err(|err| err.to_string())?
+                .unwrap_or_default()
+        };
+        let lines: Vec<String> = content.lines().map(str::to_string).collect();
+
+        let changed_ranges = if !deleted
+            && module.status != GitStatus::Unchanged
+            && (file_ref.base_blob.is_some() || file_ref.head_blob.is_some())
+        {
+            let diff = load_file_diff(self.repo.as_ref(), &self.base_oid, file_ref)?;
+            changed_head_ranges(&diff)
+        } else {
+            Vec::new()
+        };
+
+        Ok(FileViewEntry {
+            path: file_ref.path.clone(),
+            lines,
+            changed_ranges,
+            deleted,
+        })
+    }
 }
 
 /// Owns [`core::App`] and drives it from egui input/paint each frame.
@@ -72,7 +134,7 @@ pub struct VdiffApp {
     /// The focus [`graph_view::show`]'s auto-pan last ran for -- lets it
     /// fire only when focus actually changes rather than every repaint.
     last_focus: Option<NodeId>,
-    pending_key: Option<char>,
+    pending_key: Option<Pending>,
     smoke: bool,
     started_at: Instant,
     diff_loader: DiffLoader,
@@ -115,6 +177,10 @@ impl VdiffApp {
                 Ok(state) => self.dispatch(Msg::DiffLoaded(state)),
                 Err(message) => self.dispatch(Msg::LoadFailed(message)),
             },
+            Cmd::LoadFile(node) => match self.diff_loader.load_file_view(&self.app.graph, &node) {
+                Ok(state) => self.dispatch(Msg::FileLoaded(state)),
+                Err(message) => self.dispatch(Msg::LoadFailed(message)),
+            },
             Cmd::Relayout => {
                 self.layout = layout(&self.app.visible_graph());
             }
@@ -125,7 +191,7 @@ impl VdiffApp {
     /// [`map_key`], updating the pending chord char and dispatching any
     /// resulting [`Msg`].
     fn handle_keys(&mut self, ctx: &Context) {
-        let presses: Vec<Key> = ctx.input(|i| {
+        let presses: Vec<(Key, Modifiers)> = ctx.input(|i| {
             i.events
                 .iter()
                 .filter_map(|event| match event {
@@ -133,19 +199,22 @@ impl VdiffApp {
                         key,
                         pressed: true,
                         repeat: false,
+                        modifiers,
                         ..
-                    } => Some(*key),
+                    } => Some((*key, *modifiers)),
                     _ => None,
                 })
                 .collect()
         });
 
-        for key in presses {
-            let Some(input) = egui_key_to_input(key) else {
+        for (key, modifiers) in presses {
+            let Some(input) = egui_key_to_input(key, modifiers) else {
                 continue;
             };
             let ctx = KeyContext {
                 screen: self.app.screen,
+                pane: self.app.pane,
+                file_open: self.app.file_view.is_some(),
                 picker_open: self.app.picker.is_some(),
                 pending: self.pending_key,
             };
@@ -153,7 +222,7 @@ impl VdiffApp {
             self.pending_key = None;
             match outcome {
                 KeyOutcome::Msg(msg) => self.dispatch(msg),
-                KeyOutcome::Pending(c) => self.pending_key = Some(c),
+                KeyOutcome::Pending(pending) => self.pending_key = Some(pending),
                 KeyOutcome::None => {}
             }
         }
@@ -237,6 +306,35 @@ impl VdiffApp {
             }
         }
     }
+
+    /// [`Screen::Graph`] with [`App::file_view`] open: the right-hand file
+    /// pane on a resizable [`egui::SidePanel`], then the graph on whatever
+    /// [`egui::CentralPanel`] space remains. Records the row count
+    /// [`file_view::show`] fit into that space as
+    /// [`App::viewport_rows`], read one frame later by
+    /// [`Msg::FileHalfPage`] -- see that field's doc for why this can't be
+    /// computed any earlier.
+    fn show_two_panel(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if let Some(file_view) = &self.app.file_view {
+            let focused = self.app.pane == Pane::File;
+            let response = egui::Panel::right("file_pane")
+                .resizable(true)
+                .default_size(ui.available_width() * 0.45)
+                .show(ui, |ui| file_view::show(ui, file_view, focused));
+            self.app.viewport_rows = response.inner;
+        }
+        egui::CentralPanel::default().show(ui, |ui| {
+            graph_view::show(
+                ui,
+                &self.app,
+                &self.layout,
+                &mut self.transform,
+                &mut self.last_focus,
+            );
+        });
+        self.show_picker(&ctx);
+    }
 }
 
 impl eframe::App for VdiffApp {
@@ -256,19 +354,7 @@ impl eframe::App for VdiffApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         match self.app.screen {
-            Screen::Graph => {
-                let ctx = ui.ctx().clone();
-                egui::CentralPanel::default().show(ui, |ui| {
-                    graph_view::show(
-                        ui,
-                        &self.app,
-                        &self.layout,
-                        &mut self.transform,
-                        &mut self.last_focus,
-                    );
-                });
-                self.show_picker(&ctx);
-            }
+            Screen::Graph => self.show_two_panel(ui),
             Screen::Diff => {
                 egui::CentralPanel::default().show(ui, |ui| {
                     self.show_diff(ui);
@@ -278,20 +364,36 @@ impl eframe::App for VdiffApp {
     }
 }
 
-/// Translate an egui key press to vdiff's toolkit-independent [`KeyInput`].
-/// Pure and unit-tested: only the keys [`crate::keymap::map_key`] cares
-/// about (h/j/k/l/g/d/r/t, Enter, Esc) map to anything; everything else is
-/// `None`.
-pub fn egui_key_to_input(key: Key) -> Option<KeyInput> {
+/// Translate an egui key press (with its modifiers) to vdiff's
+/// toolkit-independent [`KeyInput`]. Pure and unit-tested: with Ctrl held,
+/// only `w`/`d`/`u` map to anything ([`KeyInput::Ctrl`]); otherwise the
+/// keys [`crate::keymap::map_key`] cares about (h/j/k/l/g/G/d/r/t/s/c/f/[/],
+/// Enter, Esc) map to anything, everything else is `None`. `Key::G` maps to
+/// `Char('G')` when Shift is held (uppercase, distinct from the `gg`/`gd`/
+/// `gr` prefix `Char('g')`) and `Char('g')` otherwise.
+pub fn egui_key_to_input(key: Key, modifiers: Modifiers) -> Option<KeyInput> {
+    if modifiers.ctrl {
+        return match key {
+            Key::W => Some(KeyInput::Ctrl('w')),
+            Key::D => Some(KeyInput::Ctrl('d')),
+            Key::U => Some(KeyInput::Ctrl('u')),
+            _ => None,
+        };
+    }
     match key {
         Key::H => Some(KeyInput::Char('h')),
         Key::J => Some(KeyInput::Char('j')),
         Key::K => Some(KeyInput::Char('k')),
         Key::L => Some(KeyInput::Char('l')),
-        Key::G => Some(KeyInput::Char('g')),
+        Key::G => Some(KeyInput::Char(if modifiers.shift { 'G' } else { 'g' })),
         Key::D => Some(KeyInput::Char('d')),
         Key::R => Some(KeyInput::Char('r')),
         Key::T => Some(KeyInput::Char('t')),
+        Key::S => Some(KeyInput::Char('s')),
+        Key::C => Some(KeyInput::Char('c')),
+        Key::F => Some(KeyInput::Char('f')),
+        Key::OpenBracket => Some(KeyInput::Char('[')),
+        Key::CloseBracket => Some(KeyInput::Char(']')),
         Key::Enter => Some(KeyInput::Enter),
         Key::Escape => Some(KeyInput::Esc),
         _ => None,
@@ -304,7 +406,7 @@ mod tests {
     use crate::pipeline::repo::FakeRepo;
 
     #[test]
-    fn translates_mapped_keys() {
+    fn translates_mapped_keys_with_no_modifiers() {
         let cases = [
             (Key::H, KeyInput::Char('h')),
             (Key::J, KeyInput::Char('j')),
@@ -314,18 +416,52 @@ mod tests {
             (Key::D, KeyInput::Char('d')),
             (Key::R, KeyInput::Char('r')),
             (Key::T, KeyInput::Char('t')),
+            (Key::S, KeyInput::Char('s')),
+            (Key::C, KeyInput::Char('c')),
+            (Key::F, KeyInput::Char('f')),
+            (Key::OpenBracket, KeyInput::Char('[')),
+            (Key::CloseBracket, KeyInput::Char(']')),
             (Key::Enter, KeyInput::Enter),
             (Key::Escape, KeyInput::Esc),
         ];
         for (key, expected) in cases {
-            assert_eq!(egui_key_to_input(key), Some(expected), "key={key:?}");
+            assert_eq!(
+                egui_key_to_input(key, Modifiers::NONE),
+                Some(expected),
+                "key={key:?}"
+            );
         }
+    }
+
+    #[test]
+    fn shift_g_translates_to_uppercase() {
+        assert_eq!(
+            egui_key_to_input(Key::G, Modifiers::SHIFT),
+            Some(KeyInput::Char('G'))
+        );
+    }
+
+    #[test]
+    fn ctrl_modifier_maps_w_d_u_and_nothing_else() {
+        assert_eq!(
+            egui_key_to_input(Key::W, Modifiers::CTRL),
+            Some(KeyInput::Ctrl('w'))
+        );
+        assert_eq!(
+            egui_key_to_input(Key::D, Modifiers::CTRL),
+            Some(KeyInput::Ctrl('d'))
+        );
+        assert_eq!(
+            egui_key_to_input(Key::U, Modifiers::CTRL),
+            Some(KeyInput::Ctrl('u'))
+        );
+        assert_eq!(egui_key_to_input(Key::H, Modifiers::CTRL), None);
     }
 
     #[test]
     fn unmapped_keys_translate_to_none() {
         for key in [Key::A, Key::Z, Key::Num1, Key::Space, Key::Tab] {
-            assert_eq!(egui_key_to_input(key), None, "key={key:?}");
+            assert_eq!(egui_key_to_input(key, Modifiers::NONE), None, "key={key:?}");
         }
     }
 
@@ -423,5 +559,113 @@ mod tests {
             base_oid: "base-oid".to_string(),
         };
         assert!(loader.load(&graph, &NodeId::from("nope")).is_err());
+    }
+
+    #[test]
+    fn file_loader_loads_head_content_and_changed_ranges() {
+        let (graph, repo) = graph_and_repo();
+        let loader = DiffLoader {
+            repo: Box::new(repo) as Box<dyn GitRepo>,
+            base_oid: "base-oid".to_string(),
+        };
+
+        let state = loader
+            .load_file_view(&graph, &NodeId::from("rust:demo"))
+            .unwrap();
+        assert_eq!(state.node, NodeId::from("rust:demo"));
+        assert_eq!(state.files.len(), 2);
+
+        let new_file = state
+            .files
+            .iter()
+            .find(|f| f.path.to_str() == Some("new.rs"))
+            .unwrap();
+        assert_eq!(new_file.lines, vec!["brand new"]);
+        assert!(!new_file.deleted);
+        assert_eq!(
+            new_file.changed_ranges,
+            vec![(0, 0)],
+            "whole added file is one changed range"
+        );
+
+        let changed_file = state
+            .files
+            .iter()
+            .find(|f| f.path.to_str() == Some("changed.rs"))
+            .unwrap();
+        assert_eq!(changed_file.lines, vec!["after"]);
+        assert!(!changed_file.deleted);
+        assert_eq!(changed_file.changed_ranges, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn file_loader_errors_on_unknown_node() {
+        let (graph, repo) = graph_and_repo();
+        let loader = DiffLoader {
+            repo: Box::new(repo) as Box<dyn GitRepo>,
+            base_oid: "base-oid".to_string(),
+        };
+        assert!(loader
+            .load_file_view(&graph, &NodeId::from("nope"))
+            .is_err());
+    }
+
+    /// One node backed by a deleted file (`gone.rs`, base content only, no
+    /// head blob) -- exercises `DiffLoader::load_file_view_entry`'s
+    /// deleted-file fallback.
+    fn graph_and_repo_with_deleted_file() -> (ProjectGraph, FakeRepo) {
+        use crate::graph::model::{FileRef, GitStatus, ModuleNode};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let node_id = NodeId::from("rust:gone");
+        let node = ModuleNode {
+            id: node_id.clone(),
+            display_name: "gone".to_string(),
+            parent: None,
+            children: vec![],
+            status: GitStatus::Deleted,
+            files: vec![FileRef {
+                path: PathBuf::from("gone.rs"),
+                base_blob: Some("b".to_string()),
+                head_blob: None,
+            }],
+        };
+        let mut nodes = HashMap::new();
+        nodes.insert(node_id.clone(), node);
+        let graph = ProjectGraph {
+            nodes,
+            roots: vec![node_id],
+            edges: vec![],
+        };
+
+        let mut base_files = HashMap::new();
+        base_files.insert(PathBuf::from("gone.rs"), "old content\n".to_string());
+
+        let repo = FakeRepo {
+            default_base_oid: "base-oid".to_string(),
+            deltas: vec![],
+            base_files,
+            head_files: HashMap::new(),
+            tracked_files: vec![],
+        };
+        (graph, repo)
+    }
+
+    #[test]
+    fn file_loader_deleted_file_falls_back_to_base_content_with_no_changed_ranges() {
+        let (graph, repo) = graph_and_repo_with_deleted_file();
+        let loader = DiffLoader {
+            repo: Box::new(repo) as Box<dyn GitRepo>,
+            base_oid: "base-oid".to_string(),
+        };
+
+        let state = loader
+            .load_file_view(&graph, &NodeId::from("rust:gone"))
+            .unwrap();
+        let file = &state.files[0];
+        assert!(file.deleted);
+        assert_eq!(file.lines, vec!["old content"]);
+        assert!(file.changed_ranges.is_empty(), "no head content to mark up");
     }
 }

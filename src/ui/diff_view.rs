@@ -433,7 +433,9 @@ fn paint_intraline_spans(
 }
 
 /// File-extension-based language hint for [`highlight`]'s syntect lookup.
-fn language_for(path: &Path) -> &str {
+/// `pub(crate)`: also used by [`crate::ui::file_view`] so both panes pick
+/// the same syntect language for a given path.
+pub(crate) fn language_for(path: &Path) -> &str {
     path.extension().and_then(|ext| ext.to_str()).unwrap_or("")
 }
 

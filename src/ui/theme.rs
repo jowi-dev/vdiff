@@ -98,6 +98,19 @@ pub fn focus_ring_stroke() -> Stroke {
     Stroke::new(2.0, FOCUS_RING)
 }
 
+/// Border stroke for the file viewer pane: [`FOCUS_RING`] when it has
+/// keyboard focus ([`crate::core::app::Pane::File`]), a faint gray
+/// otherwise -- the graph pane signals its own focus via the focused
+/// node's ring, so the file pane only needs to visibly dim, not vanish,
+/// when focus is elsewhere.
+pub fn pane_border_stroke(focused: bool) -> Stroke {
+    if focused {
+        Stroke::new(2.0, FOCUS_RING)
+    } else {
+        Stroke::new(1.0, Color32::from_rgb(0x3a, 0x3a, 0x3a))
+    }
+}
+
 /// A deterministic, saturated hue for `root_id`, used as a node's left-edge
 /// stripe and its legend-row swatch (see [`crate::ui::graph_view`]) so a
 /// namespace root reads as "the same color everywhere" without vdiff having
