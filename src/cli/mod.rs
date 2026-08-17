@@ -49,6 +49,17 @@ pub struct Cli {
     /// on `PATH`.
     #[arg(long)]
     pub nvim: bool,
+    /// Ex command to run in the embedded nvim after startup (repeatable --
+    /// pass `--nvim-cmd` multiple times to run several, in order). Runs
+    /// after `nvim_ui_attach` and again after every automatic respawn (see
+    /// [`crate::nvim::session`]'s liveness handling), before the first file
+    /// opens. A failing command is logged to stderr as a warning, never
+    /// fatal. Example: `--nvim-cmd ContextWindowHide` to silence a plugin
+    /// that's noisy only inside vdiff's embedded instance. Ignored (with no
+    /// warning) unless `--nvim` is also given and a usable `nvim` was
+    /// found.
+    #[arg(long = "nvim-cmd")]
+    pub nvim_cmd: Vec<String>,
 }
 
 /// `--dump` output format.

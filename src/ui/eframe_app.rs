@@ -302,7 +302,9 @@ impl VdiffApp {
         match NvimPane::spawn(&self.nvim_cwd, cols, rows, self.egui_ctx.clone()) {
             Ok(pane) => {
                 for cmd in &self.nvim_init_cmds {
-                    pane.send(NvimCmd::Ex(cmd.clone()));
+                    if let Err(message) = pane.run_init_command(cmd) {
+                        eprintln!("warning: {message}");
+                    }
                 }
                 self.nvim = Some(pane);
             }
@@ -564,12 +566,12 @@ impl VdiffApp {
             if let Some(nvim) = self.nvim.as_mut() {
                 egui::Panel::right("file_pane")
                     .resizable(true)
-                    .default_size(ui.available_width() * 0.45)
+                    .default_size(ui.available_width() * 0.5)
                     .show(ui, |ui| nvim_pane::show(ui, nvim, focused));
             } else if let Some(file_view) = self.app.file_view.as_ref() {
                 let response = egui::Panel::right("file_pane")
                     .resizable(true)
-                    .default_size(ui.available_width() * 0.45)
+                    .default_size(ui.available_width() * 0.5)
                     .show(ui, |ui| file_view::show(ui, file_view, focused));
                 self.app.viewport_rows = response.inner;
             }

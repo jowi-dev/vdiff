@@ -74,6 +74,7 @@ fn main() -> ExitCode {
                 &repo_path,
                 cli.smoke,
                 cli.nvim,
+                cli.nvim_cmd,
                 DiffLoader { repo, base_oid },
             )
         }
@@ -116,12 +117,15 @@ fn dump(
 /// `diff_loader` backs `Cmd::LoadDiff` once a node's diff pane is opened.
 /// `want_nvim` is the `--nvim` flag: if set but no `nvim` binary is on
 /// `PATH`, prints a warning and falls back to the built-in file viewer
-/// rather than failing to start.
+/// rather than failing to start. `nvim_cmd` is `--nvim-cmd`'s Ex commands,
+/// run after every attach/respawn; ignored (silently) when nvim mode isn't
+/// active.
 fn run_gui(
     graph: ProjectGraph,
     repo_path: &Path,
     smoke: bool,
     want_nvim: bool,
+    nvim_cmd: Vec<String>,
     diff_loader: DiffLoader,
 ) -> ExitCode {
     if want_nvim && !nvim_available() {
@@ -167,7 +171,10 @@ fn run_gui(
                 // `Resize` the moment it measures the actual panel size on
                 // the first frame (see `NvimPane::maybe_resize`).
                 match NvimPane::spawn(&repo_root, 80, 24, cc.egui_ctx.clone()) {
-                    Ok(pane) => Some(pane),
+                    Ok(pane) => {
+                        run_nvim_init_commands(&pane, &nvim_cmd);
+                        Some(pane)
+                    }
                     Err(err) => {
                         eprintln!("warning: failed to spawn nvim: {err}");
                         None
@@ -184,7 +191,7 @@ fn run_gui(
                 NvimConfig {
                     pane: nvim,
                     cwd: repo_root.clone(),
-                    init_cmds: Vec::new(),
+                    init_cmds: nvim_cmd.clone(),
                     egui_ctx: cc.egui_ctx.clone(),
                 },
             )))
@@ -196,6 +203,19 @@ fn run_gui(
         Err(err) => {
             eprintln!("error running GUI: {err}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run each `--nvim-cmd` in order via [`NvimPane::run_init_command`],
+/// logging (never failing the run over) any that error out or time out.
+/// `VdiffApp::respawn_nvim` re-runs the same commands after a dead session
+/// is replaced (see `NvimConfig::init_cmds`, which carries `commands`
+/// forward for that).
+fn run_nvim_init_commands(pane: &NvimPane, commands: &[String]) {
+    for command in commands {
+        if let Err(message) = pane.run_init_command(command) {
+            eprintln!("warning: {message}");
         }
     }
 }
