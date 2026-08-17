@@ -37,6 +37,13 @@ pub struct EdgePicker {
 pub struct App {
     /// The project graph being browsed.
     pub graph: ProjectGraph,
+    /// The layered-dependency-layout structure ([`crate::graph::layers::assign_layers`]'s
+    /// output) `focus` navigation walks. Computed once by the caller when
+    /// constructing `App` -- core stays geometry-free, but layering is pure
+    /// graph logic, so it's fine for the caller to compute it up front and
+    /// hand it in rather than `core` recomputing it from `graph` on every
+    /// navigation step.
+    pub layers: Vec<Vec<NodeId>>,
     /// The currently focused node.
     pub focus: NodeId,
     /// The screen currently shown.
@@ -46,6 +53,15 @@ pub struct App {
     pub diff: Option<DiffPaneState>,
     /// The edge-following picker overlay, `None` when closed.
     pub picker: Option<EdgePicker>,
+}
+
+impl App {
+    /// Whether `id` is a drawn (real, navigable) node -- present in
+    /// `self.layers` -- as opposed to a synthetic namespace node or an
+    /// unknown id. [`Msg::FocusSet`] rejects any target that isn't.
+    fn is_drawn(&self, id: &NodeId) -> bool {
+        self.layers.iter().any(|layer| layer.contains(id))
+    }
 }
 
 /// Every event [`update`] can react to.
@@ -119,12 +135,12 @@ pub fn update(mut app: App, msg: Msg) -> (App, Cmd) {
     match msg {
         Msg::FocusMove(dir) => {
             if on_graph_with_no_picker(&app) {
-                app.focus = move_focus(&app.graph, &app.focus, dir);
+                app.focus = move_focus(&app.layers, &app.focus, dir);
             }
             (app, Cmd::None)
         }
         Msg::FocusSet(id) => {
-            if on_graph_with_no_picker(&app) && app.graph.node(&id).is_some() {
+            if on_graph_with_no_picker(&app) && app.is_drawn(&id) {
                 app.focus = id;
             }
             (app, Cmd::None)
@@ -267,14 +283,19 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    /// `leaf_a`/`leaf_b` are children of `root`; `target_x/y/z` sit
-    /// alongside them with no hierarchy relevant to these tests. Edges:
-    /// `leaf_a -> target_x`, `leaf_b -> target_x`, `leaf_b -> target_y`,
-    /// `leaf_b -> target_z`. So `dep_targets(leaf_a)` is a single hit
-    /// (`target_x`), `dep_targets(leaf_b)` is three (`target_x/y/z`),
-    /// `dep_targets(target_x)` is zero. `dependent_sources(target_x)` is two
-    /// (`leaf_a`, `leaf_b`), `dependent_sources(target_y)` is a single hit
-    /// (`leaf_b`), `dependent_sources(root)` is zero.
+    /// `leaf_a`/`leaf_b` are children of the synthetic (no-files) node
+    /// `root`; `target_x/y/z` sit alongside them with no hierarchy relevant
+    /// to these tests. Edges: `leaf_a -> target_x`, `leaf_b -> target_x`,
+    /// `leaf_b -> target_y`, `leaf_b -> target_z`. So `dep_targets(leaf_a)`
+    /// is a single hit (`target_x`), `dep_targets(leaf_b)` is three
+    /// (`target_x/y/z`), `dep_targets(target_x)` is zero.
+    /// `dependent_sources(target_x)` is two (`leaf_a`, `leaf_b`),
+    /// `dependent_sources(target_y)` is a single hit (`leaf_b`),
+    /// `dependent_sources(root)` is zero. Every drawn node has one edge into
+    /// `target_x/y/z`, so layering (see [`crate::graph::layers`]) puts
+    /// `[leaf_a, leaf_b]` at layer 0 and `[target_x, target_y, target_z]` at
+    /// layer 1 -- `root` is synthetic (no files) and never appears in a
+    /// layer at all.
     fn graph_fixture() -> ProjectGraph {
         let root = NodeId::from("root");
         let leaf_a = NodeId::from("leaf_a");
@@ -289,7 +310,11 @@ mod tests {
             parent,
             children: vec![],
             status: GitStatus::Unchanged,
-            files: vec![],
+            files: vec![crate::graph::model::FileRef {
+                path: PathBuf::from(format!("{name}.rs")),
+                base_blob: Some("b".to_string()),
+                head_blob: Some("h".to_string()),
+            }],
         };
 
         let mut nodes = HashMap::new();
@@ -341,8 +366,11 @@ mod tests {
     }
 
     fn app_at(focus: &str) -> App {
+        let graph = graph_fixture();
+        let layers = crate::graph::layers::assign_layers(&graph);
         App {
-            graph: graph_fixture(),
+            graph,
+            layers,
             focus: NodeId::from(focus),
             screen: Screen::Graph,
             diff: None,
@@ -352,9 +380,11 @@ mod tests {
 
     #[test]
     fn focus_move_updates_focus_on_graph_with_no_picker() {
+        // Layer 0 is [leaf_a, leaf_b] (see `graph_fixture`'s docs): Right
+        // moves within that row.
         let app = app_at("leaf_a");
-        let (app, cmd) = update(app, Msg::FocusMove(Direction::Left));
-        assert_eq!(app.focus, NodeId::from("root"));
+        let (app, cmd) = update(app, Msg::FocusMove(Direction::Right));
+        assert_eq!(app.focus, NodeId::from("leaf_b"));
         assert_eq!(cmd, Cmd::None);
     }
 
@@ -365,7 +395,7 @@ mod tests {
             candidates: vec![NodeId::from("target_x")],
             selected: 0,
         });
-        let (app, _) = update(app, Msg::FocusMove(Direction::Left));
+        let (app, _) = update(app, Msg::FocusMove(Direction::Right));
         assert_eq!(app.focus, NodeId::from("leaf_a"));
     }
 
@@ -373,13 +403,13 @@ mod tests {
     fn focus_move_noop_off_graph_screen() {
         let mut app = app_at("leaf_a");
         app.screen = Screen::Diff;
-        let (app, _) = update(app, Msg::FocusMove(Direction::Left));
+        let (app, _) = update(app, Msg::FocusMove(Direction::Right));
         assert_eq!(app.focus, NodeId::from("leaf_a"));
     }
 
     #[test]
-    fn focus_set_updates_focus_for_known_node() {
-        let app = app_at("root");
+    fn focus_set_updates_focus_for_known_drawn_node() {
+        let app = app_at("leaf_a");
         let (app, cmd) = update(app, Msg::FocusSet(NodeId::from("target_y")));
         assert_eq!(app.focus, NodeId::from("target_y"));
         assert_eq!(cmd, Cmd::None);
@@ -387,9 +417,19 @@ mod tests {
 
     #[test]
     fn focus_set_noop_for_unknown_node() {
-        let app = app_at("root");
+        let app = app_at("leaf_a");
         let (app, _) = update(app, Msg::FocusSet(NodeId::from("nonexistent")));
-        assert_eq!(app.focus, NodeId::from("root"));
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
+    }
+
+    #[test]
+    fn focus_set_noop_for_synthetic_node() {
+        // `root` has no files -- it's excluded from `layers` entirely and
+        // must be rejected as a focus target even though it's a real node
+        // in the graph.
+        let app = app_at("leaf_a");
+        let (app, _) = update(app, Msg::FocusSet(NodeId::from("root")));
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
     }
 
     #[test]

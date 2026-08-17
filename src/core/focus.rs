@@ -1,60 +1,100 @@
-//! h/j/k/l tree-walk navigation over a [`ProjectGraph`]. Pure: consults only
-//! the graph's parent/children edges, never layout geometry.
+//! h/j/k/l layer navigation over the layered dependency layout: pure,
+//! consulting only the layer structure ([`crate::graph::layers::assign_layers`]'s
+//! output, threaded in as `layers`) -- never layout geometry. h/l move
+//! within a layer's row; j/k move between adjacent layers.
 
 use crate::graph::model::{NodeId, ProjectGraph};
 
-/// A single navigation step, named after its vim keybinding.
+/// A single navigation step, named after its vim keybinding (see
+/// [`crate::keymap`], which maps h/j/k/l to these unchanged).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
-    /// `h`: ascend to the parent. No-op on a root.
+    /// `h`: previous node in the current layer's row. No-op at the row's
+    /// start.
     Left,
-    /// `j`: move to the next sibling. No-op on the last sibling.
+    /// `j`: the roughly-same-position node one layer down (deeper
+    /// dependency). No-op on the last layer.
     Down,
-    /// `k`: move to the previous sibling. No-op on the first sibling.
+    /// `k`: the roughly-same-position node one layer up (shallower
+    /// dependency). No-op on the first layer.
     Up,
-    /// `l`: descend to the first child. No-op on a leaf.
+    /// `l`: next node in the current layer's row. No-op at the row's end.
     Right,
 }
 
 /// Move focus from `current` in `dir`, returning the new focused node.
-/// Returns `current` unchanged for every no-op case documented on
-/// [`Direction`]'s variants. Sibling order is [`ProjectGraph::sorted_children`]
-/// (or [`ProjectGraph::sorted_roots`] for top-level nodes) -- the same order
-/// the graph view renders.
-pub fn move_focus(graph: &ProjectGraph, current: &NodeId, dir: Direction) -> NodeId {
-    match dir {
-        Direction::Left => parent_of(graph, current).unwrap_or_else(|| current.clone()),
-        Direction::Right => first_child(graph, current).unwrap_or_else(|| current.clone()),
-        Direction::Down => sibling_step(graph, current, 1).unwrap_or_else(|| current.clone()),
-        Direction::Up => sibling_step(graph, current, -1).unwrap_or_else(|| current.clone()),
-    }
-}
-
-/// `current`'s parent, if it has one and it resolves to a real node.
-fn parent_of(graph: &ProjectGraph, current: &NodeId) -> Option<NodeId> {
-    graph.node(current)?.parent.clone()
-}
-
-/// The first (name-sorted) child of `current`, if it has any.
-fn first_child(graph: &ProjectGraph, current: &NodeId) -> Option<NodeId> {
-    graph.sorted_children(current).into_iter().next()
-}
-
-/// Step `delta` positions through `current`'s sibling list (root list if
-/// `current` has no parent), clamped to the list's bounds. `None` if the
-/// step would be a no-op (already at that end) or `current` isn't found in
-/// its own sibling list (shouldn't happen for a well-formed graph).
-fn sibling_step(graph: &ProjectGraph, current: &NodeId, delta: i32) -> Option<NodeId> {
-    let siblings = match parent_of(graph, current) {
-        Some(parent) => graph.sorted_children(&parent),
-        None => graph.sorted_roots(),
+/// `layers` is [`crate::graph::layers::assign_layers`]'s output (one row of
+/// node ids per layer, already ordered root-then-name). Returns `current`
+/// unchanged if it isn't found in `layers` at all (shouldn't happen --
+/// [`crate::core::app::App::layers`] and `focus` are built from the same
+/// graph -- but `FocusSet` defensively rejects synthetic/unknown targets
+/// too, so this stays a safe fallback) or for the no-op cases documented on
+/// [`Direction`]'s variants.
+pub fn move_focus(layers: &[Vec<NodeId>], current: &NodeId, dir: Direction) -> NodeId {
+    let Some((layer_idx, pos_idx)) = locate(layers, current) else {
+        return current.clone();
     };
-    let index = siblings.iter().position(|id| id == current)?;
-    let new_index = index as i32 + delta;
-    if new_index < 0 || new_index as usize >= siblings.len() {
+
+    match dir {
+        Direction::Left => step_within_row(layers, layer_idx, pos_idx, -1),
+        Direction::Right => step_within_row(layers, layer_idx, pos_idx, 1),
+        Direction::Up => step_to_layer(layers, layer_idx, pos_idx, -1),
+        Direction::Down => step_to_layer(layers, layer_idx, pos_idx, 1),
+    }
+    .unwrap_or_else(|| current.clone())
+}
+
+/// Find `id`'s `(layer_idx, pos_idx)` in `layers`.
+fn locate(layers: &[Vec<NodeId>], id: &NodeId) -> Option<(usize, usize)> {
+    for (layer_idx, row) in layers.iter().enumerate() {
+        if let Some(pos_idx) = row.iter().position(|n| n == id) {
+            return Some((layer_idx, pos_idx));
+        }
+    }
+    None
+}
+
+/// Step `delta` positions within `layers[layer_idx]`, clamped to the row's
+/// bounds. `None` if the step would be a no-op (already at that end).
+fn step_within_row(
+    layers: &[Vec<NodeId>],
+    layer_idx: usize,
+    pos_idx: usize,
+    delta: i32,
+) -> Option<NodeId> {
+    let row = &layers[layer_idx];
+    let new_pos = pos_idx as i32 + delta;
+    if new_pos < 0 || new_pos as usize >= row.len() {
         return None;
     }
-    siblings.get(new_index as usize).cloned()
+    row.get(new_pos as usize).cloned()
+}
+
+/// Move to `layers[layer_idx + delta]` (`delta` is `1` or `-1`), landing on
+/// the node at the same fractional position within that row: `pos_idx *
+/// target_len / current_len`, clamped to the target row's last index. A
+/// cheap "stay roughly above/below" without consulting layout geometry.
+/// `None` if `layer_idx + delta` is out of bounds or the target layer is
+/// empty (shouldn't happen -- `assign_layers` never emits an empty layer).
+fn step_to_layer(
+    layers: &[Vec<NodeId>],
+    layer_idx: usize,
+    pos_idx: usize,
+    delta: i32,
+) -> Option<NodeId> {
+    let target_idx = layer_idx as i32 + delta;
+    if target_idx < 0 || target_idx as usize >= layers.len() {
+        return None;
+    }
+    let target_idx = target_idx as usize;
+    let target_row = &layers[target_idx];
+    if target_row.is_empty() {
+        return None;
+    }
+    let current_len = layers[layer_idx].len().max(1);
+    let target_len = target_row.len();
+    let target_pos = (pos_idx * target_len / current_len).min(target_len - 1);
+    target_row.get(target_pos).cloned()
 }
 
 /// Outgoing dependency targets of `node`: the `to` end of every edge whose
@@ -101,169 +141,84 @@ fn dedup_sorted_by_name(graph: &ProjectGraph, ids: impl Iterator<Item = NodeId>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::model::{DepEdge, DepKind, GitStatus, ModuleNode, ProjectGraph};
+    use crate::graph::model::{DepEdge, DepKind, GitStatus, ModuleNode};
     use std::collections::HashMap;
 
-    /// Two-root, two-level fixture:
-    /// ```text
-    /// app (root)          zzz (root, leaf)
-    ///  ├─ a (leaf)
-    ///  └─ b
-    ///      └─ x (leaf)
-    /// ```
-    /// `app`'s children sort as `[a, b]`; roots sort as `[app, zzz]`.
-    fn fixture() -> ProjectGraph {
-        let app = NodeId::from("app");
-        let zzz = NodeId::from("zzz");
-        let a = NodeId::from("a");
-        let b = NodeId::from("b");
-        let x = NodeId::from("x");
+    fn id(name: &str) -> NodeId {
+        NodeId::from(name)
+    }
 
-        let leaf = |id: &NodeId, name: &str, parent: Option<NodeId>| ModuleNode {
-            id: id.clone(),
-            display_name: name.to_string(),
-            parent,
-            children: vec![],
-            status: GitStatus::Unchanged,
-            files: vec![],
-        };
+    fn row(names: &[&str]) -> Vec<NodeId> {
+        names.iter().map(|n| id(n)).collect()
+    }
 
-        let mut nodes = HashMap::new();
-        nodes.insert(
-            app.clone(),
-            ModuleNode {
-                id: app.clone(),
-                display_name: "app".to_string(),
-                parent: None,
-                children: vec![b.clone(), a.clone()],
-                status: GitStatus::Unchanged,
-                files: vec![],
-            },
-        );
-        nodes.insert(zzz.clone(), leaf(&zzz, "zzz", None));
-        nodes.insert(a.clone(), leaf(&a, "a", Some(app.clone())));
-        nodes.insert(
-            b.clone(),
-            ModuleNode {
-                id: b.clone(),
-                display_name: "b".to_string(),
-                parent: Some(app.clone()),
-                children: vec![x.clone()],
-                status: GitStatus::Unchanged,
-                files: vec![],
-            },
-        );
-        nodes.insert(x.clone(), leaf(&x, "x", Some(b.clone())));
-
-        ProjectGraph {
-            nodes,
-            roots: vec![app, zzz],
-            edges: vec![],
-        }
+    /// Three layers: `[app, zzz]`, `[a, b]`, `[x]` -- enough rows/lengths to
+    /// exercise clamping (row-end no-ops) and the fractional j/k landing
+    /// (2 -> 1 nodes and 1 -> 2 nodes).
+    fn layers_fixture() -> Vec<Vec<NodeId>> {
+        vec![row(&["app", "zzz"]), row(&["a", "b"]), row(&["x"])]
     }
 
     #[test]
-    fn down_moves_to_next_sibling_no_wrap() {
-        let g = fixture();
+    fn right_and_left_move_within_a_row_no_wrap() {
+        let layers = layers_fixture();
+        assert_eq!(move_focus(&layers, &id("app"), Direction::Right), id("zzz"));
         assert_eq!(
-            move_focus(&g, &NodeId::from("app"), Direction::Down),
-            NodeId::from("zzz")
+            move_focus(&layers, &id("zzz"), Direction::Right),
+            id("zzz"),
+            "no-op at row end"
         );
+        assert_eq!(move_focus(&layers, &id("zzz"), Direction::Left), id("app"));
         assert_eq!(
-            move_focus(&g, &NodeId::from("zzz"), Direction::Down),
-            NodeId::from("zzz"),
-            "no-op at last root sibling"
-        );
-        assert_eq!(
-            move_focus(&g, &NodeId::from("a"), Direction::Down),
-            NodeId::from("b")
-        );
-        assert_eq!(
-            move_focus(&g, &NodeId::from("b"), Direction::Down),
-            NodeId::from("b"),
-            "no-op at last child sibling"
+            move_focus(&layers, &id("app"), Direction::Left),
+            id("app"),
+            "no-op at row start"
         );
     }
 
     #[test]
-    fn up_moves_to_prev_sibling_no_wrap() {
-        let g = fixture();
-        assert_eq!(
-            move_focus(&g, &NodeId::from("zzz"), Direction::Up),
-            NodeId::from("app")
-        );
-        assert_eq!(
-            move_focus(&g, &NodeId::from("app"), Direction::Up),
-            NodeId::from("app"),
-            "no-op at first root sibling"
-        );
-        assert_eq!(
-            move_focus(&g, &NodeId::from("b"), Direction::Up),
-            NodeId::from("a")
-        );
-        assert_eq!(
-            move_focus(&g, &NodeId::from("a"), Direction::Up),
-            NodeId::from("a"),
-            "no-op at first child sibling"
-        );
+    fn down_and_up_move_between_layers_at_fractional_position() {
+        let layers = layers_fixture();
+        // layer 0 pos 0 (of 2) -> layer 1 (of 2): 0*2/2 = 0 -> "a".
+        assert_eq!(move_focus(&layers, &id("app"), Direction::Down), id("a"));
+        // layer 0 pos 1 (of 2) -> layer 1 (of 2): 1*2/2 = 1 -> "b".
+        assert_eq!(move_focus(&layers, &id("zzz"), Direction::Down), id("b"));
+        // layer 1 pos 1 (of 2) -> layer 2 (of 1): 1*1/2 = 0 -> "x".
+        assert_eq!(move_focus(&layers, &id("b"), Direction::Down), id("x"));
+        // layer 2 pos 0 (of 1) -> layer 1 (of 2): 0*2/1 = 0 -> "a".
+        assert_eq!(move_focus(&layers, &id("x"), Direction::Up), id("a"));
     }
 
     #[test]
-    fn right_moves_to_first_child_no_op_on_leaf() {
-        let g = fixture();
-        assert_eq!(
-            move_focus(&g, &NodeId::from("app"), Direction::Right),
-            NodeId::from("a")
-        );
-        assert_eq!(
-            move_focus(&g, &NodeId::from("b"), Direction::Right),
-            NodeId::from("x")
-        );
-        assert_eq!(
-            move_focus(&g, &NodeId::from("a"), Direction::Right),
-            NodeId::from("a"),
-            "no-op on leaf"
-        );
-        assert_eq!(
-            move_focus(&g, &NodeId::from("zzz"), Direction::Right),
-            NodeId::from("zzz"),
-            "no-op on childless root"
-        );
+    fn down_noop_on_last_layer_up_noop_on_first_layer() {
+        let layers = layers_fixture();
+        assert_eq!(move_focus(&layers, &id("x"), Direction::Down), id("x"));
+        assert_eq!(move_focus(&layers, &id("app"), Direction::Up), id("app"));
+        assert_eq!(move_focus(&layers, &id("zzz"), Direction::Up), id("zzz"));
     }
 
     #[test]
-    fn left_moves_to_parent_no_op_on_root() {
-        let g = fixture();
+    fn unknown_node_returns_itself() {
+        let layers = layers_fixture();
         assert_eq!(
-            move_focus(&g, &NodeId::from("x"), Direction::Left),
-            NodeId::from("b")
+            move_focus(&layers, &id("ghost"), Direction::Right),
+            id("ghost")
         );
         assert_eq!(
-            move_focus(&g, &NodeId::from("b"), Direction::Left),
-            NodeId::from("app")
-        );
-        assert_eq!(
-            move_focus(&g, &NodeId::from("app"), Direction::Left),
-            NodeId::from("app"),
-            "no-op on root"
-        );
-        assert_eq!(
-            move_focus(&g, &NodeId::from("zzz"), Direction::Left),
-            NodeId::from("zzz"),
-            "no-op on root"
+            move_focus(&layers, &id("ghost"), Direction::Down),
+            id("ghost")
         );
     }
 
-    /// Standalone edge fixture (disjoint from `fixture()`, no hierarchy
-    /// needed): `n1` depends on `alpha` and `beta` (with a duplicate `n1 ->
-    /// beta` edge of a different kind, to exercise dedup), and is depended on
-    /// by `delta` and `gamma`. `alpha`/`beta` have no outgoing edges of their
-    /// own (covering `dep_targets`' 0-edge case); `delta`/`gamma` have no
-    /// incoming edges of their own (covering `dependent_sources`' 0-edge
-    /// case).
+    /// Standalone edge fixture (no layer hierarchy needed): `n1` depends on
+    /// `alpha` and `beta` (with a duplicate `n1 -> beta` edge of a different
+    /// kind, to exercise dedup), and is depended on by `delta` and `gamma`.
+    /// `alpha`/`beta` have no outgoing edges of their own (covering
+    /// `dep_targets`' 0-edge case); `delta`/`gamma` have no incoming edges of
+    /// their own (covering `dependent_sources`' 0-edge case).
     fn edge_fixture() -> ProjectGraph {
         let n1 = NodeId::from("n1");
-        let alpha = NodeId::from("alpha"); // display_name "alpha", id != name to test name-sort
+        let alpha = NodeId::from("alpha");
         let beta = NodeId::from("beta");
         let delta = NodeId::from("delta");
         let gamma = NodeId::from("gamma");
