@@ -200,7 +200,57 @@ fn handle_pan_zoom(ui: &Ui, response: &egui::Response, transform: &mut Transform
     }
 }
 
-/// The offset delta (screen-space) needed to bring `focus_rect` fully
+/// The graph's total horizontal extent in layout space: the span from the
+/// leftmost rect's left edge to the rightmost rect's right edge across
+/// every drawn node. `graph::layout` already centers every row relative to
+/// every other row within this same span, so it's exactly the width the
+/// initial view (see [`initial_x_offset`]) should center in the viewport.
+/// `None` for an empty layout (nothing to center).
+pub fn graph_width(layout: &LayoutResult) -> Option<f32> {
+    layout
+        .rects
+        .values()
+        .fold(None, |acc: Option<(f32, f32)>, rect| {
+            let left = rect.origin.x;
+            let right = rect.origin.x + rect.size.w;
+            Some(match acc {
+                None => (left, right),
+                Some((l, r)) => (l.min(left), r.max(right)),
+            })
+        })
+        .map(|(left, right)| right - left)
+}
+
+/// The `Transform::offset.x` that centers a `graph_width`-wide (layout
+/// space) graph at `scale` horizontally within a `viewport_width`-wide
+/// viewport -- used once, on the very first frame, so the graph opens
+/// centered instead of pinned to the left edge (see
+/// [`crate::ui::eframe_app::VdiffApp`]'s `initial_view_centered` field for
+/// why this must run exactly once, not every frame: recomputing it after
+/// the user has panned would fight their own pan, the same flicker
+/// [`show`]'s `last_focus` gating avoids for auto-pan).
+///
+/// When the graph is wider than the viewport, the naive centered value
+/// goes negative enough to crop equally off both sides -- clamped instead
+/// to `min_left_margin`, so a graph too wide to fit opens left-aligned
+/// with a little breathing room (reading left-to-right from layer 0)
+/// rather than starting mid-graph with its first layer already scrolled
+/// off to the left.
+pub fn initial_x_offset(
+    viewport_width: f32,
+    graph_width: f32,
+    scale: f32,
+    min_left_margin: f32,
+) -> f32 {
+    let centered = (viewport_width - graph_width * scale) / 2.0;
+    if centered < 0.0 {
+        min_left_margin
+    } else {
+        centered
+    }
+}
+
+/// The offset delta (screen-space) needed to bring `focus_rect`
 /// inside `viewport`, with no animation -- zero if it's already visible.
 /// Pure function of plain rect data, unit-tested below.
 pub fn clamp_into_view(focus_rect: EguiRect, viewport: EguiRect) -> Vec2 {
@@ -759,6 +809,67 @@ mod tests {
         let after = t.to_screen_pos(world_under_anchor);
         assert!((after.x - anchor.x).abs() < 0.001, "x drifted: {after:?}");
         assert!((after.y - anchor.y).abs() < 0.001, "y drifted: {after:?}");
+    }
+
+    #[test]
+    fn graph_width_none_for_empty_layout() {
+        let layout = LayoutResult {
+            rects: HashMap::new(),
+            edges: Vec::new(),
+            layers: Vec::new(),
+            rows: Vec::new(),
+        };
+        assert_eq!(graph_width(&layout), None);
+    }
+
+    #[test]
+    fn graph_width_spans_leftmost_to_rightmost_rect() {
+        let mut rects = HashMap::new();
+        rects.insert(
+            NodeId::from("a"),
+            LRect {
+                origin: LPos { x: 10.0, y: 0.0 },
+                size: layout::Size { w: 20.0, h: 10.0 },
+            },
+        );
+        rects.insert(
+            NodeId::from("b"),
+            LRect {
+                origin: LPos { x: 100.0, y: 0.0 },
+                size: layout::Size { w: 30.0, h: 10.0 },
+            },
+        );
+        let layout = LayoutResult {
+            rects,
+            edges: Vec::new(),
+            layers: Vec::new(),
+            rows: Vec::new(),
+        };
+        // Leftmost edge is a's origin (10.0), rightmost edge is b's origin
+        // + width (100.0 + 30.0 = 130.0) -- span is 120.0.
+        assert_eq!(graph_width(&layout), Some(120.0));
+    }
+
+    #[test]
+    fn initial_x_offset_centers_a_narrower_graph() {
+        // 800px viewport, 400px graph at scale 1.0 -- 200px margin each side.
+        assert_eq!(initial_x_offset(800.0, 400.0, 1.0, 24.0), 200.0);
+    }
+
+    #[test]
+    fn initial_x_offset_accounts_for_scale() {
+        // Same graph zoomed to 2x is 800px wide -- exactly fills the
+        // viewport, so it centers at offset 0.
+        assert_eq!(initial_x_offset(800.0, 400.0, 2.0, 24.0), 0.0);
+    }
+
+    #[test]
+    fn initial_x_offset_clamps_to_left_margin_when_graph_wider_than_viewport() {
+        // 2000px graph in an 800px viewport centers to a large negative
+        // offset (-600) -- clamped up to the left margin instead, so the
+        // graph opens left-aligned with breathing room rather than cropped
+        // symmetrically off both edges.
+        assert_eq!(initial_x_offset(800.0, 2000.0, 1.0, 24.0), 24.0);
     }
 
     #[test]

@@ -154,6 +154,14 @@ pub struct VdiffApp {
     /// The focus [`graph_view::show`]'s auto-pan last ran for -- lets it
     /// fire only when focus actually changes rather than every repaint.
     last_focus: Option<NodeId>,
+    /// Whether [`Self::show_graph_screen`] has already applied the initial
+    /// horizontal-centering pan (see [`graph_view::initial_x_offset`]).
+    /// `false` until the graph's first frame, when the viewport size is
+    /// first known; flipped to `true` right after, so this runs exactly
+    /// once per app lifetime rather than fighting the user's own pan on
+    /// every subsequent repaint (same one-shot concern
+    /// [`graph_view::show`]'s `last_focus` gating documents for auto-pan).
+    initial_view_centered: bool,
     pending_key: Option<Pending>,
     smoke: bool,
     started_at: Instant,
@@ -235,6 +243,7 @@ impl VdiffApp {
             layout,
             transform: Transform::initial(),
             last_focus: None,
+            initial_view_centered: false,
             pending_key: None,
             smoke,
             started_at: Instant::now(),
@@ -627,6 +636,17 @@ impl VdiffApp {
     fn show_graph_screen(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         egui::CentralPanel::default().show(ui, |ui| {
+            if !self.initial_view_centered {
+                if let Some(graph_width) = graph_view::graph_width(&self.layout) {
+                    self.transform.offset.x = graph_view::initial_x_offset(
+                        ui.max_rect().width(),
+                        graph_width,
+                        self.transform.scale,
+                        crate::ui::theme::GRAPH_TOP_PADDING,
+                    );
+                }
+                self.initial_view_centered = true;
+            }
             graph_view::show(
                 ui,
                 &self.app,
