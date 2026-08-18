@@ -1,7 +1,12 @@
 //! h/j/k/l layer navigation over the layered dependency layout: pure,
-//! consulting only the layer structure ([`crate::graph::layers::assign_layers`]'s
-//! output, threaded in as `layers`) -- never layout geometry. h/l move
-//! within a layer's row; j/k move between adjacent layers.
+//! consulting the layer structure ([`crate::graph::layers::assign_layers`]'s
+//! output, threaded in as `layers`) for h/l, and the row structure
+//! ([`crate::graph::layout::rows_with_x_centers`]'s output, threaded in as
+//! `rows`) for j/k. h/l move within a layer's row, ignoring how it wraps
+//! onto screen; j/k move between adjacent *visual* rows (a wrapped layer's
+//! sub-rows count as rows in their own right), landing on the x-nearest
+//! node -- see [`move_focus`]'s doc for why layer structure alone isn't
+//! enough for that.
 
 use crate::graph::model::{NodeId, ProjectGraph};
 
@@ -24,22 +29,36 @@ pub enum Direction {
 
 /// Move focus from `current` in `dir`, returning the new focused node.
 /// `layers` is [`crate::graph::layers::assign_layers`]'s output (one row of
-/// node ids per layer, already ordered root-then-name). Returns `current`
-/// unchanged if it isn't found in `layers` at all (shouldn't happen --
-/// [`crate::core::app::App::layers`] and `focus` are built from the same
-/// graph -- but `FocusSet` defensively rejects synthetic/unknown targets
-/// too, so this stays a safe fallback) or for the no-op cases documented on
-/// [`Direction`]'s variants.
-pub fn move_focus(layers: &[Vec<NodeId>], current: &NodeId, dir: Direction) -> NodeId {
-    let Some((layer_idx, pos_idx)) = locate(layers, current) else {
-        return current.clone();
-    };
-
+/// node ids per layer, already ordered root-then-name) -- `h`/`l` walk it
+/// unchanged, in a layer's node order regardless of how that layer wraps
+/// onto multiple visual rows on screen (a linear "next/previous in this
+/// layer" model, where wrapping across sub-rows is fine). `rows` is
+/// [`crate::graph::layout::rows_with_x_centers`]'s output (one row per
+/// *visual* row -- a wrapped layer contributes multiple entries -- each
+/// node paired with its rect's x-center): `j`/`k` land on the node in the
+/// adjacent visual row whose x-center is nearest `current`'s, which is what
+/// makes `j` step to the node actually below `current` on screen even when
+/// that's a wrapped sub-row of the same layer, not a jump to the next whole
+/// layer (the old fractional-layer-index behavior this replaced could skip
+/// right over it). Returns `current` unchanged if it isn't found in the
+/// relevant structure at all (shouldn't happen --
+/// [`crate::core::app::App::layers`]/`rows` and `focus` are built from the
+/// same graph -- but `FocusSet` defensively rejects synthetic/unknown
+/// targets too, so this stays a safe fallback) or for the no-op cases
+/// documented on [`Direction`]'s variants.
+pub fn move_focus(
+    layers: &[Vec<NodeId>],
+    rows: &[Vec<(NodeId, f32)>],
+    current: &NodeId,
+    dir: Direction,
+) -> NodeId {
     match dir {
-        Direction::Left => step_within_row(layers, layer_idx, pos_idx, -1),
-        Direction::Right => step_within_row(layers, layer_idx, pos_idx, 1),
-        Direction::Up => step_to_layer(layers, layer_idx, pos_idx, -1),
-        Direction::Down => step_to_layer(layers, layer_idx, pos_idx, 1),
+        Direction::Left => locate(layers, current)
+            .and_then(|(layer_idx, pos_idx)| step_within_row(layers, layer_idx, pos_idx, -1)),
+        Direction::Right => locate(layers, current)
+            .and_then(|(layer_idx, pos_idx)| step_within_row(layers, layer_idx, pos_idx, 1)),
+        Direction::Up => step_to_visual_row(rows, current, -1),
+        Direction::Down => step_to_visual_row(rows, current, 1),
     }
     .unwrap_or_else(|| current.clone())
 }
@@ -70,31 +89,38 @@ fn step_within_row(
     row.get(new_pos as usize).cloned()
 }
 
-/// Move to `layers[layer_idx + delta]` (`delta` is `1` or `-1`), landing on
-/// the node at the same fractional position within that row: `pos_idx *
-/// target_len / current_len`, clamped to the target row's last index. A
-/// cheap "stay roughly above/below" without consulting layout geometry.
-/// `None` if `layer_idx + delta` is out of bounds or the target layer is
-/// empty (shouldn't happen -- `assign_layers` never emits an empty layer).
-fn step_to_layer(
-    layers: &[Vec<NodeId>],
-    layer_idx: usize,
-    pos_idx: usize,
-    delta: i32,
-) -> Option<NodeId> {
-    let target_idx = layer_idx as i32 + delta;
-    if target_idx < 0 || target_idx as usize >= layers.len() {
+/// Find `id`'s `(row_idx, x_center)` in `rows`.
+fn locate_in_rows(rows: &[Vec<(NodeId, f32)>], id: &NodeId) -> Option<(usize, f32)> {
+    for (row_idx, row) in rows.iter().enumerate() {
+        if let Some((_, x_center)) = row.iter().find(|(node_id, _)| node_id == id) {
+            return Some((row_idx, *x_center));
+        }
+    }
+    None
+}
+
+/// Move to `rows[row_idx + delta]` (`delta` is `1` or `-1`), landing on the
+/// node whose x-center is nearest `current`'s -- ties broken toward the
+/// earlier (leftmost) candidate for determinism. `None` if `current` isn't
+/// in `rows`, `row_idx + delta` is out of bounds, or the target row is
+/// empty (shouldn't happen -- [`crate::graph::layout::layout`] never emits
+/// an empty row).
+fn step_to_visual_row(rows: &[Vec<(NodeId, f32)>], current: &NodeId, delta: i32) -> Option<NodeId> {
+    let (row_idx, current_x) = locate_in_rows(rows, current)?;
+    let target_idx = row_idx as i32 + delta;
+    if target_idx < 0 || target_idx as usize >= rows.len() {
         return None;
     }
-    let target_idx = target_idx as usize;
-    let target_row = &layers[target_idx];
-    if target_row.is_empty() {
-        return None;
-    }
-    let current_len = layers[layer_idx].len().max(1);
-    let target_len = target_row.len();
-    let target_pos = (pos_idx * target_len / current_len).min(target_len - 1);
-    target_row.get(target_pos).cloned()
+    let target_row = &rows[target_idx as usize];
+    target_row
+        .iter()
+        .min_by(|(_, a), (_, b)| {
+            (a - current_x)
+                .abs()
+                .partial_cmp(&(b - current_x).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(id, _)| id.clone())
 }
 
 /// Outgoing dependency targets of `node`: the `to` end of every edge whose
@@ -153,59 +179,100 @@ mod tests {
     }
 
     /// Three layers: `[app, zzz]`, `[a, b]`, `[x]` -- enough rows/lengths to
-    /// exercise clamping (row-end no-ops) and the fractional j/k landing
-    /// (2 -> 1 nodes and 1 -> 2 nodes).
+    /// exercise clamping (row-end no-ops) for `h`/`l`, which walk `layers`
+    /// unchanged regardless of visual wrapping.
     fn layers_fixture() -> Vec<Vec<NodeId>> {
         vec![row(&["app", "zzz"]), row(&["a", "b"]), row(&["x"])]
+    }
+
+    fn xy(name: &str, x: f32) -> (NodeId, f32) {
+        (id(name), x)
+    }
+
+    /// Three *visual* rows, deliberately not a 1:1 mapping with any layer
+    /// list: layer 0 wraps onto two sub-rows (`p1`/`p2` then `p3`/`p4`,
+    /// matching x-columns 10/100 in both), then a single-row layer 1
+    /// (`q1` at x=50) -- exactly the shape `j`/`k` must navigate correctly
+    /// (a wrapped sub-row within one layer, immediately followed by the
+    /// next layer's row).
+    fn rows_fixture() -> Vec<Vec<(NodeId, f32)>> {
+        vec![
+            vec![xy("p1", 10.0), xy("p2", 100.0)],
+            vec![xy("p3", 10.0), xy("p4", 100.0)],
+            vec![xy("q1", 50.0)],
+        ]
     }
 
     #[test]
     fn right_and_left_move_within_a_row_no_wrap() {
         let layers = layers_fixture();
-        assert_eq!(move_focus(&layers, &id("app"), Direction::Right), id("zzz"));
         assert_eq!(
-            move_focus(&layers, &id("zzz"), Direction::Right),
+            move_focus(&layers, &[], &id("app"), Direction::Right),
+            id("zzz")
+        );
+        assert_eq!(
+            move_focus(&layers, &[], &id("zzz"), Direction::Right),
             id("zzz"),
             "no-op at row end"
         );
-        assert_eq!(move_focus(&layers, &id("zzz"), Direction::Left), id("app"));
         assert_eq!(
-            move_focus(&layers, &id("app"), Direction::Left),
+            move_focus(&layers, &[], &id("zzz"), Direction::Left),
+            id("app")
+        );
+        assert_eq!(
+            move_focus(&layers, &[], &id("app"), Direction::Left),
             id("app"),
             "no-op at row start"
         );
     }
 
     #[test]
-    fn down_and_up_move_between_layers_at_fractional_position() {
-        let layers = layers_fixture();
-        // layer 0 pos 0 (of 2) -> layer 1 (of 2): 0*2/2 = 0 -> "a".
-        assert_eq!(move_focus(&layers, &id("app"), Direction::Down), id("a"));
-        // layer 0 pos 1 (of 2) -> layer 1 (of 2): 1*2/2 = 1 -> "b".
-        assert_eq!(move_focus(&layers, &id("zzz"), Direction::Down), id("b"));
-        // layer 1 pos 1 (of 2) -> layer 2 (of 1): 1*1/2 = 0 -> "x".
-        assert_eq!(move_focus(&layers, &id("b"), Direction::Down), id("x"));
-        // layer 2 pos 0 (of 1) -> layer 1 (of 2): 0*2/1 = 0 -> "a".
-        assert_eq!(move_focus(&layers, &id("x"), Direction::Up), id("a"));
+    fn down_lands_on_the_node_directly_below_in_a_wrapped_sub_row() {
+        // `j` from `p1` (x=10) must land on `p3` (same column, next visual
+        // row) -- not skip past it to layer 1's `q1` the way the old
+        // fractional-layer-index `j` would have (it only ever consulted
+        // whole layers, never wrapped sub-rows).
+        let rows = rows_fixture();
+        assert_eq!(move_focus(&[], &rows, &id("p1"), Direction::Down), id("p3"));
+        assert_eq!(move_focus(&[], &rows, &id("p2"), Direction::Down), id("p4"));
     }
 
     #[test]
-    fn down_noop_on_last_layer_up_noop_on_first_layer() {
-        let layers = layers_fixture();
-        assert_eq!(move_focus(&layers, &id("x"), Direction::Down), id("x"));
-        assert_eq!(move_focus(&layers, &id("app"), Direction::Up), id("app"));
-        assert_eq!(move_focus(&layers, &id("zzz"), Direction::Up), id("zzz"));
+    fn down_crosses_from_the_last_wrapped_sub_row_into_the_next_layer() {
+        // `p3`/`p4` are the last visual row of layer 0's wrapped band --
+        // `j` from there must reach layer 1's row (`q1`), landing on
+        // whichever is x-nearest.
+        let rows = rows_fixture();
+        assert_eq!(move_focus(&[], &rows, &id("p3"), Direction::Down), id("q1"));
+        assert_eq!(move_focus(&[], &rows, &id("p4"), Direction::Down), id("q1"));
+    }
+
+    #[test]
+    fn up_lands_on_the_x_nearest_node_in_the_row_above() {
+        // From `q1` (x=50), the row above is `p3`/`p4` (x=10/x=100): `p3`
+        // is closer (distance 40 vs 50), so `k` lands there.
+        let rows = rows_fixture();
+        assert_eq!(move_focus(&[], &rows, &id("q1"), Direction::Up), id("p3"));
+    }
+
+    #[test]
+    fn down_noop_on_last_row_up_noop_on_first_row() {
+        let rows = rows_fixture();
+        assert_eq!(move_focus(&[], &rows, &id("q1"), Direction::Down), id("q1"));
+        assert_eq!(move_focus(&[], &rows, &id("p1"), Direction::Up), id("p1"));
+        assert_eq!(move_focus(&[], &rows, &id("p2"), Direction::Up), id("p2"));
     }
 
     #[test]
     fn unknown_node_returns_itself() {
         let layers = layers_fixture();
+        let rows = rows_fixture();
         assert_eq!(
-            move_focus(&layers, &id("ghost"), Direction::Right),
+            move_focus(&layers, &rows, &id("ghost"), Direction::Right),
             id("ghost")
         );
         assert_eq!(
-            move_focus(&layers, &id("ghost"), Direction::Down),
+            move_focus(&layers, &rows, &id("ghost"), Direction::Down),
             id("ghost")
         );
     }

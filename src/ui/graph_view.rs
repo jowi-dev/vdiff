@@ -715,6 +715,7 @@ mod tests {
             rects,
             edges: vec![],
             layers: vec![vec![NodeId::from("a"), NodeId::from("b")]],
+            rows: vec![vec![NodeId::from("a"), NodeId::from("b")]],
         };
 
         let extent = layer_extent(&layout.layers[0], &layout);

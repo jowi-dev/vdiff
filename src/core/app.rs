@@ -9,7 +9,7 @@
 pub use crate::core::diff_state::DiffPaneState;
 use crate::core::file_view::FileViewState;
 use crate::core::focus::{dep_targets, dependent_sources, move_focus, Direction};
-use crate::graph::layers::assign_layers;
+use crate::graph::layout::{layout, rows_with_x_centers};
 use crate::graph::model::{NodeId, ProjectGraph};
 use crate::graph::test_modules::hide_test_modules;
 
@@ -65,6 +65,15 @@ pub struct App {
     /// hand it in rather than `core` recomputing it from `graph` on every
     /// navigation step.
     pub layers: Vec<Vec<NodeId>>,
+    /// [`crate::graph::layout::rows_with_x_centers`]'s output for the
+    /// current `visible_graph()`'s layout: one entry per *visual* row (a
+    /// wrapped layer contributes multiple rows here, unlike `layers`),
+    /// each node paired with its rect's x-center. Computed once by the
+    /// caller alongside `layers` (see `layers`'s own doc) and consulted by
+    /// [`Msg::FocusMove`]'s `j`/`k` (via
+    /// [`crate::core::focus::move_focus`]) so a wrapped sub-row navigates
+    /// correctly instead of jumping a whole layer.
+    pub rows: Vec<Vec<(NodeId, f32)>>,
     /// The currently focused node.
     pub focus: NodeId,
     /// The screen currently shown.
@@ -257,7 +266,7 @@ pub fn update(mut app: App, msg: Msg) -> (App, Cmd) {
                 return (app, Cmd::None);
             }
             let old_focus = app.focus.clone();
-            app.focus = move_focus(&app.layers, &app.focus, dir);
+            app.focus = move_focus(&app.layers, &app.rows, &app.focus, dir);
             let cmd = reload_file_on_focus_change(&app, &old_focus);
             (app, cmd)
         }
@@ -395,16 +404,21 @@ pub fn update(mut app: App, msg: Msg) -> (App, Cmd) {
     }
 }
 
-/// Handle [`Msg::ToggleTests`]: flip `show_tests`, recompute `layers` from
-/// [`App::visible_graph`], and re-seat focus (see [`reseat_focus`]) if it's
-/// no longer drawn.
+/// Handle [`Msg::ToggleTests`]: flip `show_tests`, recompute `layers`/`rows`
+/// from a full [`crate::graph::layout::layout`] pass over
+/// [`App::visible_graph`] (rather than calling `assign_layers` separately --
+/// this is also what keeps `layers`/`rows` from drifting out of sync with
+/// each other, since they're now two views of the same [`LayoutResult`]),
+/// and re-seat focus (see [`reseat_focus`]) if it's no longer drawn.
 fn toggle_tests(mut app: App) -> (App, Cmd) {
     if !on_graph_with_no_picker_and_graph_pane(&app) {
         return (app, Cmd::None);
     }
     app.show_tests = !app.show_tests;
     let old_layers = std::mem::take(&mut app.layers);
-    app.layers = assign_layers(&app.visible_graph());
+    let result = layout(&app.visible_graph());
+    app.rows = rows_with_x_centers(&result);
+    app.layers = result.layers;
     if !app.is_drawn(&app.focus) {
         app.focus = reseat_focus(&old_layers, &app.layers, &app.focus);
     }
@@ -659,10 +673,12 @@ mod tests {
 
     fn app_at(focus: &str) -> App {
         let graph = graph_fixture();
-        let layers = crate::graph::layers::assign_layers(&graph);
+        let result = crate::graph::layout::layout(&graph);
+        let rows = crate::graph::layout::rows_with_x_centers(&result);
         App {
             graph,
-            layers,
+            layers: result.layers,
+            rows,
             focus: NodeId::from(focus),
             screen: Screen::Graph,
             diff: None,
@@ -1054,9 +1070,12 @@ mod tests {
     fn toggle_tests_reveals_hidden_test_node_and_recomputes_layers() {
         let g = graph_fixture_with_test_node();
         let visible = crate::graph::test_modules::hide_test_modules(&g).0;
+        let result = crate::graph::layout::layout(&visible);
+        let rows = crate::graph::layout::rows_with_x_centers(&result);
         let app = App {
             graph: g,
-            layers: crate::graph::layers::assign_layers(&visible),
+            layers: result.layers,
+            rows,
             focus: NodeId::from("leaf_a"),
             screen: Screen::Graph,
             diff: None,
@@ -1089,8 +1108,11 @@ mod tests {
     #[test]
     fn toggle_tests_reseats_focus_when_the_focused_node_becomes_hidden() {
         let g = graph_fixture_with_test_node();
+        let result = crate::graph::layout::layout(&g);
+        let rows = crate::graph::layout::rows_with_x_centers(&result);
         let app = App {
-            layers: crate::graph::layers::assign_layers(&g),
+            layers: result.layers,
+            rows,
             graph: g,
             focus: NodeId::from("test_x"),
             screen: Screen::Graph,

@@ -120,6 +120,36 @@ pub struct LayoutResult {
     pub rects: HashMap<NodeId, Rect>,
     pub edges: Vec<EdgePath>,
     pub layers: Vec<Vec<NodeId>>,
+    /// Every *visual* row across the whole layout, top-to-bottom, each in
+    /// left-to-right order: unlike `layers`, a layer that wrapped onto
+    /// multiple sub-rows (see [`pack_rows`]) contributes one entry per
+    /// sub-row here, not one entry for the whole layer. This is what lets
+    /// [`crate::core::focus::move_focus`]'s `j`/`k` navigate by the row the
+    /// user actually sees instead of jumping a whole wrapped layer at once
+    /// -- see [`rows_with_x_centers`], which is what actually gets threaded
+    /// into `core::App` (as plain ids + x-centers, not `Rect`s, keeping
+    /// `core` geometry-free beyond that).
+    pub rows: Vec<Vec<NodeId>>,
+}
+
+/// `layout.rows` paired with each node's rect x-center, in the same
+/// row/left-to-right order -- the shape [`crate::core::focus::move_focus`]
+/// actually consults for row-based `j`/`k` (see [`LayoutResult::rows`]'s
+/// doc). A node absent from `layout.rects` (shouldn't happen for a drawn
+/// node) is skipped rather than panicking.
+pub fn rows_with_x_centers(layout: &LayoutResult) -> Vec<Vec<(NodeId, f32)>> {
+    layout
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .filter_map(|id| {
+                    let center_x = layout.rects.get(id)?.center().x;
+                    Some((id.clone(), center_x))
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Lay out an entire project graph: assign layers, pack each layer into a
@@ -153,10 +183,12 @@ pub fn layout(graph: &ProjectGraph) -> LayoutResult {
         .fold(0.0_f32, f32::max);
 
     let mut rects = HashMap::new();
+    let mut visual_rows: Vec<Vec<NodeId>> = Vec::new();
     let mut cursor_y = 0.0_f32;
     for (rows, band_size) in &bands {
         for row in rows {
             let shift_x = (graph_width - row.width) / 2.0;
+            let mut row_ids = Vec::with_capacity(row.items.len());
             for (id, pos, size) in &row.items {
                 rects.insert(
                     id.clone(),
@@ -168,7 +200,9 @@ pub fn layout(graph: &ProjectGraph) -> LayoutResult {
                         size: *size,
                     },
                 );
+                row_ids.push(id.clone());
             }
+            visual_rows.push(row_ids);
         }
         cursor_y += band_size.h + BAND_GAP;
     }
@@ -179,6 +213,7 @@ pub fn layout(graph: &ProjectGraph) -> LayoutResult {
         rects,
         edges,
         layers,
+        rows: visual_rows,
     }
 }
 
@@ -501,6 +536,54 @@ mod tests {
         let result = layout(&graph);
 
         assert_eq!(result.rects[&NodeId::from("a")].size.w, LEAF_W);
+    }
+
+    #[test]
+    fn rows_field_has_one_entry_per_wrapped_sub_row_not_per_layer() {
+        // Same fixture as `no_overlaps_within_a_band_even_when_it_wraps`:
+        // 40 unconnected nodes land in a single trailing layer, but wrap
+        // onto >=2 visual rows. `layers` has exactly one entry (the whole
+        // layer); `rows` must have one entry per wrapped sub-row instead,
+        // and every id from the layer must appear in exactly one row.
+        let ids: Vec<String> = (0..40).map(|i| format!("n{i:02}")).collect();
+        let entries: Vec<(NodeId, ModuleNode)> = ids.iter().map(|id| leaf(id, id, None)).collect();
+        let roots: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let graph = graph_from(entries, roots);
+
+        let result = layout(&graph);
+
+        assert_eq!(result.layers.len(), 1, "sanity: one layer");
+        assert!(
+            result.rows.len() >= 2,
+            "expected the layer to wrap onto >=2 visual rows, got {}",
+            result.rows.len()
+        );
+
+        let mut flattened: Vec<NodeId> = result.rows.iter().flatten().cloned().collect();
+        let mut expected: Vec<NodeId> = ids.iter().map(|s| NodeId::from(s.as_str())).collect();
+        flattened.sort();
+        expected.sort();
+        assert_eq!(flattened, expected, "every id appears in exactly one row");
+    }
+
+    #[test]
+    fn rows_with_x_centers_pairs_each_row_id_with_its_rect_center_x() {
+        let mut graph = graph_from(
+            vec![leaf("a", "a", None), leaf("b", "b", None)],
+            vec!["a", "b"],
+        );
+        graph.edges = vec![edge("a", "b")];
+
+        let result = layout(&graph);
+        let centers = rows_with_x_centers(&result);
+
+        assert_eq!(centers.len(), result.rows.len());
+        for (row, center_row) in result.rows.iter().zip(centers.iter()) {
+            for (id, (center_id, cx)) in row.iter().zip(center_row.iter()) {
+                assert_eq!(id, center_id);
+                assert_eq!(*cx, result.rects[id].center().x);
+            }
+        }
     }
 
     #[test]

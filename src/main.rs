@@ -150,6 +150,7 @@ fn run_gui(
     let app = App {
         graph,
         layers: layout_result.layers.clone(),
+        rows: vdiff::graph::layout::rows_with_x_centers(&layout_result),
         focus,
         screen: Screen::Graph,
         diff: None,
