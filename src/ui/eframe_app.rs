@@ -12,8 +12,9 @@
 //! instead of growing `crate::keymap::KeyInput` with a variant the reducer
 //! would never act on.
 //!
-//! The embedded-nvim spike (`--nvim`, see [`crate::nvim`]) is the other
-//! exception: when [`VdiffApp::nvim`] is `Some` and keyboard focus is on
+//! The embedded-nvim mode (default-on, `--no-nvim` to opt out; see
+//! [`crate::nvim`]) is the other exception: when [`VdiffApp::nvim`] is
+//! `Some` and keyboard focus is on
 //! [`Pane::File`], raw egui input bypasses `map_key` entirely in favor of
 //! [`VdiffApp::handle_nvim_keys`], which delegates the actual event
 //! processing to the pure [`crate::ui::nvim_pane::process_nvim_events`] --
@@ -166,8 +167,9 @@ pub struct VdiffApp {
     smoke: bool,
     started_at: Instant,
     diff_loader: DiffLoader,
-    /// The live embedded-nvim session, if `--nvim` was given and an `nvim`
-    /// binary was found (see `main.rs`'s startup decision). Once `Some`,
+    /// The live embedded-nvim session, if nvim mode is on (the default,
+    /// unless `--no-nvim` was given) and an `nvim` binary was found (see
+    /// `main.rs`'s startup decision). Once `Some`,
     /// stays `Some` for the lifetime of the app even if the underlying
     /// process dies -- see [`Self::logic`]/[`Self::respawn_nvim`]; a dead
     /// session is replaced in place, never dropped down to `None` (unless
@@ -201,10 +203,10 @@ pub struct VdiffApp {
     /// diffable real file (an unnamed/scratch buffer). Without it, either
     /// of those cases would have nothing to fall back to at all.
     nvim_current_file: Option<std::path::PathBuf>,
-    /// Whether the "comments require --nvim" stderr note has already been
-    /// printed this run -- [`Self::comment_node`] prints it at most once
-    /// (repeating it on every `c` press outside nvim mode would just be
-    /// noise) rather than tracking it any more elaborately.
+    /// Whether the "comments require nvim mode" stderr note has already
+    /// been printed this run -- [`Self::comment_node`] prints it at most
+    /// once (repeating it on every `c` press outside nvim mode would just
+    /// be noise) rather than tracking it any more elaborately.
     warned_comments_need_nvim: bool,
     /// Whether the "commenting requires the vdiff.nvim plugin" stderr hint
     /// has already been printed this run -- distinct from
@@ -217,9 +219,9 @@ pub struct VdiffApp {
 
 /// Everything [`VdiffApp::new`] needs to set up (and later respawn) the
 /// embedded-nvim spike, bundled to keep the constructor's arg count sane.
-/// `pane` is `None` when `--nvim` wasn't given or no `nvim` binary was
-/// found -- see `main.rs`'s startup decision -- in which case the rest of
-/// the fields are unused.
+/// `pane` is `None` when nvim mode is off (`--no-nvim` was given) or no
+/// `nvim` binary was found -- see `main.rs`'s startup decision -- in which
+/// case the rest of the fields are unused.
 pub struct NvimConfig {
     /// An already-spawned embedded session, or `None` to run in the
     /// built-in-viewer-only mode this struct otherwise doesn't touch.
@@ -352,9 +354,9 @@ impl VdiffApp {
     ///
     /// Two distinct fallbacks, kept separate: outside nvim mode entirely
     /// there's no embedded session to delegate to at all, so this keeps the
-    /// pre-existing "comments require --nvim" note (unchanged, still gated
-    /// by [`Self::warned_comments_need_nvim`]); inside nvim mode but with
-    /// `vdiff.nvim` not installed (delegation returns `false` -- `require`
+    /// pre-existing "comments require nvim mode" note (unchanged, still
+    /// gated by [`Self::warned_comments_need_nvim`]); inside nvim mode but
+    /// with `vdiff.nvim` not installed (delegation returns `false` -- `require`
     /// failed, or the module has no `comment_range`), it prints the plugin
     /// hint instead (gated by [`Self::warned_missing_comment_plugin`],
     /// separately, since these are different diagnoses a user would fix
@@ -362,7 +364,7 @@ impl VdiffApp {
     fn comment_node(&mut self, node: NodeId) {
         if self.nvim.is_none() {
             if !self.warned_comments_need_nvim {
-                eprintln!("note: comments require --nvim");
+                eprintln!("note: comments require nvim mode (see --no-nvim)");
                 self.warned_comments_need_nvim = true;
             }
             return;

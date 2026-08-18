@@ -33,8 +33,8 @@ nix develop
 ## Quickstart
 
 ```sh
-vdiff                  # open the graph for the current repo's change set
-vdiff --nvim           # same, but file panes are a real embedded Neovim
+vdiff                  # open the graph for the current repo's change set; file panes are a real embedded Neovim
+vdiff --no-nvim        # same, but file panes use the built-in read-only viewer instead
 vdiff --base main      # diff against a specific ref instead of the detected default branch
 ```
 
@@ -59,9 +59,10 @@ available yet.
 
 vdiff itself doesn't capture comments — that's the job of a companion
 Neovim plugin, [`vdiff.nvim`](https://github.com/jowi-dev/vdiff.nvim). Since
-`--nvim` runs your own Neovim config, installing that plugin normally makes
-`:VdiffComment` and the `c` key work inside vdiff automatically, with no
-extra wiring. Comments are stored at `<git-dir>/vdiff/comments.json` — see
+the default embedded-nvim mode runs your own Neovim config, installing that
+plugin normally makes `:VdiffComment` and the `c` key work inside vdiff
+automatically, with no extra wiring. Comments are stored at
+`<git-dir>/vdiff/comments.json` — see
 [`docs/comments-schema.md`](docs/comments-schema.md) for the exact format.
 
 vdiff reads that store back out with:

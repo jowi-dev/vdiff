@@ -108,8 +108,8 @@ pub enum NvimCmd {
     ExecLua(String),
 }
 
-/// Whether an `nvim` binary is on `PATH` -- gates `--nvim` falling back to
-/// the built-in file viewer instead of failing to spawn.
+/// Whether an `nvim` binary is on `PATH` -- gates nvim mode (on by default)
+/// falling back to the built-in file viewer instead of failing to spawn.
 pub fn nvim_available() -> bool {
     which::which("nvim").is_ok()
 }

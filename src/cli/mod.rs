@@ -44,10 +44,11 @@ pub struct Cli {
     #[arg(long)]
     pub all: bool,
     /// Replace the built-in read-only file viewer with a real embedded
-    /// `nvim --embed` instance (see [`crate::nvim`]). Falls back to the
-    /// built-in viewer with a stderr warning if no `nvim` binary is found
-    /// on `PATH`.
-    #[arg(long)]
+    /// `nvim --embed` instance (see [`crate::nvim`]). On by default. Falls
+    /// back to the built-in viewer with a stderr warning if no `nvim`
+    /// binary is found on `PATH`. Pass `--no-nvim` to opt out and use the
+    /// legacy built-in viewer instead.
+    #[arg(long = "no-nvim", action = clap::ArgAction::SetFalse)]
     pub nvim: bool,
     /// Ex command to run in the embedded nvim after startup (repeatable --
     /// pass `--nvim-cmd` multiple times to run several, in order). Runs
@@ -56,8 +57,8 @@ pub struct Cli {
     /// opens. A failing command is logged to stderr as a warning, never
     /// fatal. Example: `--nvim-cmd ContextWindowHide` to silence a plugin
     /// that's noisy only inside vdiff's embedded instance. Ignored (with no
-    /// warning) unless `--nvim` is also given and a usable `nvim` was
-    /// found.
+    /// warning) unless a usable `nvim` was found (nvim mode is on by
+    /// default) and `--no-nvim` wasn't given.
     #[arg(long = "nvim-cmd")]
     pub nvim_cmd: Vec<String>,
     /// Print every captured review comment (see

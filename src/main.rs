@@ -166,11 +166,11 @@ fn dump(
 /// name. `smoke` closes the window after a couple seconds instead of
 /// waiting for the user, for headless-ish startup verification.
 /// `diff_loader` backs `Cmd::LoadDiff` once a node's diff pane is opened.
-/// `want_nvim` is the `--nvim` flag: if set but no `nvim` binary is on
-/// `PATH`, prints a warning and falls back to the built-in file viewer
-/// rather than failing to start. `nvim_cmd` is `--nvim-cmd`'s Ex commands,
-/// run after every attach/respawn; ignored (silently) when nvim mode isn't
-/// active.
+/// `want_nvim` is the `nvim` field (on by default; `--no-nvim` clears it):
+/// if set but no `nvim` binary is on `PATH`, prints a warning and falls
+/// back to the built-in file viewer rather than failing to start.
+/// `nvim_cmd` is `--nvim-cmd`'s Ex commands, run after every attach/
+/// respawn; ignored (silently) when nvim mode isn't active.
 fn run_gui(
     graph: ProjectGraph,
     repo_path: &Path,
@@ -180,7 +180,7 @@ fn run_gui(
     diff_loader: DiffLoader,
 ) -> ExitCode {
     if want_nvim && !nvim_available() {
-        eprintln!("warning: --nvim given but no `nvim` binary found on PATH; falling back to the built-in file viewer");
+        eprintln!("warning: nvim mode is on by default but no `nvim` binary was found on PATH; falling back to the built-in file viewer");
     }
     let want_nvim = want_nvim && nvim_available();
     let repo_root = repo_path.to_path_buf();
