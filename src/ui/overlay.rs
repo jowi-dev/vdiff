@@ -1,15 +1,18 @@
 //! Fullscreen editor overlay: when [`Pane::File`] is the active pane, this
-//! paints on top of the already-rendered graph -- a scrim over the whole
-//! viewport, then an opaque header strip, then the editor content (the nvim
-//! grid, or the built-in [`file_view`] as a fallback) below it.
+//! paints on top of the already-rendered graph -- an opaque header strip,
+//! then the editor content (the nvim grid, or the built-in [`file_view`] as
+//! a fallback) below it. There is no separate full-viewport scrim: the
+//! editor content itself paints its backgrounds translucent (see
+//! [`theme::EDITOR_BG_ALPHA`]'s doc), which is what lets the graph show
+//! through as a faint ambient glow. The header strip is the one exception,
+//! staying fully opaque -- solid UI chrome, not part of that surface.
 //!
 //! This replaced a resizable 50%-width side panel. Rationale (decided with
 //! the user): the graph and the editor answer different questions, and
 //! splitting the viewport taxes both -- fullscreen nvim also fixes
-//! plugins/UIs that feel cramped at half width. The scrim is a continuity
-//! cue ("the graph is still there, dimmed"), not an information channel --
-//! see [`theme::OVERLAY_SCRIM_ALPHA`]'s doc for why it leans nearly opaque
-//! rather than something you're meant to read through.
+//! plugins/UIs that feel cramped at half width. The see-through content is
+//! a continuity cue ("the graph is still there, dimmed"), not an
+//! information channel -- legibility of the editor's own text always wins.
 
 use egui::{Align2, FontId, Pos2, Rect, Ui, UiBuilder, Vec2};
 
@@ -28,10 +31,14 @@ const HEADER_PADDING: f32 = 8.0;
 
 /// Paint the fullscreen overlay into `ui`'s current `max_rect` (the whole
 /// viewport -- the graph has already been painted underneath by the
-/// caller): scrim, header strip, then editor content in whatever's left.
+/// caller): opaque header strip, then editor content in whatever's left.
 /// `nvim` selects the content: `Some` paints the live nvim grid via
-/// [`nvim_pane::show`]; `None` falls back to the built-in
-/// [`file_view::show`]. Returns the row count the built-in viewer fit into
+/// [`nvim_pane::show`], whose own per-cell backgrounds are translucent, so
+/// nothing further is painted here; `None` falls back to the built-in
+/// [`file_view::show`], which paints no background of its own, so this
+/// function paints one translucent panel wash behind it first (see
+/// [`theme::EDITOR_BG_ALPHA`]) to give both modes the same "graph shows
+/// through" treatment. Returns the row count the built-in viewer fit into
 /// its content area (for [`App::viewport_rows`]'s `Ctrl-d`/`Ctrl-u`
 /// half-page math) -- `None` in nvim mode, which doesn't use it.
 pub fn show(
@@ -41,8 +48,6 @@ pub fn show(
     nvim: Option<&mut NvimPane>,
 ) -> Option<usize> {
     let screen_rect = ui.max_rect();
-    ui.painter()
-        .rect_filled(screen_rect, 0.0, theme::overlay_scrim_color());
 
     let header_rect = Rect::from_min_size(
         screen_rect.min,
@@ -71,7 +76,16 @@ pub fn show(
             nvim_pane::show(&mut content_ui, nvim_pane);
             None
         }
-        None => Some(file_view::show(&mut content_ui, file_view_state)),
+        None => {
+            // nvim's own cell backgrounds are what make it translucent;
+            // the built-in viewer paints no background at all, so it needs
+            // this wash to match -- painted once, covering exactly the
+            // content area (not the whole screen), so there's nothing here
+            // for a second translucent layer to stack under.
+            ui.painter()
+                .rect_filled(content_rect, 0.0, theme::translucent(theme::CANVAS_BG));
+            Some(file_view::show(&mut content_ui, file_view_state))
+        }
     }
 }
 

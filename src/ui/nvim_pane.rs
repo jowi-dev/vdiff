@@ -18,6 +18,7 @@ use rmpv::Value;
 
 use crate::nvim::grid::GridState;
 use crate::nvim::session::{NvimCmd, NvimSession};
+use crate::ui::theme;
 
 /// The monospace font size the grid is painted at. Fixed for this spike --
 /// no font-size settings/zoom.
@@ -261,7 +262,14 @@ pub fn show(ui: &mut Ui, pane: &mut NvimPane) {
 }
 
 /// Paint one row, batching consecutive same-highlight cells into a single
-/// background rect + text run rather than one draw call per cell.
+/// background rect + text run rather than one draw call per cell. The
+/// background rect is painted translucent (see [`theme::translucent`]) --
+/// this is the fix for the fullscreen editor overlay reading as fully
+/// opaque no matter how the scrim alpha was tuned: an opaque cell
+/// background here used to paint over the entire content area every frame,
+/// covering whatever the overlay drew underneath regardless of that
+/// constant. Foreground text stays fully opaque -- only backgrounds get the
+/// alpha treatment.
 fn paint_row(
     painter: &egui::Painter,
     grid: &GridState,
@@ -293,7 +301,7 @@ fn paint_row(
             origin + Vec2::new(run_start as f32 * char_width, row as f32 * row_height),
             Vec2::new((col - run_start) as f32 * char_width, row_height),
         );
-        painter.rect_filled(rect, 0.0, bg);
+        painter.rect_filled(rect, 0.0, theme::translucent(bg));
         painter.text(rect.min, egui::Align2::LEFT_TOP, &text, font_id.clone(), fg);
     }
 }

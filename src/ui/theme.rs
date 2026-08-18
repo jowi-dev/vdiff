@@ -114,25 +114,38 @@ pub fn focus_ring_stroke() -> Stroke {
     Stroke::new(2.0, FOCUS_RING)
 }
 
-/// Alpha (`0..=255`) of the scrim painted over the graph when the
-/// fullscreen editor overlay ([`crate::ui::overlay`]) is open -- ~85%
-/// opaque, so the graph reads as a faint ambient glow behind the editor
-/// rather than a genuinely visible second information channel (text
-/// legibility over whatever colorscheme/content is on top wins over any
-/// amount of "see-through" -- this is a continuity cue, not something the
-/// user is meant to read through). Tunable in one place if that balance
-/// ever needs to shift.
-pub const OVERLAY_SCRIM_ALPHA: u8 = 217;
+/// Alpha (`0..=255`) applied to every *background* the fullscreen editor
+/// overlay ([`crate::ui::overlay`]) paints over the already-drawn graph --
+/// the nvim grid's per-cell backgrounds ([`crate::ui::nvim_pane`]) and the
+/// built-in file viewer's panel wash alike -- so the editor reads as one
+/// ~85% opaque surface with the graph showing through as a faint ambient
+/// glow. Text glyphs and the cursor block are painted fully opaque
+/// regardless (see [`crate::ui::nvim_pane::show`]) -- only backgrounds get
+/// this alpha, since legibility of the text itself is non-negotiable.
+///
+/// There is deliberately only **one** alpha constant in this story. An
+/// earlier revision painted a separate full-viewport scrim *underneath* the
+/// editor content's own (fully opaque) backgrounds; lowering the scrim's
+/// alpha did nothing observable because the opaque content painted on top
+/// of it still covered 100% of the pixels. This revision removes that
+/// scrim entirely -- the editor's content backgrounds (translucent via
+/// [`translucent`]) are themselves what let the graph show through, so
+/// there is nothing left to stack multiplicatively into double-dimming.
+/// The one thing that stays fully opaque is the header strip
+/// ([`OVERLAY_HEADER_BG`]) -- solid UI chrome, not part of the
+/// "graph shows through" surface.
+pub const EDITOR_BG_ALPHA: u8 = 217;
 
-/// The scrim color the overlay paints over the whole viewport before its
-/// header/content -- [`CANVAS_BG`] at [`OVERLAY_SCRIM_ALPHA`].
-pub fn overlay_scrim_color() -> Color32 {
-    Color32::from_rgba_unmultiplied(
-        CANVAS_BG.r(),
-        CANVAS_BG.g(),
-        CANVAS_BG.b(),
-        OVERLAY_SCRIM_ALPHA,
-    )
+/// `bg` with its alpha channel replaced by [`EDITOR_BG_ALPHA`], rgb
+/// untouched. The one function every translucent-background paint call in
+/// the editor overlay goes through (nvim cell backgrounds, the built-in
+/// viewer's panel wash) -- see [`EDITOR_BG_ALPHA`]'s doc for why there is
+/// only one alpha in this whole story. For a reverse-video cell, callers
+/// swap fg/bg *before* calling this (see
+/// [`crate::ui::nvim_pane::colors_for`]) -- this function only ever adjusts
+/// alpha, never decides which color is "the background".
+pub fn translucent(bg: Color32) -> Color32 {
+    Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), EDITOR_BG_ALPHA)
 }
 
 /// The overlay's header strip background -- fully opaque (unlike the
@@ -189,6 +202,45 @@ mod tests {
     #[test]
     fn root_hue_color_is_deterministic() {
         assert_eq!(root_hue_color("App.Leads"), root_hue_color("App.Leads"));
+    }
+
+    #[test]
+    fn translucent_sets_editor_bg_alpha() {
+        // `Color32` stores premultiplied alpha internally (see
+        // `ecolor::Color32::from_rgba_unmultiplied`), so the rgb channels
+        // aren't preserved bit-for-bit after this call -- only the alpha
+        // channel and "same input always converts the same way" are
+        // observable guarantees at this level; egui un-premultiplies for
+        // painting, per the module's sanity note.
+        let bg = Color32::from_rgb(0x12, 0x34, 0x56);
+        let result = translucent(bg);
+        assert_eq!(result.a(), EDITOR_BG_ALPHA);
+        assert_eq!(
+            result,
+            Color32::from_rgba_unmultiplied(0x12, 0x34, 0x56, EDITOR_BG_ALPHA)
+        );
+    }
+
+    #[test]
+    fn translucent_on_reverse_video_swap_uses_the_swapped_color() {
+        // Reverse video swaps fg/bg *before* translucent() ever sees it --
+        // this just asserts translucent() itself doesn't care which color
+        // it's handed, only that it stamps the alpha on whatever it's given.
+        let original_fg = Color32::from_rgb(0xaa, 0xbb, 0xcc);
+        let swapped_bg = original_fg; // caller already did the swap
+        let result = translucent(swapped_bg);
+        assert_eq!(result.a(), EDITOR_BG_ALPHA);
+        assert_eq!(
+            result,
+            Color32::from_rgba_unmultiplied(0xaa, 0xbb, 0xcc, EDITOR_BG_ALPHA)
+        );
+    }
+
+    #[test]
+    fn translucent_differs_for_differing_backgrounds() {
+        let a = translucent(Color32::from_rgb(0x10, 0x10, 0x10));
+        let b = translucent(Color32::from_rgb(0x20, 0x20, 0x20));
+        assert_ne!(a, b);
     }
 
     #[test]
