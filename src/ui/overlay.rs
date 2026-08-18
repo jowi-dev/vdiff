@@ -89,15 +89,28 @@ pub fn show(
     }
 }
 
-/// Assemble the header strip's text for `app`'s current focus/layers and
-/// `file_view`'s currently open file.
+/// Assemble the header strip's text for `app`'s current layers and
+/// `file_view`'s currently open file, naming `file_view.node` -- the node
+/// whose file is actually shown, which is `app.focus` except right after
+/// `gt` (see [`crate::core::app::Msg::GoToTest`]).
 fn header_text(app: &App, file_view: &FileViewState, nvim_mode: bool) -> String {
+    // The pane shows `file_view.node`'s file -- normally `app.focus`, but
+    // after `gt` (see `Msg::GoToTest`) focus stays on the module while the
+    // pane shows its matched test's file, so the header must name the node
+    // actually on screen. `focus` is only a fallback for the (should-never-
+    // happen) case where `file_view.node` isn't in the graph at all.
+    let display_node = app.graph.node(&file_view.node).map(|_| &file_view.node);
+    let display_node = display_node.unwrap_or(&app.focus);
     let display_name = app
         .graph
-        .node(&app.focus)
+        .node(display_node)
         .map(|node| node.display_name.as_str())
         .unwrap_or("?");
-    let layer_position = focused_layer_position(&app.layers, &app.focus);
+    // The test node itself is never in `app.layers` (test modules are
+    // pruned out of the visible layout regardless of `show_tests` when
+    // matched -- see `group_matched_test_modules`), so this comes back
+    // `None` after `gt` and `assemble_header_text` just omits the segment.
+    let layer_position = focused_layer_position(&app.layers, display_node);
     let Some(file) = file_view.current_file() else {
         return match layer_position {
             Some((layer, total)) => format!("{display_name}   layer {layer}/{total}"),
@@ -245,5 +258,79 @@ mod tests {
             assemble_header_text("MyApp.Multi", Some((1, 2)), &f, 1, 3, false),
             "MyApp.Multi   layer 1/2   src/b.rs"
         );
+    }
+
+    /// A minimal graph with a module (`module`, display name `Foo`, laid out
+    /// in `layers`) and its matched test (`module_test`, display name
+    /// `FooTest`, deliberately absent from `layers` -- test nodes never
+    /// appear there, see [`header_text`]'s doc), plus an `App` focused on
+    /// `module` -- for [`header_text`] tests exercising the post-`gt` state
+    /// where `file_view.node` differs from `focus`.
+    fn app_with_test_module() -> App {
+        use crate::core::app::{Pane, Screen};
+        use crate::graph::model::{GitStatus, ModuleNode, ProjectGraph};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let module = NodeId::from("module");
+        let test = NodeId::from("module_test");
+        let leaf = |id: &NodeId, name: &str| ModuleNode {
+            id: id.clone(),
+            display_name: name.to_string(),
+            parent: None,
+            children: vec![],
+            status: GitStatus::Unchanged,
+            files: vec![crate::graph::model::FileRef {
+                path: PathBuf::from(format!("{name}.rs")),
+                base_blob: Some("b".to_string()),
+                head_blob: Some("h".to_string()),
+            }],
+        };
+        let mut nodes = HashMap::new();
+        nodes.insert(module.clone(), leaf(&module, "Foo"));
+        nodes.insert(test.clone(), leaf(&test, "FooTest"));
+        let graph = ProjectGraph {
+            roots: vec![module.clone(), test.clone()],
+            nodes,
+            edges: vec![],
+        };
+
+        App {
+            graph,
+            layers: vec![vec![module.clone()]],
+            rows: vec![],
+            focus: module,
+            screen: Screen::Graph,
+            diff: None,
+            picker: None,
+            show_tests: false,
+            file_view: None,
+            pane: Pane::File,
+            viewport_rows: 20,
+        }
+    }
+
+    #[test]
+    fn header_text_names_the_displayed_node_not_focus() {
+        let mut app = app_with_test_module();
+        app.file_view = Some(FileViewState::new(NodeId::from("module_test"), vec![]));
+        let file_view = app.file_view.clone().unwrap();
+
+        let text = header_text(&app, &file_view, false);
+
+        // Names FooTest (the displayed node), not Foo (focus), and omits
+        // the layer segment -- module_test isn't in `app.layers`.
+        assert_eq!(text, "FooTest");
+    }
+
+    #[test]
+    fn header_text_falls_back_to_focus_when_displayed_node_is_unknown() {
+        let mut app = app_with_test_module();
+        app.file_view = Some(FileViewState::new(NodeId::from("nonexistent"), vec![]));
+        let file_view = app.file_view.clone().unwrap();
+
+        let text = header_text(&app, &file_view, false);
+
+        assert_eq!(text, "Foo   layer 1/1");
     }
 }
