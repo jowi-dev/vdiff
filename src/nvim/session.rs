@@ -96,6 +96,50 @@ pub enum NvimCmd {
     /// left of the window currently showing `path`, and turn on `diffthis`
     /// in both -- the `:VdiffDiff`/`d` diffsplit-against-merge-base.
     DiffSplit { path: PathBuf, base_content: String },
+    /// Run an arbitrary Lua chunk via `nvim_exec_lua` with no arguments,
+    /// fire-and-forget -- used once per session (initial spawn and every
+    /// respawn, alongside [`VDIFF_DIFF_COMMAND`]/[`VDIFF_DIFF_OFF_COMMAND`])
+    /// to register the `:VdiffComment` review-comment capture command (see
+    /// [`COMMENT_SETUP_LUA`]). Distinct from [`NvimCmd::Ex`] (which runs a
+    /// single Ex command string via `nvim_command`, not a Lua chunk) and
+    /// from [`NvimCmd::OpenFile`]/[`NvimCmd::DiffSplit`] (which have their
+    /// own fixed Lua bodies and typed arguments) -- this one's a general
+    /// escape hatch for "run this Lua once, no args, don't wait for a
+    /// reply".
+    ExecLua(String),
+    /// Re-render every review-comment highlight/sign in `path`'s buffer
+    /// (loading it if not already open) from `ranges` (0-based, inclusive
+    /// -- same convention as [`NvimCmd::OpenFile`]'s `ranges`): clears the
+    /// `vdiff_comments` namespace first, so a comment's marks always
+    /// reflect the current on-disk store, never accumulate stale ones from
+    /// a comment that was later hand-deleted from `comments.json`. Sent
+    /// both right after [`NvimCmd::OpenFile`] (so existing comments show up
+    /// the moment a file opens -- see [`COMMENT_MARKS_LUA`]) and right
+    /// after a new comment is captured and saved.
+    MarkComments {
+        path: PathBuf,
+        ranges: Vec<(usize, usize)>,
+    },
+}
+
+/// One `vdiff_comment` notification's payload, decoded from the
+/// `rpcnotify(1, 'vdiff_comment', {...})` [`COMMENT_SETUP_LUA`]'s compose
+/// function fires on submit. `path` is already repo-relative (resolved on
+/// the Lua side against `vim.fn.getcwd()`, same convention
+/// [`crate::ui::nvim_pane::resolve_diffed_path`] uses for `:VdiffDiff`);
+/// `start_line`/`end_line` are 1-based inclusive, matching
+/// [`crate::review::comments::Comment`]'s convention exactly so the glue
+/// side can build one without renumbering anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingComment {
+    pub path: String,
+    pub start_line: u64,
+    pub end_line: u64,
+    pub text: String,
+    /// Set only for a node-level ("architecture") comment -- see
+    /// [`crate::core::app::Msg::CommentNode`]; `None` for a line-range
+    /// comment captured via `:VdiffComment`.
+    pub node: Option<String>,
 }
 
 /// Whether an `nvim` binary is on `PATH` -- gates `--nvim` falling back to
@@ -132,6 +176,11 @@ pub struct NvimSession {
     /// arrives (the embedded `:VdiffDiff` Ex command's `rpcnotify`) --
     /// drained by [`Self::take_diff_request`] on the UI thread each frame.
     diff_requests: mpsc::Receiver<()>,
+    /// Fed by the reader thread every time a `vdiff_comment` notification
+    /// arrives (the embedded `:VdiffComment` compose flow's `rpcnotify`,
+    /// see [`COMMENT_SETUP_LUA`]) -- drained by
+    /// [`Self::take_comment_requests`] on the UI thread each frame.
+    comment_requests: mpsc::Receiver<PendingComment>,
     _writer: JoinHandle<()>,
     _reader: JoinHandle<()>,
 }
@@ -174,6 +223,7 @@ impl NvimSession {
         });
 
         let (diff_tx, diff_rx) = mpsc::channel::<()>();
+        let (comment_tx, comment_rx) = mpsc::channel::<PendingComment>();
         let grid_for_reader = grid.clone();
         let reader_alive = alive.clone();
         let reader_pending = pending.clone();
@@ -185,6 +235,7 @@ impl NvimSession {
                 reader_alive,
                 reader_pending,
                 diff_tx,
+                comment_tx,
             );
         });
 
@@ -194,6 +245,7 @@ impl NvimSession {
             grid,
             alive,
             diff_requests: diff_rx,
+            comment_requests: comment_rx,
             _writer: writer,
             _reader: reader,
         })
@@ -254,6 +306,20 @@ impl NvimSession {
             seen = true;
         }
         seen
+    }
+
+    /// Every `:VdiffComment` (`vdiff_comment` notification) that arrived
+    /// since the last call, in the order received -- unlike
+    /// [`Self::take_diff_request`] (a diffsplit re-run is idempotent, so
+    /// only "did one happen" matters), each comment carries distinct data
+    /// that has to be saved, so none of them can be dropped even if several
+    /// piled up between frames.
+    pub fn take_comment_requests(&self) -> Vec<PendingComment> {
+        let mut requests = Vec::new();
+        while let Ok(request) = self.comment_requests.try_recv() {
+            requests.push(request);
+        }
+        requests
     }
 }
 
@@ -345,6 +411,16 @@ fn run_writer(
             }
             NvimCmd::DiffSplit { path, base_content } => {
                 send_diff_split(&mut stdin, &msgid, &path, &base_content)
+            }
+            NvimCmd::ExecLua(source) => send_request(
+                &mut stdin,
+                &msgid,
+                "nvim_exec_lua",
+                vec![Value::from(source), Value::Array(vec![])],
+            )
+            .map(|_| ()),
+            NvimCmd::MarkComments { path, ranges } => {
+                send_mark_comments(&mut stdin, &msgid, &path, &ranges)
             }
         };
         if result.is_err() {
@@ -541,6 +617,166 @@ fn send_diff_split(
     .map(|_| ())
 }
 
+/// Registered once per session (initial spawn and every respawn, alongside
+/// [`VDIFF_DIFF_COMMAND`]/[`VDIFF_DIFF_OFF_COMMAND`] -- see
+/// [`crate::ui::nvim_pane::NvimPane::register_vdiff_commands`]) via
+/// [`NvimCmd::ExecLua`]: a global compose function plus the `:VdiffComment`
+/// user command that drives it.
+///
+/// `_G.__vdiff_compose_comment(path, start_line, end_line, node)` is the
+/// shared entry point both capture flows funnel through -- `:VdiffComment`
+/// (below, resolving `path`/the line range itself from the current buffer
+/// and `range = true`'s `opts.line1`/`opts.line2`, `node` always `nil`) and
+/// the graph pane's `c` key (glue sends [`NvimCmd::ExecLua`] with a tiny
+/// chunk calling this same global directly, `path`/range fixed to the
+/// node's first file/line 1..1, `node` set -- see
+/// [`crate::ui::eframe_app::VdiffApp`]'s `comment_node`). Single-line
+/// `vim.ui.input` is the MVP compose UX (multi-line compose buffer is a
+/// noted follow-up, not built here); an empty/cancelled input is silently
+/// dropped rather than saving a blank comment.
+///
+/// `:VdiffComment` itself: `range = true` makes it work from visual mode as
+/// `:'<,'>VdiffComment` (and from normal mode too, defaulting to the
+/// current line) -- resolves the buffer's name the same defensive way
+/// [`crate::ui::nvim_pane::resolve_diffed_path`] does for `:VdiffDiff`
+/// (skip unnamed buffers and this plugin's own `vdiff-base://` scratch
+/// buffers, strip the cwd prefix to get a repo-relative path), warning via
+/// `vim.notify` instead of composing if neither applies. `<leader>vc` is
+/// registered as a global (not buffer-local) visual-mode alias for
+/// `:VdiffComment` -- simpler than re-registering it per-buffer on every
+/// [`OPEN_FILE_LUA`] run for the same effect, since the ex command itself
+/// is always available regardless of leader mapping anyway (the spec this
+/// implements is explicit that the ex command has to work "regardless of
+/// leader").
+const COMMENT_SETUP_LUA: &str = r##"
+function _G.__vdiff_compose_comment(path, start_line, end_line, node)
+  vim.ui.input({ prompt = "PR comment: " }, function(text)
+    if text == nil or text == "" then
+      return
+    end
+    local payload = { path = path, start_line = start_line, end_line = end_line, text = text }
+    if node ~= nil and node ~= vim.NIL then
+      payload.node = node
+    end
+    vim.rpcnotify(1, "vdiff_comment", payload)
+  end)
+end
+
+vim.api.nvim_create_user_command("VdiffComment", function(opts)
+  local name = vim.api.nvim_buf_get_name(0)
+  if name == "" or name:match("^vdiff%-base://") then
+    vim.notify("vdiff: no file to comment on", vim.log.levels.WARN)
+    return
+  end
+  local cwd = vim.fn.getcwd()
+  local path = name
+  if vim.startswith(name, cwd .. "/") then
+    path = name:sub(#cwd + 2)
+  end
+  _G.__vdiff_compose_comment(path, opts.line1, opts.line2, vim.NIL)
+end, { range = true, bar = true })
+
+vim.keymap.set("x", "<leader>vc", ":VdiffComment<CR>", { silent = true })
+"##;
+
+/// Returns [`COMMENT_SETUP_LUA`] for [`crate::ui::nvim_pane::NvimPane::register_vdiff_commands`]
+/// to send via [`NvimCmd::ExecLua`] -- a plain function rather than
+/// exporting the const directly so the doc lives in one place and callers
+/// don't need to know it's a Lua string versus some other representation.
+pub fn comment_setup_lua() -> &'static str {
+    COMMENT_SETUP_LUA
+}
+
+/// The Lua chunk [`NvimCmd::MarkComments`] runs via `nvim_exec_lua`,
+/// receiving `path, ranges` as its varargs: defines the `VdiffComment`/
+/// `VdiffCommentSign` highlight groups (idempotent, same reasoning as
+/// [`OPEN_FILE_LUA`]'s highlight defines), loads `path`'s buffer without
+/// switching to it (`bufadd`/`bufload` -- unlike [`OPEN_FILE_LUA`], this
+/// doesn't touch the current window/cursor at all, since it can run at any
+/// time, not just on open), clears the `vdiff_comments` namespace, and
+/// places one extmark per range. Colors deliberately distinct from
+/// [`OPEN_FILE_LUA`]'s green changed-line highlight -- a muted violet, so a
+/// commented range reads as its own kind of marker rather than "this line
+/// changed".
+const COMMENT_MARKS_LUA: &str = r##"
+local path, ranges = ...
+vim.api.nvim_set_hl(0, "VdiffComment", { bg = "#33265c" })
+vim.api.nvim_set_hl(0, "VdiffCommentSign", { fg = "#9d7cd8" })
+local ns = vim.api.nvim_create_namespace("vdiff_comments")
+local buf = vim.fn.bufadd(path)
+vim.fn.bufload(buf)
+vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+for _, r in ipairs(ranges) do
+  pcall(vim.api.nvim_buf_set_extmark, buf, ns, r[1], 0, {
+    end_row = r[2],
+    end_col = 0,
+    hl_eol = true,
+    hl_group = "VdiffComment",
+    sign_text = "▐",
+    sign_hl_group = "VdiffCommentSign",
+  })
+end
+"##;
+
+/// Send [`NvimCmd::MarkComments`] as one `nvim_exec_lua(COMMENT_MARKS_LUA,
+/// [path, ranges])` request. `ranges` converts through the same
+/// [`range_to_extmark_rows`] [`send_open_file`] uses -- both are 0-based
+/// inclusive on the Rust side, end-exclusive on the extmark side.
+fn send_mark_comments(
+    stdin: &mut ChildStdin,
+    msgid: &AtomicU64,
+    path: &Path,
+    ranges: &[(usize, usize)],
+) -> io::Result<()> {
+    let ranges_arg = Value::Array(
+        ranges
+            .iter()
+            .map(|&range| {
+                let (row, end_row) = range_to_extmark_rows(range);
+                Value::Array(vec![Value::from(row), Value::from(end_row)])
+            })
+            .collect(),
+    );
+    let args = vec![Value::from(path.to_string_lossy().into_owned()), ranges_arg];
+    send_request(
+        stdin,
+        msgid,
+        "nvim_exec_lua",
+        vec![Value::from(COMMENT_MARKS_LUA), Value::Array(args)],
+    )
+    .map(|_| ())
+}
+
+/// Decode one `vdiff_comment` notification's params array (`[{path=...,
+/// start_line=..., end_line=..., text=..., node=...}]`, [`COMMENT_SETUP_LUA`]'s
+/// shape) into a [`PendingComment`]. `None` if the required fields
+/// (everything but `node`) aren't present with the expected types --
+/// shouldn't happen given `COMMENT_SETUP_LUA` is the only thing that ever
+/// sends this notification, but a malformed/unexpected payload should be
+/// ignored rather than panic the reader thread. Pure and unit-tested
+/// directly against hand-built [`Value`]s (the reader thread's only job
+/// here is calling this and forwarding the result down the channel).
+fn parse_comment_notification(params: &[Value]) -> Option<PendingComment> {
+    let map = params.first()?.as_map()?;
+    let get_str = |key: &str| -> Option<String> {
+        map.iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .and_then(|(_, v)| v.as_str().map(str::to_string))
+    };
+    let get_u64 = |key: &str| -> Option<u64> {
+        map.iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .and_then(|(_, v)| v.as_u64())
+    };
+    Some(PendingComment {
+        path: get_str("path")?,
+        start_line: get_u64("start_line")?,
+        end_line: get_u64("end_line")?,
+        text: get_str("text")?,
+        node: get_str("node"),
+    })
+}
+
 /// Allocate the next msgid and encode+write one msgpack-rpc request:
 /// `[0, msgid, method, params]`, returning the `msgid` used. Most callers
 /// (`nvim_input`, `nvim_cmd`, ...) fire-and-forget and ignore it --
@@ -602,6 +838,7 @@ fn run_reader(
     alive: Arc<AtomicBool>,
     pending: PendingReplies,
     diff_tx: Sender<()>,
+    comment_tx: Sender<PendingComment>,
 ) {
     let mut reader = BufReader::new(stdout);
     while let Ok(value) = rmpv::decode::read_value(&mut reader) {
@@ -628,6 +865,14 @@ fn run_reader(
                 Some("vdiff_diff") => {
                     let _ = diff_tx.send(());
                     repaint(); // wake the UI thread so it drains the request promptly.
+                }
+                Some("vdiff_comment") => {
+                    if let Some(params) = items.get(2).and_then(rmpv::Value::as_array) {
+                        if let Some(comment) = parse_comment_notification(params) {
+                            let _ = comment_tx.send(comment);
+                            repaint(); // wake the UI thread so it drains the request promptly.
+                        }
+                    }
                 }
                 _ => {} // an event this spike doesn't know about -- ignored, forward-compat.
             },
@@ -684,5 +929,63 @@ mod tests {
     #[test]
     fn range_to_extmark_rows_preserves_start_row() {
         assert_eq!(range_to_extmark_rows((42, 100)), (42, 101));
+    }
+
+    fn comment_value(pairs: Vec<(&str, Value)>) -> Value {
+        Value::Map(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (Value::from(k), v))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn parse_comment_notification_full_payload() {
+        let params = vec![comment_value(vec![
+            ("path", Value::from("src/lib.rs")),
+            ("start_line", Value::from(3)),
+            ("end_line", Value::from(5)),
+            ("text", Value::from("looks off")),
+            ("node", Value::from("rust:crate")),
+        ])];
+        assert_eq!(
+            parse_comment_notification(&params),
+            Some(PendingComment {
+                path: "src/lib.rs".to_string(),
+                start_line: 3,
+                end_line: 5,
+                text: "looks off".to_string(),
+                node: Some("rust:crate".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_comment_notification_without_node() {
+        let params = vec![comment_value(vec![
+            ("path", Value::from("src/lib.rs")),
+            ("start_line", Value::from(1)),
+            ("end_line", Value::from(1)),
+            ("text", Value::from("hi")),
+        ])];
+        let parsed = parse_comment_notification(&params).expect("parses");
+        assert_eq!(parsed.node, None);
+    }
+
+    #[test]
+    fn parse_comment_notification_missing_required_field_is_none() {
+        let params = vec![comment_value(vec![
+            ("path", Value::from("src/lib.rs")),
+            ("start_line", Value::from(1)),
+            // end_line missing
+            ("text", Value::from("hi")),
+        ])];
+        assert_eq!(parse_comment_notification(&params), None);
+    }
+
+    #[test]
+    fn parse_comment_notification_empty_params_is_none() {
+        assert_eq!(parse_comment_notification(&[]), None);
     }
 }

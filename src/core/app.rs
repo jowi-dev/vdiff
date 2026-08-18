@@ -241,6 +241,16 @@ pub enum Msg {
     /// `Ctrl-w l`: move keyboard focus to [`Pane::File`]. A no-op if no
     /// file pane is open.
     PaneRight,
+    /// `c` on [`Pane::Graph`]: capture an "architecture" review comment
+    /// anchored to the focused node as a whole (as opposed to a line-range
+    /// comment captured via `:VdiffComment` inside the embedded nvim pane).
+    /// Only acted on on [`Screen::Graph`]/[`Pane::Graph`] with no picker
+    /// open, matching every other graph-pane message. Emits
+    /// [`Cmd::CommentNode`] -- everything past "which node" (opening its
+    /// first backing file, prompting for text, whether nvim mode is even
+    /// active to prompt with) is glue-side IO `core` has no business
+    /// knowing about.
+    CommentNode,
 }
 
 /// I/O the caller should perform as a result of [`update`]. `update` never
@@ -261,6 +271,13 @@ pub enum Cmd {
     /// the caller must rebuild its [`crate::graph::layout::LayoutResult`]
     /// from [`App::visible_graph`] before painting again.
     Relayout,
+    /// [`Msg::CommentNode`]: capture an architecture comment for the given
+    /// node. Glue's job: in nvim mode, open the node's first backing file
+    /// (same as [`Cmd::LoadFile`]) and trigger the comment-compose flow
+    /// prefilled with line range 1..1 and this node id attached; outside
+    /// nvim mode, there's no text-input surface to compose with, so glue
+    /// just logs a one-time stderr note instead.
+    CommentNode(NodeId),
 }
 
 /// Advance `app` in response to `msg`, returning the new state and any
@@ -406,6 +423,13 @@ pub fn update(mut app: App, msg: Msg) -> (App, Cmd) {
                 app.pane = Pane::File;
             }
             (app, Cmd::None)
+        }
+        Msg::CommentNode => {
+            if !on_graph_with_no_picker_and_graph_pane(&app) {
+                return (app, Cmd::None);
+            }
+            let focus = app.focus.clone();
+            (app, Cmd::CommentNode(focus))
         }
     }
 }
@@ -1272,6 +1296,41 @@ mod tests {
         let mut app = app_at("leaf_a");
         app.pane = Pane::File;
         let (_app, cmd) = update(app, Msg::OpenFile);
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn comment_node_emits_cmd_for_focused_node() {
+        let app = app_at("leaf_a");
+        let (app, cmd) = update(app, Msg::CommentNode);
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
+        assert_eq!(cmd, Cmd::CommentNode(NodeId::from("leaf_a")));
+    }
+
+    #[test]
+    fn comment_node_noop_when_picker_open() {
+        let mut app = app_at("leaf_a");
+        app.picker = Some(EdgePicker {
+            candidates: vec![NodeId::from("target_x")],
+            selected: 0,
+        });
+        let (_app, cmd) = update(app, Msg::CommentNode);
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn comment_node_noop_when_on_file_pane() {
+        let mut app = app_at("leaf_a");
+        app.pane = Pane::File;
+        let (_app, cmd) = update(app, Msg::CommentNode);
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn comment_node_noop_on_diff_screen() {
+        let mut app = app_at("leaf_a");
+        app.screen = Screen::Diff;
+        let (_app, cmd) = update(app, Msg::CommentNode);
         assert_eq!(cmd, Cmd::None);
     }
 

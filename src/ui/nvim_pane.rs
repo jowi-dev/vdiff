@@ -166,13 +166,13 @@ impl NvimPane {
         }
     }
 
-    /// Register `:VdiffDiff`/`:VdiffDiffOff` in this session -- fresh
-    /// children (initial spawn, and every respawn) start with no user
-    /// commands at all, so this has to run every time a session comes up,
-    /// not just once at startup. Fire-and-forget like [`NvimCmd::Ex`]
-    /// generally -- a failure here (should never happen; these are static,
-    /// always-valid command strings) just means `:VdiffDiff` won't exist
-    /// this session, not a crash.
+    /// Register `:VdiffDiff`/`:VdiffDiffOff`/`:VdiffComment` in this
+    /// session -- fresh children (initial spawn, and every respawn) start
+    /// with no user commands at all, so this has to run every time a
+    /// session comes up, not just once at startup. Fire-and-forget like
+    /// [`NvimCmd::Ex`] generally -- a failure here (should never happen;
+    /// these are static, always-valid command strings) just means the
+    /// command won't exist this session, not a crash.
     pub fn register_vdiff_commands(&self) {
         self.send(NvimCmd::Ex(
             crate::nvim::session::VDIFF_DIFF_COMMAND.to_string(),
@@ -180,12 +180,21 @@ impl NvimPane {
         self.send(NvimCmd::Ex(
             crate::nvim::session::VDIFF_DIFF_OFF_COMMAND.to_string(),
         ));
+        self.send(NvimCmd::ExecLua(
+            crate::nvim::session::comment_setup_lua().to_string(),
+        ));
     }
 
     /// Whether `:VdiffDiff` was invoked in this session since the last
     /// call -- see [`NvimSession::take_diff_request`].
     pub fn take_diff_request(&self) -> bool {
         self.session.take_diff_request()
+    }
+
+    /// Every `:VdiffComment` invocation since the last call -- see
+    /// [`NvimSession::take_comment_requests`].
+    pub fn take_comment_requests(&self) -> Vec<crate::nvim::session::PendingComment> {
+        self.session.take_comment_requests()
     }
 
     /// Open (or refresh) the diffsplit-against-merge-base view for
@@ -197,6 +206,48 @@ impl NvimPane {
     pub fn diffsplit(&self, path: PathBuf, base_content: String) {
         self.send(NvimCmd::DiffSplit { path, base_content });
     }
+
+    /// Trigger the review-comment compose flow directly (rather than via
+    /// the `:VdiffComment` Ex command a user types) for the graph pane's
+    /// `c`-on-focused-node ("architecture" comment) binding: runs a tiny
+    /// Lua chunk calling `_G.__vdiff_compose_comment` (registered by
+    /// [`Self::register_vdiff_commands`]) with `path`/`start_line`/
+    /// `end_line` fixed by the caller and `node` set, instead of letting
+    /// the Lua side resolve them from the current buffer/range the way
+    /// `:VdiffComment` does. A no-op (silently) if the function somehow
+    /// isn't registered yet -- guarded on the Lua side, not here.
+    pub fn compose_comment(&self, path: &Path, start_line: u64, end_line: u64, node: &str) {
+        let escaped_path = lua_string_literal(&path.to_string_lossy());
+        let escaped_node = lua_string_literal(node);
+        let chunk = format!(
+            "if _G.__vdiff_compose_comment then _G.__vdiff_compose_comment({escaped_path}, {start_line}, {end_line}, {escaped_node}) end"
+        );
+        self.send(NvimCmd::ExecLua(chunk));
+    }
+
+    /// Re-render review-comment highlights/signs for `path` from `ranges`
+    /// (0-based inclusive, same convention as [`Self::open_file`]'s
+    /// `ranges`) -- see [`NvimCmd::MarkComments`].
+    pub fn mark_comments(&self, path: PathBuf, ranges: Vec<(usize, usize)>) {
+        self.send(NvimCmd::MarkComments { path, ranges });
+    }
+}
+
+/// Quote `s` as a Lua single-quoted string literal, escaping backslashes,
+/// single quotes, and newlines -- used to splice `path`/`node` into the
+/// small Lua chunk [`NvimPane::compose_comment`] builds by hand rather than
+/// sending them as `nvim_exec_lua` varargs (unlike [`NvimCmd::OpenFile`]/
+/// [`NvimCmd::MarkComments`], this call's arguments are fixed by the
+/// caller, not resolved on the Lua side, so there's no varargs plumbing to
+/// reuse -- see [`NvimPane::compose_comment`]). Repo-relative paths and
+/// vdiff `NodeId`s are not attacker-controlled input, but escaping this
+/// cheaply is one line and removes any need to reason about it.
+fn lua_string_literal(s: &str) -> String {
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n");
+    format!("'{escaped}'")
 }
 
 /// The message shown in place of the grid once nvim has exited (`ZZ`, `:q`,
