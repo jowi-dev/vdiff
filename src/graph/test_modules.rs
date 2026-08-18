@@ -105,6 +105,22 @@ pub fn nodes_with_changed_tests(graph: &ProjectGraph) -> HashSet<NodeId> {
         .collect()
 }
 
+/// The test module that tests `node`, if any: the first (name-sorted, for
+/// determinism when more than one test module happens to match) test module
+/// whose [`tested_node_id`] resolves to `node`. Used by `gt` (see
+/// [`crate::core::app::Msg::GoToTest`]) to jump from a module to its test's
+/// file regardless of whether [`crate::core::app::App::show_tests`] is on.
+pub fn matched_test_module(graph: &ProjectGraph, node: &NodeId) -> Option<NodeId> {
+    let mut candidates: Vec<&ModuleNode> = graph
+        .nodes
+        .values()
+        .filter(|candidate| is_test_module(candidate))
+        .filter(|candidate| tested_node_id(graph, candidate).as_ref() == Some(node))
+        .collect();
+    candidates.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+    candidates.first().map(|test_node| test_node.id.clone())
+}
+
 /// A matched test module attached to its tested node when
 /// [`crate::core::app::App::show_tests`] is on: the test module's own short
 /// display name plus its [`GitStatus`], so the graph view can paint it as a
@@ -461,6 +477,61 @@ mod tests {
         let g = graph_with(vec![orphan_test], vec![]);
 
         assert!(test_strips(&g).is_empty());
+    }
+
+    #[test]
+    fn matched_test_module_finds_the_test_for_a_tested_node() {
+        let lead = node_with_parent(
+            "elixir:App.Lead",
+            "Lead",
+            GitStatus::Unchanged,
+            vec![file("lib/app/lead.ex")],
+            Some("elixir:App"),
+        );
+        let lead_test = node_with_parent(
+            "elixir:App.LeadTest",
+            "LeadTest",
+            GitStatus::Modified,
+            vec![file("test/app/lead_test.exs")],
+            Some("elixir:App"),
+        );
+        let g = graph_with(vec![lead.clone(), lead_test.clone()], vec![]);
+
+        assert_eq!(matched_test_module(&g, &lead.id), Some(lead_test.id));
+    }
+
+    #[test]
+    fn matched_test_module_none_when_no_test_matches() {
+        let lead = node(
+            "elixir:App.Lead",
+            "Lead",
+            GitStatus::Unchanged,
+            vec![file("lib/app/lead.ex")],
+        );
+        let g = graph_with(vec![lead.clone()], vec![]);
+
+        assert_eq!(matched_test_module(&g, &lead.id), None);
+    }
+
+    #[test]
+    fn matched_test_module_none_for_a_test_module_itself() {
+        let lead = node_with_parent(
+            "elixir:App.Lead",
+            "Lead",
+            GitStatus::Unchanged,
+            vec![file("lib/app/lead.ex")],
+            Some("elixir:App"),
+        );
+        let lead_test = node_with_parent(
+            "elixir:App.LeadTest",
+            "LeadTest",
+            GitStatus::Modified,
+            vec![file("test/app/lead_test.exs")],
+            Some("elixir:App"),
+        );
+        let g = graph_with(vec![lead, lead_test.clone()], vec![]);
+
+        assert_eq!(matched_test_module(&g, &lead_test.id), None);
     }
 
     #[test]
