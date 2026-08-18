@@ -2,6 +2,9 @@
 name = "vdiff"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Visual PR review: a branch's change set as a layered dependency graph, with vim navigation and a real embedded Neovim"
+repository = "https://github.com/jowi-dev/vdiff"
 
 [lib]
 name = "vdiff"
