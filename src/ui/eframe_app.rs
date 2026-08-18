@@ -37,7 +37,7 @@ use crate::core::app::{update, App, Cmd, Msg, Pane, Screen};
 use crate::core::diff_state::{DiffPaneState, FileEntry};
 use crate::core::file_view::{FileViewEntry, FileViewState};
 use crate::core::focus::Direction;
-use crate::graph::layout::{layout, LayoutResult};
+use crate::graph::layout::{layout_with_test_strips, LayoutResult};
 use crate::graph::model::{GitStatus, ModuleNode, NodeId, ProjectGraph};
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome, Pending};
 use crate::nvim::session::NvimCmd;
@@ -269,7 +269,12 @@ impl VdiffApp {
             },
             Cmd::LoadFile(node) => self.load_file(node),
             Cmd::Relayout => {
-                self.layout = layout(&self.app.visible_graph());
+                let test_strips = if self.app.show_tests {
+                    crate::graph::test_modules::test_strips(&self.app.graph)
+                } else {
+                    std::collections::HashMap::new()
+                };
+                self.layout = layout_with_test_strips(&self.app.visible_graph(), &test_strips);
             }
         }
     }

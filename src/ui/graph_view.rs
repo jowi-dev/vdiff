@@ -10,14 +10,16 @@
 //! Pan/zoom is view-only state ([`Transform`]) that lives in the eframe
 //! glue, never in [`crate::core::app::App`] -- the core stays geometry-free.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use egui::{Align2, Color32, FontId, Pos2, Rect as EguiRect, Sense, StrokeKind, Ui, Vec2};
 
 use crate::core::app::App;
 use crate::graph::layout::{self, LayoutResult, Pos as LPos, Rect as LRect};
 use crate::graph::model::{GitStatus, NodeId, ProjectGraph};
-use crate::graph::test_modules::{hide_test_modules, nodes_with_changed_tests};
+use crate::graph::test_modules::{
+    hide_test_modules, nodes_with_changed_tests, test_strips, TestStrip,
+};
 use crate::ui::theme;
 
 /// Zoom lower bound (10%).
@@ -146,13 +148,33 @@ pub fn show(
     painter.rect_filled(response.rect, 0.0, theme::CANVAS_BG);
 
     let tested = nodes_with_changed_tests(&app.graph);
+    // Only ever non-empty once `show_tests` is on -- see
+    // `App::visible_graph`'s doc for why a matched test's info moves from
+    // the hidden-mode badge (`tested`, above) to an attached strip here.
+    let strips = if app.show_tests {
+        test_strips(&app.graph)
+    } else {
+        HashMap::new()
+    };
+
+    let test_overlay = TestOverlay {
+        tested: &tested,
+        strips: &strips,
+        show_tests: app.show_tests,
+    };
 
     paint_band_separators(&painter, layout, transform, response.rect);
     paint_edges(&painter, layout, transform, &app.focus);
     for layer in &layout.layers {
         for id in layer {
             paint_node(
-                &painter, &app.graph, layout, transform, id, &app.focus, &tested,
+                &painter,
+                &app.graph,
+                layout,
+                transform,
+                id,
+                &app.focus,
+                &test_overlay,
             );
         }
     }
@@ -297,10 +319,28 @@ fn layer_extent(layer: &[NodeId], layout: &LayoutResult) -> Option<(f32, f32)> {
 /// truncating and to inset the text draw itself.
 const LABEL_PAD: f32 = 6.0;
 
+/// The test-module-related paint state [`paint_node`] needs, bundled so the
+/// function stays under clippy's argument-count limit: the changed-test
+/// hidden-mode badge set, the shown-mode attached-strip map, and whether
+/// `show_tests` is on at all (which picks between the two -- see
+/// [`paint_node`]'s doc).
+struct TestOverlay<'a> {
+    tested: &'a HashSet<NodeId>,
+    strips: &'a HashMap<NodeId, TestStrip>,
+    show_tests: bool,
+}
+
 /// Paint `id`'s rect: status fill/border, a left-edge stripe in its
-/// top-level root's hue, a truncated-to-fit abbreviated label, and a small
-/// green "tested" badge if `tested` flags it. Draws the focus ring on top
-/// if `id` is `focus`.
+/// top-level root's hue, a truncated-to-fit abbreviated label, and either a
+/// small green "tested" badge (hidden-mode hint) or -- once `show_tests` is
+/// on and `strips` has an entry for `id` -- an attached bottom strip
+/// showing the matched test module's own short name in its own status
+/// color (see [`crate::graph::test_modules::test_strips`]/
+/// [`crate::graph::layout::layout_with_test_strips`], which is what makes
+/// room for the strip in `layout.rects[id]`'s height in the first place).
+/// The combined box stays one focusable node -- the strip is display-only,
+/// navigation never lands on it separately. Draws the focus ring around the
+/// whole (possibly combined) box on top if `id` is `focus`.
 fn paint_node(
     painter: &egui::Painter,
     graph: &ProjectGraph,
@@ -308,7 +348,7 @@ fn paint_node(
     transform: &Transform,
     id: &NodeId,
     focus: &NodeId,
-    tested: &HashSet<NodeId>,
+    test_overlay: &TestOverlay,
 ) {
     let Some(node) = graph.node(id) else {
         return;
@@ -317,9 +357,24 @@ fn paint_node(
         return;
     };
     let screen_rect = transform.to_screen_rect(*rect);
+    let strip = test_overlay.strips.get(id);
+
+    let main_rect = match strip {
+        Some(_) => {
+            let strip_h = layout::TEST_STRIP_H * transform.scale;
+            EguiRect::from_min_size(
+                screen_rect.min,
+                Vec2::new(
+                    screen_rect.width(),
+                    (screen_rect.height() - strip_h).max(0.0),
+                ),
+            )
+        }
+        None => screen_rect,
+    };
 
     painter.rect(
-        screen_rect,
+        main_rect,
         2.0,
         theme::leaf_fill(node.status),
         theme::leaf_border_stroke(node.status),
@@ -329,22 +384,24 @@ fn paint_node(
     let root_id = graph.top_level_root(id);
     let stripe_color = theme::root_hue_color(&root_id.to_string());
     let stripe_rect =
-        EguiRect::from_min_size(screen_rect.min, Vec2::new(STRIPE_W, screen_rect.height()));
+        EguiRect::from_min_size(main_rect.min, Vec2::new(STRIPE_W, main_rect.height()));
     painter.rect_filled(stripe_rect, 0.0, stripe_color);
 
     let label = theme::abbreviated_label(&id.to_string(), &root_id.to_string(), &node.display_name);
     let font_size = 12.0 * transform.scale.max(0.3);
-    let available_px = screen_rect.width() - STRIPE_W - 2.0 * LABEL_PAD;
+    let available_px = main_rect.width() - STRIPE_W - 2.0 * LABEL_PAD;
     let label = fit_label(&label, available_px, font_size);
     painter.text(
-        screen_rect.center(),
+        main_rect.center(),
         Align2::CENTER_CENTER,
         &label,
         FontId::proportional(font_size),
         label_color(node.status),
     );
 
-    if tested.contains(id) {
+    if let Some(strip) = strip {
+        paint_test_strip(painter, screen_rect, main_rect, transform, strip);
+    } else if !test_overlay.show_tests && test_overlay.tested.contains(id) {
         painter.text(
             Pos2::new(
                 screen_rect.right() - LABEL_PAD,
@@ -365,6 +422,42 @@ fn paint_node(
             StrokeKind::Inside,
         );
     }
+}
+
+/// Paint the attached test-module strip below `main_rect`, filling the rest
+/// of `screen_rect` (the combined box) with the test's own status color, a
+/// separating top border, and its short display name -- see
+/// [`paint_node`]'s doc.
+fn paint_test_strip(
+    painter: &egui::Painter,
+    screen_rect: EguiRect,
+    main_rect: EguiRect,
+    transform: &Transform,
+    strip: &TestStrip,
+) {
+    let strip_rect = EguiRect::from_min_max(
+        Pos2::new(screen_rect.left(), main_rect.bottom()),
+        screen_rect.max,
+    );
+    painter.rect_filled(strip_rect, 0.0, theme::leaf_fill(strip.status));
+    painter.line_segment(
+        [strip_rect.left_top(), strip_rect.right_top()],
+        theme::leaf_border_stroke(strip.status),
+    );
+
+    let font_size = (10.0 * transform.scale.max(0.3)).max(6.0);
+    let label = fit_label(
+        &strip.label,
+        strip_rect.width() - 2.0 * LABEL_PAD,
+        font_size,
+    );
+    painter.text(
+        strip_rect.center(),
+        Align2::CENTER_CENTER,
+        &label,
+        FontId::proportional(font_size),
+        label_color(strip.status),
+    );
 }
 
 /// Truncate `label` with a trailing `…` if it wouldn't fit in `available_px`

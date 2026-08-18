@@ -105,6 +105,71 @@ pub fn nodes_with_changed_tests(graph: &ProjectGraph) -> HashSet<NodeId> {
         .collect()
 }
 
+/// A matched test module attached to its tested node when
+/// [`crate::core::app::App::show_tests`] is on: the test module's own short
+/// display name plus its [`GitStatus`], so the graph view can paint it as a
+/// distinct bottom strip on the tested node's box instead of a second
+/// standalone node (see [`test_strips`]/[`group_matched_test_modules`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestStrip {
+    pub label: String,
+    pub status: GitStatus,
+}
+
+/// Every non-test node id that has a matching test module (see
+/// [`tested_node_id`]), paired with that test's [`TestStrip`] info --
+/// regardless of the test's [`GitStatus`] (unlike [`nodes_with_changed_tests`],
+/// which only flags *changed* tests for the hidden-mode badge; this is the
+/// full picture shown once tests are visible). Used when `show_tests` is on
+/// to both size the taller combined box ([`crate::graph::layout::layout_with_test_strips`])
+/// and paint the strip itself ([`crate::ui::graph_view`]).
+pub fn test_strips(graph: &ProjectGraph) -> std::collections::HashMap<NodeId, TestStrip> {
+    graph
+        .nodes
+        .values()
+        .filter(|node| is_test_module(node))
+        .filter_map(|test_node| {
+            let target = tested_node_id(graph, test_node)?;
+            Some((
+                target,
+                TestStrip {
+                    label: test_node.display_name.clone(),
+                    status: test_node.status,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Prune every *matched* test module (see [`test_strips`]) out of `graph`,
+/// same pruning mechanics as [`hide_test_modules`] -- but, unlike that
+/// function, a test module with no matching tested node is left in place as
+/// a standalone node. Used by [`crate::core::app::App::visible_graph`] when
+/// `show_tests` is on: a matched test's info is drawn as an attached strip
+/// on its tested node's box instead of rendering the test module as a
+/// second, separate box.
+pub fn group_matched_test_modules(graph: &ProjectGraph) -> ProjectGraph {
+    let matched_test_ids: HashSet<NodeId> = graph
+        .nodes
+        .values()
+        .filter(|node| is_test_module(node) && tested_node_id(graph, node).is_some())
+        .map(|node| node.id.clone())
+        .collect();
+
+    if matched_test_ids.is_empty() {
+        return graph.clone();
+    }
+
+    let keep: HashSet<NodeId> = graph
+        .nodes
+        .keys()
+        .filter(|id| !matched_test_ids.contains(*id))
+        .cloned()
+        .collect();
+
+    prune(graph, &keep)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +416,103 @@ mod tests {
         // parent), so they don't share a root and must not cross-match even
         // though the names line up.
         assert!(nodes_with_changed_tests(&g).is_empty());
+    }
+
+    #[test]
+    fn test_strips_maps_the_tested_node_to_the_test_regardless_of_status() {
+        // Unlike `nodes_with_changed_tests`, an unchanged matched test still
+        // gets a strip entry -- `show_tests` shows every matched test, not
+        // just changed ones.
+        let lead = node_with_parent(
+            "elixir:App.Lead",
+            "Lead",
+            GitStatus::Unchanged,
+            vec![file("lib/app/lead.ex")],
+            Some("elixir:App"),
+        );
+        let lead_test = node_with_parent(
+            "elixir:App.LeadTest",
+            "LeadTest",
+            GitStatus::Modified,
+            vec![file("test/app/lead_test.exs")],
+            Some("elixir:App"),
+        );
+        let g = graph_with(vec![lead.clone(), lead_test.clone()], vec![]);
+
+        let strips = test_strips(&g);
+
+        assert_eq!(
+            strips.get(&lead.id),
+            Some(&TestStrip {
+                label: "LeadTest".to_string(),
+                status: GitStatus::Modified,
+            })
+        );
+    }
+
+    #[test]
+    fn test_strips_is_empty_for_an_unmatched_test_module() {
+        let orphan_test = node(
+            "elixir:App.OrphanTest",
+            "OrphanTest",
+            GitStatus::Added,
+            vec![file("test/app/orphan_test.exs")],
+        );
+        let g = graph_with(vec![orphan_test], vec![]);
+
+        assert!(test_strips(&g).is_empty());
+    }
+
+    #[test]
+    fn group_matched_test_modules_prunes_only_matched_tests() {
+        let lead = node_with_parent(
+            "elixir:App.Lead",
+            "Lead",
+            GitStatus::Unchanged,
+            vec![file("lib/app/lead.ex")],
+            Some("elixir:App"),
+        );
+        let lead_test = node_with_parent(
+            "elixir:App.LeadTest",
+            "LeadTest",
+            GitStatus::Modified,
+            vec![file("test/app/lead_test.exs")],
+            Some("elixir:App"),
+        );
+        let orphan_test = node(
+            "elixir:App.OrphanTest",
+            "OrphanTest",
+            GitStatus::Added,
+            vec![file("test/app/orphan_test.exs")],
+        );
+        let g = graph_with(
+            vec![lead.clone(), lead_test.clone(), orphan_test.clone()],
+            vec![],
+        );
+
+        let grouped = group_matched_test_modules(&g);
+
+        assert!(grouped.node(&lead.id).is_some(), "tested node stays");
+        assert!(
+            grouped.node(&lead_test.id).is_none(),
+            "matched test is pruned"
+        );
+        assert!(
+            grouped.node(&orphan_test.id).is_some(),
+            "unmatched test stays standalone"
+        );
+    }
+
+    #[test]
+    fn group_matched_test_modules_is_a_noop_with_no_matched_tests() {
+        let orphan_test = node(
+            "elixir:App.OrphanTest",
+            "OrphanTest",
+            GitStatus::Added,
+            vec![file("test/app/orphan_test.exs")],
+        );
+        let g = graph_with(vec![orphan_test], vec![]);
+
+        assert_eq!(group_matched_test_modules(&g), g);
     }
 }

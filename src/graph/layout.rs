@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use crate::graph::labels::abbreviated_label;
 use crate::graph::layers::assign_layers;
 use crate::graph::model::{DepEdge, NodeId, ProjectGraph};
+use crate::graph::test_modules::TestStrip;
 
 /// Floor on a node's box width -- also the width used for a short label
 /// (see [`node_size`]).
@@ -50,6 +51,11 @@ pub const BAND_GAP: f32 = 48.0;
 /// nodes gets at least this much horizontal room before wrapping, so a
 /// two-node band doesn't wrap into a needlessly tall single column.
 pub const MIN_BAND_WIDTH: f32 = 1200.0;
+/// Extra height added to a node's box when it has an attached
+/// [`TestStrip`] (see [`layout_with_test_strips`]) -- a distinct bottom
+/// section for the matched test module's short name and status, on top of
+/// the node's own [`LEAF_H`].
+pub const TEST_STRIP_H: f32 = 20.0;
 
 /// A 2D point in layout space (origin top-left, y grows downward).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -163,7 +169,25 @@ pub fn rows_with_x_centers(layout: &LayoutResult) -> Vec<Vec<(NodeId, f32)>> {
 /// behavior) is what makes the graph read as a centered pyramid/stack
 /// instead of a ragged left edge: a narrow band sitting under a much wider
 /// one no longer looks accidentally offset from it.
+///
+/// Convenience wrapper around [`layout_with_test_strips`] for every caller
+/// that doesn't need the taller combined test-module boxes (most of this
+/// module's own tests, and any layout pass over a graph with
+/// [`crate::core::app::App::show_tests`] off).
 pub fn layout(graph: &ProjectGraph) -> LayoutResult {
+    layout_with_test_strips(graph, &HashMap::new())
+}
+
+/// [`layout`], but every node id present in `test_strips` gets a taller box
+/// ([`LEAF_H`] + [`TEST_STRIP_H`]) to make room for the attached test-module
+/// strip [`crate::ui::graph_view`] paints on it -- see
+/// [`crate::graph::test_modules::test_strips`], which is what a caller
+/// builds `test_strips` from (only ever non-empty when `show_tests` is on;
+/// pass an empty map otherwise, same as plain [`layout`]).
+pub fn layout_with_test_strips(
+    graph: &ProjectGraph,
+    test_strips: &HashMap<NodeId, TestStrip>,
+) -> LayoutResult {
     let layers = assign_layers(graph);
 
     let bands: Vec<(Vec<Row>, Size)> = layers
@@ -171,7 +195,7 @@ pub fn layout(graph: &ProjectGraph) -> LayoutResult {
         .map(|layer| {
             let items: Vec<(NodeId, Size)> = layer
                 .iter()
-                .map(|id| (id.clone(), node_size(graph, id)))
+                .map(|id| (id.clone(), node_size(graph, id, test_strips)))
                 .collect();
             pack_rows(&items)
         })
@@ -217,21 +241,29 @@ pub fn layout(graph: &ProjectGraph) -> LayoutResult {
     }
 }
 
-/// A node's box size: fixed height, but width clamped to fit its painted
-/// label (the same [`abbreviated_label`] [`crate::ui::graph_view`] draws) --
+/// A node's box size: width clamped to fit its painted label (the same
+/// [`abbreviated_label`] [`crate::ui::graph_view`] draws) --
 /// `label_char_count * CHAR_W + 2*TEXT_PAD`, floored at [`LEAF_W`] and
-/// capped at [`MAX_LEAF_W`]. Falls back to the bare id string if `id` isn't
-/// in `graph` (shouldn't happen for a drawn node, but keeps this total).
-fn node_size(graph: &ProjectGraph, id: &NodeId) -> Size {
+/// capped at [`MAX_LEAF_W`]. Height is [`LEAF_H`], plus [`TEST_STRIP_H`] if
+/// `id` has an attached [`TestStrip`] in `test_strips` (see
+/// [`layout_with_test_strips`]). Falls back to the bare id string for the
+/// label if `id` isn't in `graph` (shouldn't happen for a drawn node, but
+/// keeps this total).
+fn node_size(graph: &ProjectGraph, id: &NodeId, test_strips: &HashMap<NodeId, TestStrip>) -> Size {
     let root_id = graph.top_level_root(id);
     let label = match graph.node(id) {
         Some(node) => abbreviated_label(&id.to_string(), &root_id.to_string(), &node.display_name),
         None => id.to_string(),
     };
     let width = (label.chars().count() as f32 * CHAR_W + 2.0 * TEXT_PAD).clamp(LEAF_W, MAX_LEAF_W);
+    let height = if test_strips.contains_key(id) {
+        LEAF_H + TEST_STRIP_H
+    } else {
+        LEAF_H
+    };
     Size {
         w: width,
-        h: LEAF_H,
+        h: height,
     }
 }
 
@@ -584,6 +616,43 @@ mod tests {
                 assert_eq!(*cx, result.rects[id].center().x);
             }
         }
+    }
+
+    #[test]
+    fn a_node_with_an_attached_test_strip_gets_a_taller_box() {
+        let graph = graph_from(vec![leaf("a", "a", None)], vec!["a"]);
+        let mut strips = StdHashMap::new();
+        strips.insert(
+            NodeId::from("a"),
+            TestStrip {
+                label: "ATest".to_string(),
+                status: GitStatus::Modified,
+            },
+        );
+
+        let result = layout_with_test_strips(&graph, &strips);
+
+        let rect = result.rects[&NodeId::from("a")];
+        assert_eq!(rect.size.h, LEAF_H + TEST_STRIP_H);
+    }
+
+    #[test]
+    fn a_node_without_a_test_strip_keeps_the_plain_leaf_height() {
+        let graph = graph_from(vec![leaf("a", "a", None)], vec!["a"]);
+
+        let result = layout_with_test_strips(&graph, &StdHashMap::new());
+
+        let rect = result.rects[&NodeId::from("a")];
+        assert_eq!(rect.size.h, LEAF_H);
+    }
+
+    #[test]
+    fn plain_layout_never_adds_test_strip_height() {
+        let graph = graph_from(vec![leaf("a", "a", None)], vec!["a"]);
+
+        let result = layout(&graph);
+
+        assert_eq!(result.rects[&NodeId::from("a")].size.h, LEAF_H);
     }
 
     #[test]

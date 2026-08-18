@@ -11,7 +11,7 @@ use crate::core::file_view::FileViewState;
 use crate::core::focus::{dep_targets, dependent_sources, move_focus, Direction};
 use crate::graph::layout::{layout, rows_with_x_centers};
 use crate::graph::model::{NodeId, ProjectGraph};
-use crate::graph::test_modules::hide_test_modules;
+use crate::graph::test_modules::{group_matched_test_modules, hide_test_modules};
 
 /// Which screen is currently shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,16 +115,22 @@ impl App {
         self.layers.iter().any(|layer| layer.contains(id))
     }
 
-    /// The graph actually drawn: `self.graph` as-is if [`Self::show_tests`],
-    /// or with every test module pruned out (see
-    /// [`crate::graph::test_modules::hide_test_modules`]) otherwise. `self.graph`
-    /// itself never changes -- it's always the full, focus-filtered graph --
-    /// so this is what [`Msg::ToggleTests`] recomputes `layers` from, and
-    /// what the caller should re-run [`crate::graph::layout::layout`] over
-    /// after a [`Cmd::Relayout`].
+    /// The graph actually drawn: with every test module pruned out (see
+    /// [`hide_test_modules`]) if `!self.show_tests`, or -- once
+    /// [`Self::show_tests`] is on -- with only *matched* test modules
+    /// pruned (see [`group_matched_test_modules`]), since those render as
+    /// an attached strip on their tested node's box rather than a second
+    /// standalone node (see [`crate::graph::test_modules::test_strips`],
+    /// consulted by the caller alongside this to build that combined box).
+    /// An unmatched test module is never pruned -- it stays a standalone
+    /// node either way. `self.graph` itself never changes -- it's always
+    /// the full, focus-filtered graph -- so this is what [`Msg::ToggleTests`]
+    /// recomputes `layers`/`rows` from, and what the caller should re-run
+    /// [`crate::graph::layout::layout_with_test_strips`] over after a
+    /// [`Cmd::Relayout`].
     pub fn visible_graph(&self) -> ProjectGraph {
         if self.show_tests {
-            self.graph.clone()
+            group_matched_test_modules(&self.graph)
         } else {
             hide_test_modules(&self.graph).0
         }
@@ -1064,6 +1070,66 @@ mod tests {
         );
         g.roots.push(test_id);
         g
+    }
+
+    /// `graph_fixture` plus one test module matched to `leaf_a` (parented
+    /// under it, so they share a top-level root, and named `leaf_aTest` so
+    /// stripping the `Test` suffix yields `leaf_a`'s own display name) --
+    /// exercises `visible_graph`'s grouping branch: once `show_tests` is on,
+    /// this node should be pruned from the drawn graph (see
+    /// `group_matched_test_modules`) rather than rendered standalone.
+    fn graph_fixture_with_matched_test_node() -> ProjectGraph {
+        let mut g = graph_fixture();
+        let test_id = NodeId::from("leaf_a_test");
+        g.nodes.insert(
+            test_id.clone(),
+            ModuleNode {
+                id: test_id.clone(),
+                display_name: "leaf_aTest".to_string(),
+                parent: Some(NodeId::from("leaf_a")),
+                children: vec![],
+                status: GitStatus::Modified,
+                files: vec![crate::graph::model::FileRef {
+                    path: PathBuf::from("test/leaf_a_test.rs"),
+                    base_blob: Some("b".to_string()),
+                    head_blob: Some("h".to_string()),
+                }],
+            },
+        );
+        g.roots.push(test_id);
+        g
+    }
+
+    #[test]
+    fn visible_graph_groups_a_matched_test_module_into_its_tested_node_when_tests_are_shown() {
+        let g = graph_fixture_with_matched_test_node();
+        let mut app = app_at("leaf_a");
+        app.graph = g;
+        app.show_tests = true;
+
+        let visible = app.visible_graph();
+
+        assert!(
+            visible.node(&NodeId::from("leaf_a")).is_some(),
+            "tested node stays drawn"
+        );
+        assert!(
+            visible.node(&NodeId::from("leaf_a_test")).is_none(),
+            "matched test module is grouped into leaf_a's box, not drawn standalone"
+        );
+    }
+
+    #[test]
+    fn visible_graph_hides_a_matched_test_module_entirely_when_tests_are_off() {
+        let g = graph_fixture_with_matched_test_node();
+        let mut app = app_at("leaf_a");
+        app.graph = g;
+        app.show_tests = false;
+
+        let visible = app.visible_graph();
+
+        assert!(visible.node(&NodeId::from("leaf_a")).is_some());
+        assert!(visible.node(&NodeId::from("leaf_a_test")).is_none());
     }
 
     #[test]
