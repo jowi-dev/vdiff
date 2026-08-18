@@ -71,6 +71,16 @@ pub trait GitRepo {
     /// [`GitRepo::head_content`]/[`GitRepo::changed_files`] on what
     /// "exists at head" means.
     fn head_blob_oid(&self, path: &Path) -> Result<Option<String>>;
+
+    /// The repository's actual git directory (`git2::Repository::path()`'s
+    /// equivalent) -- *not* `<worktree>/.git` joined by hand, which breaks
+    /// the moment `.git` is a gitlink file rather than a directory (`git
+    /// worktree add`, submodules): review comments (see
+    /// [`crate::review::store`]) live at `<git_dir>/vdiff/comments.json`,
+    /// and need the real git dir to land somewhere that (a) exists and (b)
+    /// is per-worktree the way a `git worktree add` checkout's own comments
+    /// should be, rather than shared with the main worktree's `.git`.
+    fn git_dir(&self) -> PathBuf;
 }
 
 /// In-memory [`GitRepo`] for pipeline tests: scripted deltas plus base/head
@@ -87,6 +97,8 @@ pub struct FakeRepo {
     pub head_files: HashMap<PathBuf, String>,
     /// Returned verbatim by `list_tracked_files`.
     pub tracked_files: Vec<PathBuf>,
+    /// Returned verbatim by `git_dir`.
+    pub git_dir: PathBuf,
 }
 
 impl GitRepo for FakeRepo {
@@ -118,6 +130,10 @@ impl GitRepo for FakeRepo {
 
     fn head_blob_oid(&self, path: &Path) -> Result<Option<String>> {
         Ok(self.head_files.get(path).map(|content| fake_oid(content)))
+    }
+
+    fn git_dir(&self) -> PathBuf {
+        self.git_dir.clone()
     }
 }
 
@@ -181,6 +197,7 @@ mod tests {
                 PathBuf::from("src/added.rs"),
                 PathBuf::from("src/unchanged.rs"),
             ],
+            ..Default::default()
         }
     }
 

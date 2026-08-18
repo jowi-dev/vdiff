@@ -369,14 +369,12 @@ impl VdiffApp {
         }
     }
 
-    /// The repo root every review-comment path is resolved against/stored
-    /// under -- currently just `self.nvim_cwd` ( `nvim --embed`'s cwd,
-    /// which `main.rs` sets to the repo root, same assumption
-    /// [`nvim_pane::resolve_diffed_path`] already relies on for
-    /// `:VdiffDiff`). Comments are a nvim-mode-only feature for this MVP,
-    /// so there's no built-in-viewer equivalent to fall back to.
-    fn repo_root(&self) -> &std::path::Path {
-        &self.nvim_cwd
+    /// The git directory review comments are stored under -- see
+    /// [`crate::review::store`]'s doc for why this has to be the repo's
+    /// actual git dir ([`GitRepo::git_dir`]), not `<worktree>/.git` joined
+    /// by hand.
+    fn comments_git_dir(&self) -> std::path::PathBuf {
+        self.diff_loader.repo.git_dir()
     }
 
     /// Drain any `:VdiffComment` invocations that arrived since last frame
@@ -397,8 +395,8 @@ impl VdiffApp {
     /// so the new one shows up immediately without waiting for the next
     /// file open.
     fn handle_comment_request(&mut self, request: PendingComment) {
-        let repo_root = self.repo_root().to_path_buf();
-        let mut existing = comment_store::load(&repo_root).unwrap_or_default();
+        let git_dir = self.comments_git_dir();
+        let mut existing = comment_store::load(&git_dir).unwrap_or_default();
         let comment = Comment {
             id: comments::next_id(&existing),
             path: request.path.clone(),
@@ -409,7 +407,7 @@ impl VdiffApp {
             created_at: comments::format_iso8601(SystemTime::now()),
         };
         comments::add_comment(&mut existing, comment);
-        if let Err(err) = comment_store::save(&repo_root, &existing) {
+        if let Err(err) = comment_store::save(&git_dir, &existing) {
             eprintln!("warning: failed to save review comment: {err}");
             return;
         }
@@ -424,7 +422,7 @@ impl VdiffApp {
     /// refresh, not something worth failing a load over.
     fn mark_comments_for(&self, path: &std::path::Path) {
         let Some(nvim) = &self.nvim else { return };
-        let Ok(existing) = comment_store::load(self.repo_root()) else {
+        let Ok(existing) = comment_store::load(&self.comments_git_dir()) else {
             return;
         };
         let path_str = path.to_string_lossy();
@@ -1132,6 +1130,7 @@ mod tests {
             base_files,
             head_files,
             tracked_files: vec![],
+            ..Default::default()
         };
         (graph, repo)
     }
@@ -1266,6 +1265,7 @@ mod tests {
             base_files,
             head_files: HashMap::new(),
             tracked_files: vec![],
+            ..Default::default()
         };
         (graph, repo)
     }

@@ -241,6 +241,10 @@ impl GitRepo for Git2Repo {
             }),
         }
     }
+
+    fn git_dir(&self) -> PathBuf {
+        self.repo.path().to_path_buf()
+    }
 }
 
 #[cfg(test)]

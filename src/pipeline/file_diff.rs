@@ -139,6 +139,7 @@ mod tests {
             base_files,
             head_files,
             tracked_files: vec![],
+            ..Default::default()
         }
     }
 

@@ -60,6 +60,14 @@ pub struct Cli {
     /// found.
     #[arg(long = "nvim-cmd")]
     pub nvim_cmd: Vec<String>,
+    /// Print every captured review comment (see
+    /// [`crate::review::comments`]) as markdown to stdout instead of
+    /// launching the GUI or dumping the graph, then exit. Headless, like
+    /// `--dump` -- reads `.git/vdiff/comments.json` directly, no graph
+    /// build needed. Exits 0 with a "No comments." message if the store is
+    /// empty or hasn't been created yet.
+    #[arg(long)]
+    pub export_comments: bool,
 }
 
 /// `--dump` output format.

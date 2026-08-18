@@ -28,6 +28,10 @@ fn main() -> ExitCode {
         }
     };
 
+    if cli.export_comments {
+        return export_comments(&repo_path);
+    }
+
     // Resolved once up front and reused for both the graph build and the
     // diff pane's later `Cmd::LoadDiff` lookups, so both agree on the same
     // base commit for the lifetime of this run.
@@ -79,6 +83,53 @@ fn main() -> ExitCode {
             )
         }
     }
+}
+
+/// `--export-comments`: print every captured review comment (see
+/// [`vdiff::review::comments`]) as markdown to stdout and exit -- headless,
+/// like `--dump`, and doesn't need a graph build at all (comments are keyed
+/// by path/line, not by node). Re-discovers the repository via `git2`
+/// directly to get its actual git directory (`repo.path()` -- see
+/// [`vdiff::pipeline::repo::GitRepo::git_dir`]'s doc for why this can't be
+/// `<worktree>/.git` joined by hand) and current branch name for the
+/// markdown header; the workdir is only used for the header's repo-name
+/// display, with a friendly fallback for a bare repository (no workdir) --
+/// unlike the GUI/`--dump` paths, comments don't otherwise need one.
+fn export_comments(repo_path: &Path) -> ExitCode {
+    let repo = match git2::Repository::discover(repo_path) {
+        Ok(repo) => repo,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let branch = repo
+        .head()
+        .ok()
+        .and_then(|head| head.shorthand().ok().map(str::to_string))
+        .unwrap_or_else(|| "HEAD".to_string());
+    let repo_name = repo
+        .workdir()
+        .map(repo_dir_name)
+        .unwrap_or_else(|| "(bare repository)".to_string());
+    let git_dir = repo.path();
+
+    let comments = match vdiff::review::store::load(git_dir) {
+        Ok(comments) => comments,
+        Err(err) => {
+            eprintln!(
+                "error loading {}: {err}",
+                vdiff::review::store::comments_path(git_dir).display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    print!(
+        "{}",
+        vdiff::review::comments::render_markdown(&comments, &repo_name, &branch)
+    );
+    ExitCode::SUCCESS
 }
 
 /// `--dump <format>`: render `graph`, computing the `--include-diffs`

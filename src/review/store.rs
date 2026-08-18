@@ -1,9 +1,15 @@
 //! Glue-side IO wrapper around [`crate::review::comments`]: load/save the
-//! local review-comment store at `<repo>/.git/vdiff/comments.json`. Kept
-//! outside the `.git` worktree tracking (inside `.git` itself, like git's
-//! own internal state) so comments never show up in `git status`/diffs of
-//! the reviewed repo -- they're vdiff's own bookkeeping, not part of the
-//! change set being reviewed. Pretty-printed and always re-saved in
+//! local review-comment store at `<git_dir>/vdiff/comments.json`, where
+//! `git_dir` is the repository's *actual* git directory (see
+//! [`crate::pipeline::repo::GitRepo::git_dir`]) -- never `<repo
+//! root>/.git` joined by hand, which breaks the moment `.git` is a gitlink
+//! file rather than a directory (`git worktree add`, submodules; notably,
+//! `vdiff`'s own review branches are developed inside exactly such a
+//! worktree). Living under the git dir keeps comments out of `git
+//! status`/diffs of the reviewed repo -- they're vdiff's own bookkeeping,
+//! not part of the change set being reviewed -- and, as a bonus, gives each
+//! worktree of a repo its own independent comment store rather than
+//! sharing one. Pretty-printed and always re-saved in
 //! [`crate::review::comments::sort_comments`] order, so a `git diff` of
 //! `comments.json` itself (if anyone ever did track it) stays sane.
 
@@ -13,16 +19,16 @@ use std::path::{Path, PathBuf};
 
 use super::comments::Comment;
 
-/// Where the comment store lives for a repo whose git dir (or worktree
-/// root -- either works, see the call sites) is `repo_root`.
-pub fn comments_path(repo_root: &Path) -> PathBuf {
-    repo_root.join(".git").join("vdiff").join("comments.json")
+/// Where the comment store lives, given the repository's actual git
+/// directory.
+pub fn comments_path(git_dir: &Path) -> PathBuf {
+    git_dir.join("vdiff").join("comments.json")
 }
 
 /// Load every stored comment, or an empty list if the store doesn't exist
 /// yet (a fresh repo with no comments captured is not an error).
-pub fn load(repo_root: &Path) -> io::Result<Vec<Comment>> {
-    let path = comments_path(repo_root);
+pub fn load(git_dir: &Path) -> io::Result<Vec<Comment>> {
+    let path = comments_path(git_dir);
     match fs::read_to_string(&path) {
         Ok(contents) => serde_json::from_str(&contents)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err)),
@@ -31,13 +37,13 @@ pub fn load(repo_root: &Path) -> io::Result<Vec<Comment>> {
     }
 }
 
-/// Save `comments` as pretty-printed JSON, creating `.git/vdiff/` if it
-/// doesn't exist yet. Callers are expected to have already run
+/// Save `comments` as pretty-printed JSON, creating `<git_dir>/vdiff/` if
+/// it doesn't exist yet. Callers are expected to have already run
 /// [`crate::review::comments::sort_comments`] (or gone through
 /// [`crate::review::comments::add_comment`], which does it for them) --
 /// this just serializes whatever order it's given.
-pub fn save(repo_root: &Path, comments: &[Comment]) -> io::Result<()> {
-    let path = comments_path(repo_root);
+pub fn save(git_dir: &Path, comments: &[Comment]) -> io::Result<()> {
+    let path = comments_path(git_dir);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

@@ -194,6 +194,7 @@ mod tests {
                 PathBuf::from("lib/my_app/unchanged.ex"),
                 PathBuf::from("README.md"),
             ],
+            ..Default::default()
         }
     }
 
