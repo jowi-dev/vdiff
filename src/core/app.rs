@@ -16,22 +16,27 @@ use crate::graph::test_modules::hide_test_modules;
 /// Which screen is currently shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
-    /// The two-panel screen: the node graph, plus (once opened) the file
-    /// viewer pane -- see [`Pane`].
+    /// The graph screen: the node graph fills the whole viewport; once a
+    /// file is opened, the file viewer takes over as a fullscreen overlay
+    /// on top of it (see [`Pane`], and the rendering glue in
+    /// `crate::ui::eframe_app`/`crate::ui::overlay` -- core has no notion
+    /// of panes/panels/overlays, only which of the two logically has
+    /// keyboard focus).
     Graph,
     /// The full-screen diff pane for the node focused when it was opened.
     Diff,
 }
 
-/// Which of [`Screen::Graph`]'s two panels has keyboard focus. Meaningful
+/// Which of [`Screen::Graph`]'s two modes has keyboard focus. Meaningful
 /// only once [`App::file_view`] is `Some`; while it's `None` the graph has
-/// the whole window and `pane` stays [`Pane::Graph`].
+/// the whole window and `pane` stays [`Pane::Graph`]. Purely a focus/state
+/// concept in core -- how each renders (fullscreen graph vs. a fullscreen
+/// editor overlay on top of it) is entirely the rendering glue's concern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
-    /// The node graph (left panel, or the whole window with no file pane
-    /// open).
+    /// The node graph.
     Graph,
-    /// The file viewer (right panel).
+    /// The file viewer.
     File,
 }
 

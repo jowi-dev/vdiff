@@ -32,9 +32,9 @@ const CALL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Owns a live [`NvimSession`] plus the cols/rows last sent to it, so
 /// [`show`] only fires [`NvimCmd::Resize`] when the pane's pixel size
-/// actually changes the cell grid (debounced -- a resizing SidePanel
-/// repaints every frame, but the grid only needs to hear about it once per
-/// distinct cols/rows pair).
+/// actually changes the cell grid (debounced -- every frame repaints, but
+/// the grid only needs to hear about a size change once per distinct
+/// cols/rows pair).
 pub struct NvimPane {
     session: NvimSession,
     cols: u16,
@@ -209,11 +209,14 @@ const DEAD_MESSAGE: &str = "nvim exited — move focus or press Enter to relaunc
 
 /// Paint `pane`'s current grid into the remaining space of `ui`, resizing
 /// the nvim UI first if the available space implies a different cols/rows
-/// than last frame. `focused` draws the block cursor -- matches the
-/// built-in file viewer's `focused`-gated border/cursor convention. If the
-/// session has died (see [`NvimPane::is_alive`]), paints [`DEAD_MESSAGE`]
-/// instead of the (stale) grid.
-pub fn show(ui: &mut Ui, pane: &mut NvimPane, focused: bool) {
+/// than last frame. Always draws the block cursor -- this only ever
+/// paints while [`crate::ui::overlay`]'s fullscreen editor overlay is open,
+/// which only happens when the nvim pane genuinely has keyboard focus (see
+/// `crate::core::app::Pane::File`), so there's no "visible but unfocused"
+/// state left to distinguish. If the session has died (see
+/// [`NvimPane::is_alive`]), paints [`DEAD_MESSAGE`] instead of the (stale)
+/// grid.
+pub fn show(ui: &mut Ui, pane: &mut NvimPane) {
     if !pane.is_alive() {
         ui.centered_and_justified(|ui| ui.label(DEAD_MESSAGE));
         return;
@@ -239,18 +242,16 @@ pub fn show(ui: &mut Ui, pane: &mut NvimPane, focused: bool) {
         );
     }
 
-    if focused {
-        let (cursor_row, cursor_col) = grid.cursor;
-        let rect = Rect::from_min_size(
-            origin
-                + Vec2::new(
-                    cursor_col as f32 * char_width,
-                    cursor_row as f32 * row_height,
-                ),
-            Vec2::new(char_width, row_height),
-        );
-        painter.rect_filled(rect, 0.0, Color32::from_white_alpha(110));
-    }
+    let (cursor_row, cursor_col) = grid.cursor;
+    let cursor_rect = Rect::from_min_size(
+        origin
+            + Vec2::new(
+                cursor_col as f32 * char_width,
+                cursor_row as f32 * row_height,
+            ),
+        Vec2::new(char_width, row_height),
+    );
+    painter.rect_filled(cursor_rect, 0.0, Color32::from_white_alpha(110));
 
     // Reserve the space so sibling widgets/the panel layout account for it.
     ui.allocate_space(Vec2::new(

@@ -7,4 +7,5 @@ pub mod eframe_app;
 pub mod file_view;
 pub mod graph_view;
 pub mod nvim_pane;
+pub mod overlay;
 pub mod theme;

@@ -20,12 +20,14 @@
 //! see that function's doc for why the `Ctrl-w` pane-switch chord in
 //! particular needs to be handled against real egui event sequences
 //! rather than per-event here. `core::App`/`update` never learn nvim
-//! mode exists: [`Cmd::LoadFile`] is translated to
-//! [`crate::nvim::session::NvimCmd::OpenFile`] here in [`VdiffApp::execute`],
-//! with an empty [`FileViewState`] dispatched back through the reducer just
-//! to keep its `file_view.is_some()`-gated invariants (the file pane is
-//! open, `Ctrl-w l` has something to switch to) satisfied without teaching
-//! `core` a second file-viewing mode.
+//! mode exists: [`Cmd::LoadFile`] loads the same real [`FileViewState`]
+//! either way (see [`VdiffApp::load_file`]) and, in nvim mode, additionally
+//! opens the file in the session via
+//! [`crate::nvim::session::NvimCmd::OpenFile`] -- the loaded state still
+//! flows through the reducer so `file_view.is_some()`-gated invariants
+//! (the file pane is open, `Ctrl-w l` has something to switch to) hold
+//! without teaching `core` a second file-viewing mode; it's also where the
+//! changed-line-mark ranges [`NvimPane::open_file`] needs come from.
 
 use std::time::{Duration, Instant};
 
@@ -42,9 +44,9 @@ use crate::nvim::session::NvimCmd;
 use crate::pipeline::file_diff::{changed_head_ranges, load_file_diff};
 use crate::pipeline::repo::GitRepo;
 use crate::ui::diff_view;
-use crate::ui::file_view;
 use crate::ui::graph_view::{self, Transform};
 use crate::ui::nvim_pane::{self, NvimAction, NvimPane};
+use crate::ui::overlay;
 
 /// How long `--smoke` keeps the window open before closing it.
 const SMOKE_DURATION: Duration = Duration::from_secs(2);
@@ -605,34 +607,20 @@ impl VdiffApp {
         }
     }
 
-    /// [`Screen::Graph`] with [`App::file_view`] open: the right-hand pane
-    /// on a resizable [`egui::SidePanel`], then the graph on whatever
-    /// [`egui::CentralPanel`] space remains. In nvim mode the pane renders
-    /// [`nvim_pane::show`] instead of the built-in [`file_view::show`] --
-    /// see the module doc for why `App::file_view` being (emptily) `Some`
-    /// still gates this the same way for both. Records the row count
-    /// [`file_view::show`] fit into that space as [`App::viewport_rows`],
-    /// read one frame later by [`Msg::FileHalfPage`] -- see that field's
-    /// doc for why this can't be computed any earlier; not meaningful in
-    /// nvim mode (`Ctrl-d`/`Ctrl-u` are forwarded raw, see
-    /// [`Self::handle_nvim_keys`]), so left untouched there.
-    fn show_two_panel(&mut self, ui: &mut egui::Ui) {
+    /// [`Screen::Graph`]: the graph always fills the whole viewport now --
+    /// no side panel, ever (see the module doc for why the earlier 50%
+    /// split was replaced with this). [`Pane::File`] with a file open
+    /// instead paints [`overlay::show`] fullscreen on top of the
+    /// already-painted graph -- a scrim, an opaque header strip, then
+    /// either the nvim grid or the built-in [`crate::ui::file_view::show`] beneath
+    /// it. Records the row count [`overlay::show`] reports back (only
+    /// meaningful in built-in mode -- nvim's `Ctrl-d`/`Ctrl-u` are
+    /// forwarded raw, see [`Self::handle_nvim_keys`]) as
+    /// [`App::viewport_rows`], read one frame later by
+    /// [`Msg::FileHalfPage`] -- see that field's doc for why this can't be
+    /// computed any earlier.
+    fn show_graph_screen(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        if self.app.file_view.is_some() {
-            let focused = self.app.pane == Pane::File;
-            if let Some(nvim) = self.nvim.as_mut() {
-                egui::Panel::right("file_pane")
-                    .resizable(true)
-                    .default_size(ui.available_width() * 0.5)
-                    .show(ui, |ui| nvim_pane::show(ui, nvim, focused));
-            } else if let Some(file_view) = self.app.file_view.as_ref() {
-                let response = egui::Panel::right("file_pane")
-                    .resizable(true)
-                    .default_size(ui.available_width() * 0.5)
-                    .show(ui, |ui| file_view::show(ui, file_view, focused));
-                self.app.viewport_rows = response.inner;
-            }
-        }
         egui::CentralPanel::default().show(ui, |ui| {
             graph_view::show(
                 ui,
@@ -641,6 +629,14 @@ impl VdiffApp {
                 &mut self.transform,
                 &mut self.last_focus,
             );
+            if self.app.pane == Pane::File {
+                if let Some(file_view) = self.app.file_view.as_ref() {
+                    let viewport_rows = overlay::show(ui, &self.app, file_view, self.nvim.as_mut());
+                    if let Some(rows) = viewport_rows {
+                        self.app.viewport_rows = rows;
+                    }
+                }
+            }
         });
         self.show_picker(&ctx);
     }
@@ -665,7 +661,7 @@ impl eframe::App for VdiffApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         match self.app.screen {
-            Screen::Graph => self.show_two_panel(ui),
+            Screen::Graph => self.show_graph_screen(ui),
             Screen::Diff => {
                 egui::CentralPanel::default().show(ui, |ui| {
                     self.show_diff(ui);

@@ -98,18 +98,35 @@ pub fn focus_ring_stroke() -> Stroke {
     Stroke::new(2.0, FOCUS_RING)
 }
 
-/// Border stroke for the file viewer pane: [`FOCUS_RING`] when it has
-/// keyboard focus ([`crate::core::app::Pane::File`]), a faint gray
-/// otherwise -- the graph pane signals its own focus via the focused
-/// node's ring, so the file pane only needs to visibly dim, not vanish,
-/// when focus is elsewhere.
-pub fn pane_border_stroke(focused: bool) -> Stroke {
-    if focused {
-        Stroke::new(2.0, FOCUS_RING)
-    } else {
-        Stroke::new(1.0, Color32::from_rgb(0x3a, 0x3a, 0x3a))
-    }
+/// Alpha (`0..=255`) of the scrim painted over the graph when the
+/// fullscreen editor overlay ([`crate::ui::overlay`]) is open -- ~92%
+/// opaque, so the graph reads as a faint ambient glow behind the editor
+/// rather than a genuinely visible second information channel (text
+/// legibility over whatever colorscheme/content is on top wins over any
+/// amount of "see-through" -- this is a continuity cue, not something the
+/// user is meant to read through). Tunable in one place if that balance
+/// ever needs to shift.
+pub const OVERLAY_SCRIM_ALPHA: u8 = 235;
+
+/// The scrim color the overlay paints over the whole viewport before its
+/// header/content -- [`CANVAS_BG`] at [`OVERLAY_SCRIM_ALPHA`].
+pub fn overlay_scrim_color() -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        CANVAS_BG.r(),
+        CANVAS_BG.g(),
+        CANVAS_BG.b(),
+        OVERLAY_SCRIM_ALPHA,
+    )
 }
+
+/// The overlay's header strip background -- fully opaque (unlike the
+/// scrim beneath it) and a shade lighter than [`CANVAS_BG`] so the strip
+/// reads as a distinct, solid surface rather than more of the dimmed
+/// graph showing through.
+pub const OVERLAY_HEADER_BG: Color32 = Color32::from_rgb(0x28, 0x28, 0x28);
+
+/// The overlay header strip's text color.
+pub const OVERLAY_HEADER_TEXT: Color32 = Color32::from_rgb(0xe0, 0xe0, 0xe0);
 
 /// A deterministic, saturated hue for `root_id`, used as a node's left-edge
 /// stripe and its legend-row swatch (see [`crate::ui::graph_view`]) so a

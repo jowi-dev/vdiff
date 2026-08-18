@@ -5,44 +5,34 @@
 //! [`FileViewEntry::changed_ranges`] span) and code table, pinned to the
 //! top of `scroll_row` (unlike `diff_view`'s row-centering scroll, so
 //! `scroll_row` reads literally as "top visible line" for `j`/`k` vim
-//! scrolling).
-
+//! scrolling). Painted inside [`crate::ui::overlay`]'s fullscreen editor
+//! overlay, below its own header strip -- this module no longer draws a
+//! header or a focus border of its own (there's only ever one place this
+//! can be showing now, and the overlay's header covers the same
+//! information plus the focused node's identity).
 use egui::{Align, Color32, Context, TextStyle, Ui};
 use egui_extras::syntax_highlighting::{highlight, CodeTheme};
 use egui_extras::{Column, TableBuilder};
 
 use crate::core::file_view::{FileViewEntry, FileViewState};
 use crate::ui::diff_view::language_for;
-use crate::ui::theme;
 
 /// Accent color for the change-marker bar drawn in the gutter next to lines
 /// inside a changed range.
 const CHANGE_MARKER_COLOR: Color32 = Color32::from_rgb(0x6a, 0xc9, 0x6a);
 
-/// Draw the file viewer pane for `file_view`'s current file: an accent
-/// border reflecting `focused` (see [`theme::pane_border_stroke`]), header,
-/// virtualized table, key-hint footer. Returns the number of table rows
-/// that fit in the space available this frame -- the eframe glue feeds
-/// this back into [`crate::core::app::App::viewport_rows`] for
-/// `Ctrl-d`/`Ctrl-u` half-page math, since only the render layer knows the
-/// actual pixel height available.
-pub fn show(ui: &mut Ui, file_view: &FileViewState, focused: bool) -> usize {
-    let border_rect = ui.max_rect();
-    ui.painter().rect_stroke(
-        border_rect,
-        0.0,
-        theme::pane_border_stroke(focused),
-        egui::StrokeKind::Inside,
-    );
-
+/// Draw the file viewer's current file: virtualized table, key-hint
+/// footer. Returns the number of table rows that fit in the space
+/// available this frame -- the eframe glue feeds this back into
+/// [`crate::core::app::App::viewport_rows`] for `Ctrl-d`/`Ctrl-u`
+/// half-page math, since only the render layer knows the actual pixel
+/// height available.
+pub fn show(ui: &mut Ui, file_view: &FileViewState) -> usize {
     let Some(file) = file_view.current_file() else {
         ui.heading("No files for this node");
         footer(ui);
         return 1;
     };
-
-    header(ui, file_view, file);
-    ui.separator();
 
     let ctx = ui.ctx().clone();
     let theme = CodeTheme::from_memory(&ctx, ui.style());
@@ -62,27 +52,6 @@ pub fn show(ui: &mut Ui, file_view: &FileViewState, focused: bool) -> usize {
 
     footer(ui);
     viewport_rows
-}
-
-/// The panel header: file path, `(i/N)` when multi-file, change-range
-/// count, and a `(deleted)` marker for files absent at head.
-fn header(ui: &mut Ui, file_view: &FileViewState, file: &FileViewEntry) {
-    ui.horizontal(|ui| {
-        ui.strong(file.path.display().to_string());
-        if file.deleted {
-            ui.weak("(deleted)");
-        }
-        if file_view.files.len() > 1 {
-            ui.label(format!(
-                "({}/{})",
-                file_view.file_index + 1,
-                file_view.files.len()
-            ));
-        }
-        if !file.changed_ranges.is_empty() {
-            ui.label(format!("{} changes", file.changed_ranges.len()));
-        }
-    });
 }
 
 /// The one-line key-hint footer, matching this project's keyboard-first
