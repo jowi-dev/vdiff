@@ -99,14 +99,14 @@ pub fn focus_ring_stroke() -> Stroke {
 }
 
 /// Alpha (`0..=255`) of the scrim painted over the graph when the
-/// fullscreen editor overlay ([`crate::ui::overlay`]) is open -- ~92%
+/// fullscreen editor overlay ([`crate::ui::overlay`]) is open -- ~85%
 /// opaque, so the graph reads as a faint ambient glow behind the editor
 /// rather than a genuinely visible second information channel (text
 /// legibility over whatever colorscheme/content is on top wins over any
 /// amount of "see-through" -- this is a continuity cue, not something the
 /// user is meant to read through). Tunable in one place if that balance
 /// ever needs to shift.
-pub const OVERLAY_SCRIM_ALPHA: u8 = 235;
+pub const OVERLAY_SCRIM_ALPHA: u8 = 217;
 
 /// The scrim color the overlay paints over the whole viewport before its
 /// header/content -- [`CANVAS_BG`] at [`OVERLAY_SCRIM_ALPHA`].
