@@ -88,9 +88,9 @@ pub enum KeyOutcome {
 /// 3. Otherwise, per `ctx.screen`/`ctx.pane`:
 ///    - [`Screen::Graph`]/[`Pane::Graph`]: `h`/`j`/`k`/`l` ->
 ///      [`Msg::FocusMove`], `Enter` -> [`Msg::OpenFile`], `d` ->
-///      [`Msg::OpenDiff`], `g` -> [`KeyOutcome::Pending`], `t` ->
-///      [`Msg::ToggleTests`], `c` -> [`Msg::CommentNode`], `Ctrl-w` ->
-///      [`KeyOutcome::Pending`].
+///      [`Msg::OpenDiff`], `g` -> [`KeyOutcome::Pending`] (`gt` ->
+///      [`Msg::GoToTest`]), `t` -> [`Msg::ToggleTests`], `c` ->
+///      [`Msg::CommentNode`], `Ctrl-w` -> [`KeyOutcome::Pending`].
 ///    - [`Screen::Graph`]/[`Pane::File`]: `j`/`k` -> [`Msg::FileScroll`],
 ///      `Ctrl-d`/`Ctrl-u` -> [`Msg::FileHalfPage`], `g`/`]`/`[` ->
 ///      [`KeyOutcome::Pending`], `G` -> [`Msg::FileJumpBottom`], `d` ->
@@ -175,6 +175,9 @@ fn resolve_pending(pending: Pending, key: KeyInput, ctx: KeyContext) -> KeyOutco
         }
         (Pending::Char('g'), Screen::Graph, Pane::File, KeyInput::Char('g')) => {
             KeyOutcome::Msg(Msg::FileJumpTop)
+        }
+        (Pending::Char('g'), Screen::Graph, Pane::Graph, KeyInput::Char('t')) => {
+            KeyOutcome::Msg(Msg::GoToTest)
         }
         (Pending::Char(']'), Screen::Diff, _, KeyInput::Char('c')) => {
             KeyOutcome::Msg(Msg::DiffNextHunk)
@@ -431,6 +434,23 @@ mod tests {
             map_key(KeyInput::Char('r'), ctx),
             KeyOutcome::Msg(Msg::FollowDependents)
         );
+    }
+
+    #[test]
+    fn g_then_t_goes_to_test_on_graph_pane() {
+        let mut ctx = graph_ctx();
+        ctx.pending = Some(Pending::Char('g'));
+        assert_eq!(
+            map_key(KeyInput::Char('t'), ctx),
+            KeyOutcome::Msg(Msg::GoToTest)
+        );
+    }
+
+    #[test]
+    fn g_then_t_on_file_pane_is_not_go_to_test() {
+        let mut ctx = file_pane_ctx();
+        ctx.pending = Some(Pending::Char('g'));
+        assert_eq!(map_key(KeyInput::Char('t'), ctx), KeyOutcome::None);
     }
 
     #[test]

@@ -11,7 +11,9 @@ use crate::core::file_view::FileViewState;
 use crate::core::focus::{dep_targets, dependent_sources, move_focus, Direction};
 use crate::graph::layout::{layout, rows_with_x_centers};
 use crate::graph::model::{NodeId, ProjectGraph};
-use crate::graph::test_modules::{group_matched_test_modules, hide_test_modules};
+use crate::graph::test_modules::{
+    group_matched_test_modules, hide_test_modules, matched_test_module,
+};
 
 /// Which screen is currently shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +253,15 @@ pub enum Msg {
     /// active to prompt with) is glue-side IO `core` has no business
     /// knowing about.
     CommentNode,
+    /// `gt` on [`Pane::Graph`]: open the focused module's matched test
+    /// module's file, per [`crate::graph::test_modules::matched_test_module`].
+    /// Only acted on on [`Screen::Graph`]/[`Pane::Graph`] with no picker
+    /// open, matching every other graph-pane message. `focus` does not
+    /// move -- the test node is pruned from the visible layout regardless
+    /// of [`App::show_tests`], so there's nothing in `layers` to focus it
+    /// onto; the module stays focused while its test's file shows in
+    /// [`Pane::File`].
+    GoToTest,
 }
 
 /// I/O the caller should perform as a result of [`update`]. `update` never
@@ -431,6 +442,7 @@ pub fn update(mut app: App, msg: Msg) -> (App, Cmd) {
             let focus = app.focus.clone();
             (app, Cmd::CommentNode(focus))
         }
+        Msg::GoToTest => go_to_test(app),
     }
 }
 
@@ -610,6 +622,22 @@ fn open_file(mut app: App) -> (App, Cmd) {
     let focus = app.focus.clone();
     app.pane = Pane::File;
     (app, Cmd::LoadFile(focus))
+}
+
+/// Handle [`Msg::GoToTest`]: only on [`Screen::Graph`]/[`Pane::Graph`] with
+/// no picker open, look up the focused node's matched test module and, if
+/// there is one, switch `pane` to [`Pane::File`] and emit [`Cmd::LoadFile`]
+/// for the test's id -- but leave `focus` on the module itself (see
+/// [`Msg::GoToTest`]'s doc). A no-op if there's no matching test.
+fn go_to_test(mut app: App) -> (App, Cmd) {
+    if !on_graph_with_no_picker_and_graph_pane(&app) {
+        return (app, Cmd::None);
+    }
+    let Some(test_id) = matched_test_module(&app.graph, &app.focus) else {
+        return (app, Cmd::None);
+    };
+    app.pane = Pane::File;
+    (app, Cmd::LoadFile(test_id))
 }
 
 #[cfg(test)]
@@ -1323,6 +1351,100 @@ mod tests {
         let mut app = app_at("leaf_a");
         app.pane = Pane::File;
         let (_app, cmd) = update(app, Msg::CommentNode);
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    /// A minimal graph with one module (`module`, display name `Foo`) and
+    /// its matched test module (`module_test`, display name `FooTest`,
+    /// sharing `module`'s parent so [`crate::graph::test_modules::tested_node_id`]'s
+    /// same-root check passes) -- for [`Msg::GoToTest`] tests, which don't
+    /// need `graph_fixture`'s dependency-edge shape.
+    fn graph_fixture_with_test_module() -> ProjectGraph {
+        let root = NodeId::from("root");
+        let module = NodeId::from("module");
+        let test = NodeId::from("module_test");
+
+        let leaf = |id: &NodeId, name: &str| ModuleNode {
+            id: id.clone(),
+            display_name: name.to_string(),
+            parent: Some(root.clone()),
+            children: vec![],
+            status: GitStatus::Unchanged,
+            files: vec![crate::graph::model::FileRef {
+                path: PathBuf::from(format!("{name}.rs")),
+                base_blob: Some("b".to_string()),
+                head_blob: Some("h".to_string()),
+            }],
+        };
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            root.clone(),
+            ModuleNode {
+                id: root.clone(),
+                display_name: "root".to_string(),
+                parent: None,
+                children: vec![module.clone(), test.clone()],
+                status: GitStatus::Unchanged,
+                files: vec![],
+            },
+        );
+        nodes.insert(module.clone(), leaf(&module, "Foo"));
+        nodes.insert(test.clone(), leaf(&test, "FooTest"));
+
+        ProjectGraph {
+            roots: vec![root],
+            nodes,
+            edges: vec![],
+        }
+    }
+
+    fn app_at_with_test_module(focus: &str) -> App {
+        let graph = graph_fixture_with_test_module();
+        let result = crate::graph::layout::layout(&graph);
+        let rows = crate::graph::layout::rows_with_x_centers(&result);
+        App {
+            graph,
+            layers: result.layers,
+            rows,
+            focus: NodeId::from(focus),
+            screen: Screen::Graph,
+            diff: None,
+            picker: None,
+            show_tests: false,
+            file_view: None,
+            pane: Pane::Graph,
+            viewport_rows: 20,
+        }
+    }
+
+    #[test]
+    fn go_to_test_switches_pane_and_emits_load_file_for_the_test() {
+        let app = app_at_with_test_module("module");
+        let (app, cmd) = update(app, Msg::GoToTest);
+        assert_eq!(app.pane, Pane::File);
+        assert_eq!(app.focus, NodeId::from("module"));
+        assert_eq!(cmd, Cmd::LoadFile(NodeId::from("module_test")));
+    }
+
+    #[test]
+    fn go_to_test_noop_when_no_matching_test() {
+        let app = app_at("leaf_a");
+        let (app, cmd) = update(app, Msg::GoToTest);
+        assert_eq!(app.pane, Pane::Graph);
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn go_to_test_noop_when_picker_open() {
+        let mut app = app_at_with_test_module("module");
+        app.picker = Some(EdgePicker {
+            candidates: vec![NodeId::from("module_test")],
+            selected: 0,
+        });
+        let (app, cmd) = update(app, Msg::GoToTest);
+        assert_eq!(app.pane, Pane::Graph);
         assert_eq!(cmd, Cmd::None);
     }
 
