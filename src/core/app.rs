@@ -587,15 +587,20 @@ fn picker_select(app: &mut App) {
 }
 
 /// Handle [`Msg::OpenDiff`]: only on [`Screen::Graph`] with no picker open,
-/// switch to [`Screen::Diff`] and emit [`Cmd::LoadDiff`] for the focused
-/// node.
+/// switch to [`Screen::Diff`] and emit [`Cmd::LoadDiff`] for the node whose
+/// file is actually shown: [`App::file_view`]'s node when [`Pane::File`] is
+/// open (after [`Msg::GoToTest`], that's the test, not `focus`, which stays
+/// on the module -- see [`Msg::GoToTest`]'s doc), `focus` otherwise.
 fn open_diff(mut app: App) -> (App, Cmd) {
     if !on_graph_with_no_picker(&app) {
         return (app, Cmd::None);
     }
-    let focus = app.focus.clone();
+    let target = match (&app.file_view, app.pane) {
+        (Some(file_view), Pane::File) => file_view.node.clone(),
+        _ => app.focus.clone(),
+    };
     app.screen = Screen::Diff;
-    (app, Cmd::LoadDiff(focus))
+    (app, Cmd::LoadDiff(target))
 }
 
 /// Shared guard for the `File*` messages that mutate the open file pane:
@@ -965,6 +970,26 @@ mod tests {
         let (app, cmd) = update(app, Msg::OpenDiff);
         assert_eq!(app.screen, Screen::Diff);
         assert_eq!(cmd, Cmd::LoadDiff(NodeId::from("leaf_a")));
+    }
+
+    #[test]
+    fn open_diff_targets_the_displayed_files_node_after_go_to_test() {
+        // After `gt`, `focus` stays on the module while `file_view.node` is
+        // the test -- `d` should diff what's actually on screen (the test).
+        let mut app = app_at_with_test_module("module");
+        app.pane = Pane::File;
+        app.file_view = Some(FileViewState::new(NodeId::from("module_test"), vec![]));
+        let (app, cmd) = update(app, Msg::OpenDiff);
+        assert_eq!(app.focus, NodeId::from("module"));
+        assert_eq!(cmd, Cmd::LoadDiff(NodeId::from("module_test")));
+    }
+
+    #[test]
+    fn open_diff_targets_focus_from_graph_pane_even_with_a_stale_file_view() {
+        let mut app = app_at_with_test_module("module");
+        app.file_view = Some(FileViewState::new(NodeId::from("module_test"), vec![]));
+        let (_app, cmd) = update(app, Msg::OpenDiff);
+        assert_eq!(cmd, Cmd::LoadDiff(NodeId::from("module")));
     }
 
     /// An empty diff pane (no files loaded) for the given node -- enough
