@@ -162,7 +162,14 @@ fn run_gui(
     };
 
     let title = format!("vdiff — {}", repo_dir_name(repo_path));
-    let native_options = eframe::NativeOptions::default();
+    // Start maximized rather than macOS native fullscreen: fullscreen opens
+    // a separate Space, which is more disorienting than helpful for a dev
+    // tool the user switches in and out of constantly. Maximized still
+    // gives this data-dense graph the whole screen without that jump.
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_maximized(true),
+        ..Default::default()
+    };
     let result = eframe::run_native(
         &title,
         native_options,
