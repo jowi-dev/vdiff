@@ -7,4 +7,5 @@ pub mod graph;
 pub mod keymap;
 pub mod nvim;
 pub mod pipeline;
+pub mod review;
 pub mod ui;
