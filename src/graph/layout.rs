@@ -124,33 +124,51 @@ pub struct LayoutResult {
 
 /// Lay out an entire project graph: assign layers, pack each layer into a
 /// horizontal band (wrapping onto extra rows if it'd otherwise be too
-/// wide), stack bands top-to-bottom with [`BAND_GAP`] between them, then
-/// resolve straight-line edge paths.
+/// wide), center every row -- band or wrapped sub-row alike -- within the
+/// graph's overall width (the widest row anywhere in the layout), stack
+/// bands top-to-bottom with [`BAND_GAP`] between them, then resolve
+/// straight-line edge paths.
+///
+/// Centering (rather than left-aligning every row at `x=0`, the old
+/// behavior) is what makes the graph read as a centered pyramid/stack
+/// instead of a ragged left edge: a narrow band sitting under a much wider
+/// one no longer looks accidentally offset from it.
 pub fn layout(graph: &ProjectGraph) -> LayoutResult {
     let layers = assign_layers(graph);
 
+    let bands: Vec<(Vec<Row>, Size)> = layers
+        .iter()
+        .map(|layer| {
+            let items: Vec<(NodeId, Size)> = layer
+                .iter()
+                .map(|id| (id.clone(), node_size(graph, id)))
+                .collect();
+            pack_rows(&items)
+        })
+        .collect();
+
+    let graph_width = bands
+        .iter()
+        .flat_map(|(rows, _)| rows.iter().map(|row| row.width))
+        .fold(0.0_f32, f32::max);
+
     let mut rects = HashMap::new();
     let mut cursor_y = 0.0_f32;
-    for layer in &layers {
-        let items: Vec<(NodeId, Size)> = layer
-            .iter()
-            .map(|id| (id.clone(), node_size(graph, id)))
-            .collect();
-        let (positions, band_size) = pack_row(&items);
-        // `pack_row` preserves input order in its returned positions, so
-        // zipping against `items` recovers each id's actual (variable) size
-        // -- `positions` itself only carries `Pos`, not `Size`.
-        for ((_, size), (id, pos)) in items.iter().zip(positions.iter()) {
-            rects.insert(
-                id.clone(),
-                Rect {
-                    origin: Pos {
-                        x: pos.x,
-                        y: pos.y + cursor_y,
+    for (rows, band_size) in &bands {
+        for row in rows {
+            let shift_x = (graph_width - row.width) / 2.0;
+            for (id, pos, size) in &row.items {
+                rects.insert(
+                    id.clone(),
+                    Rect {
+                        origin: Pos {
+                            x: pos.x + shift_x,
+                            y: pos.y + cursor_y,
+                        },
+                        size: *size,
                     },
-                    size: *size,
-                },
-            );
+                );
+            }
         }
         cursor_y += band_size.h + BAND_GAP;
     }
@@ -190,12 +208,22 @@ fn min_band_width(total_area: f32) -> f32 {
     f32::max(MIN_BAND_WIDTH, total_area.sqrt() * 1.3)
 }
 
+/// One packed row within a band: its items positioned relative to `(0, 0)`
+/// (`y` already reflects which sub-row within the band this is, from
+/// wrapping), plus its own content width -- used by [`layout`] to center
+/// each row independently within the graph's overall width.
+struct Row {
+    items: Vec<(NodeId, Pos, Size)>,
+    width: f32,
+}
+
 /// Pack `items` (in caller-supplied order -- for a layer, `assign_layers`'s
 /// root-then-name order) onto rows: place left-to-right with [`PADDING`]
 /// gaps, wrapping to a new row once the current row would exceed
-/// [`min_band_width`]. Returns each item's position relative to `(0, 0)`,
-/// plus the bounding size of the packed content.
-fn pack_row(items: &[(NodeId, Size)]) -> (Vec<(NodeId, Pos)>, Size) {
+/// [`min_band_width`]. Returns each wrapped row (left-aligned at `x=0`,
+/// [`layout`] centers them afterward) plus the bounding size of the packed
+/// content.
+fn pack_rows(items: &[(NodeId, Size)]) -> (Vec<Row>, Size) {
     if items.is_empty() {
         return (Vec::new(), Size { w: 0.0, h: 0.0 });
     }
@@ -203,34 +231,43 @@ fn pack_row(items: &[(NodeId, Size)]) -> (Vec<(NodeId, Pos)>, Size) {
     let total_area: f32 = items.iter().map(|(_, s)| s.w * s.h).sum();
     let target_width = min_band_width(total_area);
 
-    let mut positions = Vec::with_capacity(items.len());
+    let mut rows: Vec<Row> = Vec::new();
+    let mut current_row: Vec<(NodeId, Pos, Size)> = Vec::new();
     let mut cursor_x = 0.0_f32;
     let mut cursor_y = 0.0_f32;
     let mut row_height = 0.0_f32;
-    let mut content_w = 0.0_f32;
 
     for (id, size) in items {
         if cursor_x > 0.0 && cursor_x + size.w > target_width {
+            rows.push(Row {
+                items: std::mem::take(&mut current_row),
+                width: cursor_x - PADDING,
+            });
             cursor_y += row_height + PADDING;
             cursor_x = 0.0;
             row_height = 0.0;
         }
 
-        positions.push((
+        current_row.push((
             id.clone(),
             Pos {
                 x: cursor_x,
                 y: cursor_y,
             },
+            *size,
         ));
-        content_w = f32::max(content_w, cursor_x + size.w);
         row_height = f32::max(row_height, size.h);
         cursor_x += size.w + PADDING;
     }
+    rows.push(Row {
+        items: current_row,
+        width: cursor_x - PADDING,
+    });
 
     let content_h = cursor_y + row_height;
+    let content_w = rows.iter().map(|row| row.width).fold(0.0_f32, f32::max);
     (
-        positions,
+        rows,
         Size {
             w: content_w,
             h: content_h,
@@ -464,6 +501,51 @@ mod tests {
         let result = layout(&graph);
 
         assert_eq!(result.rects[&NodeId::from("a")].size.w, LEAF_W);
+    }
+
+    #[test]
+    fn narrower_rows_are_centered_within_the_widest_row_in_the_graph() {
+        // Layer 0: one node with a long label (wide box, ~280px at
+        // MAX_LEAF_W). Layer 1: two short-label nodes (~120px each, 248px
+        // total row width). Neither row wraps (well under
+        // MIN_BAND_WIDTH) -- each layer packs onto exactly one row, and
+        // the narrower row (layer 1) must be centered under the wider one
+        // (layer 0), not left-aligned at x=0.
+        let mut graph = graph_from(
+            vec![
+                leaf(
+                    "a",
+                    "a_very_long_display_name_that_should_widen_the_box_a_lot",
+                    None,
+                ),
+                leaf("b", "b", None),
+                leaf("c", "c", None),
+            ],
+            vec!["a", "b", "c"],
+        );
+        graph.edges = vec![edge("a", "b"), edge("a", "c")];
+
+        let result = layout(&graph);
+
+        let a_rect = result.rects[&NodeId::from("a")];
+        let b_rect = result.rects[&NodeId::from("b")];
+        let c_rect = result.rects[&NodeId::from("c")];
+
+        assert_eq!(
+            a_rect.size.w, MAX_LEAF_W,
+            "sanity: layer 0 is the wider row"
+        );
+        assert_eq!(a_rect.origin.x, 0.0, "the widest row anchors at x=0");
+
+        let layer1_width = c_rect.origin.x + c_rect.size.w - b_rect.origin.x;
+        let expected_shift = (a_rect.size.w - layer1_width) / 2.0;
+        assert!(expected_shift > 0.0, "sanity: layer 1 really is narrower");
+        assert!(
+            (b_rect.origin.x - expected_shift).abs() < 0.01,
+            "layer 1's row should be centered under layer 0's: b.x={}, expected shift={}",
+            b_rect.origin.x,
+            expected_shift
+        );
     }
 
     #[test]
