@@ -29,7 +29,7 @@
 //! without teaching `core` a second file-viewing mode; it's also where the
 //! changed-line-mark ranges [`NvimPane::open_file`] needs come from.
 
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use egui::{Align2, Context, Key, Modifiers};
 
@@ -40,11 +40,9 @@ use crate::core::focus::Direction;
 use crate::graph::layout::{layout_with_test_strips, LayoutResult};
 use crate::graph::model::{GitStatus, ModuleNode, NodeId, ProjectGraph};
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome, Pending};
-use crate::nvim::session::{NvimCmd, PendingComment};
+use crate::nvim::session::NvimCmd;
 use crate::pipeline::file_diff::{changed_head_ranges, load_file_diff};
 use crate::pipeline::repo::GitRepo;
-use crate::review::comments::{self, Comment};
-use crate::review::store as comment_store;
 use crate::ui::diff_view;
 use crate::ui::graph_view::{self, Transform};
 use crate::ui::nvim_pane::{self, NvimAction, NvimPane};
@@ -208,6 +206,13 @@ pub struct VdiffApp {
     /// (repeating it on every `c` press outside nvim mode would just be
     /// noise) rather than tracking it any more elaborately.
     warned_comments_need_nvim: bool,
+    /// Whether the "commenting requires the vdiff.nvim plugin" stderr hint
+    /// has already been printed this run -- distinct from
+    /// [`Self::warned_comments_need_nvim`] (that one covers "nvim mode isn't
+    /// even on"; this one covers "nvim mode is on, but the plugin that
+    /// actually handles `c` isn't installed") since a user hitting each one
+    /// needs to fix a different thing. See [`Self::comment_node`].
+    warned_missing_comment_plugin: bool,
 }
 
 /// Everything [`VdiffApp::new`] needs to set up (and later respawn) the
@@ -262,6 +267,7 @@ impl VdiffApp {
             egui_ctx: nvim.egui_ctx,
             nvim_current_file: None,
             warned_comments_need_nvim: false,
+            warned_missing_comment_plugin: false,
         }
     }
 
@@ -322,7 +328,6 @@ impl VdiffApp {
                         .map(|file_ref| file_ref.path.clone());
                     if let (Some(nvim), Some(file)) = (&self.nvim, state.current_file()) {
                         nvim.open_file(file.path.clone(), Some(1), file.changed_ranges.clone());
-                        self.mark_comments_for(&file.path.clone());
                     }
                     self.dispatch(Msg::FileLoaded(state));
                 }
@@ -338,14 +343,22 @@ impl VdiffApp {
 
     /// Handle [`Cmd::CommentNode`]: in nvim mode, open the node's file (via
     /// [`Self::load_file`] -- same as `Enter`/[`Msg::OpenFile`], so the
-    /// same marks/tracking apply) and trigger the comment-compose flow
-    /// prefilled with line range 1..1 and this node's id (an "architecture"
-    /// comment anchors to the file's top line, not a specific range --
-    /// that's the whole point of a node-level rather than line-level
-    /// comment). Outside nvim mode there's no text-input surface to compose
-    /// with (no egui text editor is being built for this MVP), so this
-    /// prints a one-time stderr note instead -- see
-    /// [`Self::warned_comments_need_nvim`].
+    /// same marks/tracking apply) and delegate the actual comment-compose
+    /// flow to `vdiff.nvim` via [`NvimPane::delegate_comment_node`] -- this
+    /// app no longer owns comment capture at all (compose UI, writing
+    /// `comments.json`, rendering comment extmarks all moved to that
+    /// standalone plugin, which loads inside the embedded session
+    /// automatically since it runs the user's own nvim config).
+    ///
+    /// Two distinct fallbacks, kept separate: outside nvim mode entirely
+    /// there's no embedded session to delegate to at all, so this keeps the
+    /// pre-existing "comments require --nvim" note (unchanged, still gated
+    /// by [`Self::warned_comments_need_nvim`]); inside nvim mode but with
+    /// `vdiff.nvim` not installed (delegation returns `false` -- `require`
+    /// failed, or the module has no `comment_range`), it prints the plugin
+    /// hint instead (gated by [`Self::warned_missing_comment_plugin`],
+    /// separately, since these are different diagnoses a user would fix
+    /// differently).
     fn comment_node(&mut self, node: NodeId) {
         if self.nvim.is_none() {
             if !self.warned_comments_need_nvim {
@@ -354,89 +367,17 @@ impl VdiffApp {
             }
             return;
         }
-        let Some(path) = self
-            .app
-            .graph
-            .node(&node)
-            .and_then(|module| module.files.first())
-            .map(|file_ref| file_ref.path.clone())
-        else {
-            return;
-        };
         self.load_file(node.clone());
-        if let Some(nvim) = &self.nvim {
-            nvim.compose_comment(&path, 1, 1, &node.to_string());
+        let delegated = self
+            .nvim
+            .as_ref()
+            .is_some_and(|nvim| nvim.delegate_comment_node(&node.to_string()));
+        if !delegated && !self.warned_missing_comment_plugin {
+            eprintln!(
+                "vdiff: commenting requires the vdiff.nvim plugin (github.com/jowi-dev/vdiff.nvim)"
+            );
+            self.warned_missing_comment_plugin = true;
         }
-    }
-
-    /// The git directory review comments are stored under -- see
-    /// [`crate::review::store`]'s doc for why this has to be the repo's
-    /// actual git dir ([`GitRepo::git_dir`]), not `<worktree>/.git` joined
-    /// by hand.
-    fn comments_git_dir(&self) -> std::path::PathBuf {
-        self.diff_loader.repo.git_dir()
-    }
-
-    /// Drain any `:VdiffComment` invocations that arrived since last frame
-    /// (see [`NvimPane::take_comment_requests`]) and save each one.
-    fn poll_comment_requests(&mut self) {
-        let Some(nvim) = &self.nvim else { return };
-        let requests = nvim.take_comment_requests();
-        for request in requests {
-            self.handle_comment_request(request);
-        }
-    }
-
-    /// Save one captured comment: build a [`Comment`] (id/timestamp
-    /// assigned here -- the one place in this module `SystemTime::now()`
-    /// is called, per the pure/glue split -- [`comments::next_id`]/
-    /// [`comments::format_iso8601`] do the actual pure work), append+sort
-    /// it into the on-disk store, and re-render that file's comment marks
-    /// so the new one shows up immediately without waiting for the next
-    /// file open.
-    fn handle_comment_request(&mut self, request: PendingComment) {
-        let git_dir = self.comments_git_dir();
-        let mut existing = comment_store::load(&git_dir).unwrap_or_default();
-        let comment = Comment {
-            id: comments::next_id(&existing),
-            path: request.path.clone(),
-            start_line: request.start_line as u32,
-            end_line: request.end_line as u32,
-            text: request.text,
-            node: request.node,
-            created_at: comments::format_iso8601(SystemTime::now()),
-        };
-        comments::add_comment(&mut existing, comment);
-        if let Err(err) = comment_store::save(&git_dir, &existing) {
-            eprintln!("warning: failed to save review comment: {err}");
-            return;
-        }
-        self.mark_comments_for(std::path::Path::new(&request.path));
-    }
-
-    /// Re-render every review-comment highlight/sign for `path`'s buffer
-    /// from the on-disk store -- called both right after a file opens (so
-    /// pre-existing comments are visible immediately) and right after a new
-    /// comment is captured and saved. A no-op (no nvim session, or the
-    /// store can't be read) rather than an error -- this is a display
-    /// refresh, not something worth failing a load over.
-    fn mark_comments_for(&self, path: &std::path::Path) {
-        let Some(nvim) = &self.nvim else { return };
-        let Ok(existing) = comment_store::load(&self.comments_git_dir()) else {
-            return;
-        };
-        let path_str = path.to_string_lossy();
-        let ranges: Vec<(usize, usize)> = existing
-            .iter()
-            .filter(|comment| comment.path == path_str)
-            .map(|comment| {
-                (
-                    (comment.start_line.saturating_sub(1)) as usize,
-                    (comment.end_line.saturating_sub(1)) as usize,
-                )
-            })
-            .collect();
-        nvim.mark_comments(path.to_path_buf(), ranges);
     }
 
     /// Tear down the dead session (dropping it kills/reaps the child --
@@ -793,7 +734,6 @@ impl eframe::App for VdiffApp {
 
         self.reclaim_focus_from_dead_nvim();
         self.poll_vdiff_diff_requests();
-        self.poll_comment_requests();
         self.handle_keys(ctx);
         self.handle_zoom_keys(ctx);
     }
