@@ -233,7 +233,7 @@ impl VdiffApp {
         Self {
             app,
             layout,
-            transform: Transform::default(),
+            transform: Transform::initial(),
             last_focus: None,
             pending_key: None,
             smoke,

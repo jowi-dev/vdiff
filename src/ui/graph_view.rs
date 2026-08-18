@@ -30,8 +30,12 @@ pub const MAX_SCALE: f32 = 5.0;
 /// at every scale rather than shrinking away when zoomed out).
 const STRIPE_W: f32 = 4.0;
 
-/// Height reserved for the legend row pinned at the top of the canvas.
+/// Height of one legend row (there are two: root swatches, then hints).
 const LEGEND_H: f32 = 22.0;
+
+/// Outer margin kept between a screen-anchored corner overlay (the legend,
+/// the focused-node status chip) and the window edge.
+const CORNER_MARGIN: f32 = 8.0;
 
 /// Pan/zoom applied to every layout-space point at paint time: `screen =
 /// layout * scale + offset`.
@@ -46,6 +50,22 @@ impl Default for Transform {
         Self {
             scale: 1.0,
             offset: Vec2::ZERO,
+        }
+    }
+}
+
+impl Transform {
+    /// The initial transform the graph view opens with: identity scale,
+    /// panned down by [`theme::GRAPH_TOP_PADDING`] so layer 0 doesn't sit
+    /// flush against the window's top edge on first open. Distinct from
+    /// [`Default::default`] (a true, zero-offset identity, exercised
+    /// directly by the transform-math unit tests below) -- this is what
+    /// [`crate::ui::eframe_app::VdiffApp::new`] actually seeds
+    /// [`crate::ui::eframe_app::VdiffApp`]'s transform with.
+    pub fn initial() -> Self {
+        Self {
+            scale: 1.0,
+            offset: Vec2::new(0.0, theme::GRAPH_TOP_PADDING),
         }
     }
 }
@@ -110,7 +130,14 @@ pub fn show(
     if last_focus.as_ref() != Some(&app.focus) {
         if let Some(focus_rect) = layout.rects.get(&app.focus) {
             let screen_rect = transform.to_screen_rect(*focus_rect);
-            transform.pan(clamp_into_view(screen_rect, response.rect));
+            let padded_viewport = EguiRect::from_min_max(
+                Pos2::new(
+                    response.rect.left(),
+                    response.rect.top() + theme::GRAPH_TOP_PADDING,
+                ),
+                response.rect.max,
+            );
+            transform.pan(clamp_into_view(screen_rect, padded_viewport));
         }
         *last_focus = Some(app.focus.clone());
     }
@@ -131,6 +158,7 @@ pub fn show(
     }
 
     paint_legend(&painter, app, layout, response.rect);
+    paint_focus_status(&painter, app, response.rect);
 }
 
 /// Drag pans the view; scroll zooms around the pointer position.
@@ -359,13 +387,28 @@ fn fit_label(label: &str, available_px: f32, font_size: f32) -> String {
     format!("{truncated}…")
 }
 
-/// The pinned legend, two screen-space rows: root-hue swatches (unchanged),
-/// then a hint row -- the hidden/shown test-module count with the `t` key
-/// reminder, and two edge-color swatches explaining
-/// [`theme::edge_stroke_outgoing`]/[`theme::edge_stroke_incoming`].
+/// The legend, anchored to the bottom-LEFT corner of the screen (not
+/// world/graph space -- it must stay put regardless of pan/zoom, and
+/// bottom-left leaves the bottom-right corner free for
+/// [`paint_focus_status`]). Two rows over an [`theme::overlay_chip_bg`]
+/// backing chip: root-hue swatches, then a hint row -- the hidden/shown
+/// test-module count with the `t` key reminder, and two edge-color swatches
+/// explaining [`theme::edge_stroke_outgoing`]/[`theme::edge_stroke_incoming`].
 fn paint_legend(painter: &egui::Painter, app: &App, layout: &LayoutResult, viewport: EguiRect) {
-    paint_root_legend(painter, &app.graph, layout, viewport);
-    paint_hint_row(painter, app, viewport);
+    let chip_height = LEGEND_H * 2.0;
+    let chip_rect = EguiRect::from_min_size(
+        Pos2::new(
+            viewport.left(),
+            viewport.bottom() - chip_height - CORNER_MARGIN,
+        ),
+        Vec2::new(viewport.width(), chip_height),
+    );
+    painter.rect_filled(chip_rect, 4.0, theme::overlay_chip_bg());
+
+    let root_row_y = chip_rect.top() + LEGEND_H / 2.0;
+    let hint_row_y = chip_rect.top() + LEGEND_H + LEGEND_H / 2.0;
+    paint_root_legend(painter, &app.graph, layout, viewport, root_row_y);
+    paint_hint_row(painter, app, viewport, hint_row_y);
 }
 
 /// Row 1: every distinct top-level root's name in its
@@ -376,6 +419,7 @@ fn paint_root_legend(
     graph: &ProjectGraph,
     layout: &LayoutResult,
     viewport: EguiRect,
+    text_y: f32,
 ) {
     let mut roots: Vec<NodeId> = layout
         .layers
@@ -386,8 +430,7 @@ fn paint_root_legend(
     roots.sort();
     roots.dedup();
 
-    let mut cursor_x = viewport.left() + 8.0;
-    let text_y = viewport.top() + LEGEND_H / 2.0;
+    let mut cursor_x = viewport.left() + CORNER_MARGIN;
     for root_id in roots {
         let name = graph
             .node(&root_id)
@@ -410,11 +453,10 @@ fn paint_root_legend(
 /// Row 2: the `Enter`/`d` pane-open hint, the test-module hidden/shown hint
 /// (only drawn once there are any test modules to mention at all), then the
 /// two edge-color swatches.
-fn paint_hint_row(painter: &egui::Painter, app: &App, viewport: EguiRect) {
+fn paint_hint_row(painter: &egui::Painter, app: &App, viewport: EguiRect, text_y: f32) {
     const HINT_COLOR: Color32 = Color32::from_rgb(0xaa, 0xaa, 0xaa);
 
-    let mut cursor_x = viewport.left() + 8.0;
-    let text_y = viewport.top() + LEGEND_H + LEGEND_H / 2.0;
+    let mut cursor_x = viewport.left() + CORNER_MARGIN;
 
     cursor_x = paint_text(
         painter,
@@ -442,6 +484,67 @@ fn paint_hint_row(painter: &egui::Painter, app: &App, viewport: EguiRect) {
         cursor_x,
         text_y,
     );
+}
+
+/// The focused-node status readout, anchored to the bottom-RIGHT corner of
+/// the screen (screen space, like [`paint_legend`] -- stays put regardless
+/// of pan/zoom): the focused node's full, untruncated qualified name plus
+/// its first backing file's path, over a [`theme::overlay_chip_bg`] chip.
+/// Exists because [`paint_node`]'s own label is abbreviated/truncated to fit
+/// the node's box -- this is always the full story, updating as focus
+/// moves. A no-op if the focused node somehow isn't in `app.graph` (a
+/// synthetic/unknown id shouldn't be focusable, but this is rendering code,
+/// so it defends rather than panics).
+fn paint_focus_status(painter: &egui::Painter, app: &App, viewport: EguiRect) {
+    let Some(node) = app.graph.node(&app.focus) else {
+        return;
+    };
+
+    let name_color = label_color(node.status);
+    const PATH_COLOR: Color32 = Color32::from_rgb(0xaa, 0xaa, 0xaa);
+    let path_text = node
+        .files
+        .first()
+        .map(|f| f.path.display().to_string())
+        .unwrap_or_default();
+
+    let name_galley = painter.layout_no_wrap(
+        app.focus.to_string(),
+        FontId::proportional(13.0),
+        name_color,
+    );
+    let path_galley = if path_text.is_empty() {
+        None
+    } else {
+        Some(painter.layout_no_wrap(path_text, FontId::proportional(11.0), PATH_COLOR))
+    };
+
+    let content_w = name_galley
+        .size()
+        .x
+        .max(path_galley.as_ref().map_or(0.0, |g| g.size().x));
+    let content_h = name_galley.size().y + path_galley.as_ref().map_or(0.0, |g| g.size().y + 2.0);
+
+    let chip_rect = EguiRect::from_min_size(
+        Pos2::new(
+            viewport.right() - content_w - 2.0 * CORNER_MARGIN,
+            viewport.bottom() - content_h - 2.0 * CORNER_MARGIN,
+        ),
+        Vec2::new(
+            content_w + 2.0 * CORNER_MARGIN,
+            content_h + 2.0 * CORNER_MARGIN,
+        ),
+    );
+    painter.rect_filled(chip_rect, 4.0, theme::overlay_chip_bg());
+
+    let mut text_y = chip_rect.top() + CORNER_MARGIN;
+    let text_x = chip_rect.left() + CORNER_MARGIN;
+    let name_h = name_galley.size().y;
+    painter.galley(Pos2::new(text_x, text_y), name_galley, name_color);
+    text_y += name_h + 2.0;
+    if let Some(galley) = path_galley {
+        painter.galley(Pos2::new(text_x, text_y), galley, PATH_COLOR);
+    }
 }
 
 /// Draw `text` left-aligned at `(x, mid_y)` (vertically centered on

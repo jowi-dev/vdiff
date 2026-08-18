@@ -85,6 +85,22 @@ pub fn edge_stroke_incoming() -> Stroke {
 /// status change.
 pub const TESTED_BADGE_COLOR: Color32 = Color32::from_rgb(0x6a, 0xc9, 0x6a);
 
+/// Screen-space breathing room kept above the topmost node when the graph
+/// first opens (baked into [`crate::ui::graph_view::Transform`]'s default
+/// offset) and preserved by auto-pan (see
+/// [`crate::ui::graph_view::clamp_into_view`]) -- so layer 0 never sits
+/// flush against the window's top edge. Now that the legend has moved to a
+/// screen-anchored corner (see [`crate::ui::graph_view::paint_legend`]),
+/// this is purely visual comfort, not collision avoidance.
+pub const GRAPH_TOP_PADDING: f32 = 24.0;
+
+/// Background chip color for screen-anchored overlays painted on top of the
+/// graph -- the legend and the focused-node status readout -- so their text
+/// stays legible over whatever edges/nodes happen to sit underneath.
+pub fn overlay_chip_bg() -> Color32 {
+    Color32::from_rgba_unmultiplied(0x1e, 0x1e, 0x1e, 200)
+}
+
 /// Faint horizontal line color separating one layer's band from the next.
 pub const BAND_SEPARATOR: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x2c);
 
