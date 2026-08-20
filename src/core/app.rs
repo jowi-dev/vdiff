@@ -186,6 +186,17 @@ impl App {
     }
 }
 
+/// Startup's `show_tests` seed: `false` (the normal default, matching
+/// [`App::show_tests`]'s own default) unless the change set is *only*
+/// test modules, in which case [`hide_test_modules`] would prune the
+/// entire graph and vdiff would open on a blank canvas with a sentinel
+/// focus (see `main::run_gui`, the only caller). Defined here rather than
+/// inline at the call site so it's unit-testable as a pure decision over a
+/// graph with no `App` (and no layout) yet in existence.
+pub fn initial_show_tests(graph: &ProjectGraph) -> bool {
+    !graph.nodes.is_empty() && hide_test_modules(graph).0.nodes.is_empty()
+}
+
 /// Every event [`update`] can react to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Msg {
@@ -1294,6 +1305,60 @@ mod tests {
 
         assert!(visible.node(&NodeId::from("leaf_a")).is_some());
         assert!(visible.node(&NodeId::from("leaf_a_test")).is_none());
+    }
+
+    /// A graph made up entirely of test modules (one standalone node, name
+    /// ending `Test` so [`crate::graph::test_modules::is_test_module`]
+    /// matches) -- exercises [`initial_show_tests`]'s blank-canvas case,
+    /// where hiding tests would prune every node.
+    fn all_test_graph() -> ProjectGraph {
+        let id = NodeId::from("only_test");
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            id.clone(),
+            ModuleNode {
+                id: id.clone(),
+                display_name: "OnlyTest".to_string(),
+                parent: None,
+                children: vec![],
+                status: GitStatus::Modified,
+                files: vec![crate::graph::model::FileRef {
+                    path: PathBuf::from("only_test.rs"),
+                    base_blob: Some("b".to_string()),
+                    head_blob: Some("h".to_string()),
+                }],
+            },
+        );
+        ProjectGraph {
+            roots: vec![id],
+            nodes,
+            edges: vec![],
+        }
+    }
+
+    #[test]
+    fn initial_show_tests_false_when_graph_has_no_test_modules() {
+        assert!(!initial_show_tests(&graph_fixture()));
+    }
+
+    #[test]
+    fn initial_show_tests_false_when_hiding_tests_still_leaves_nodes() {
+        assert!(!initial_show_tests(&graph_fixture_with_test_node()));
+    }
+
+    #[test]
+    fn initial_show_tests_true_when_hiding_tests_would_blank_the_graph() {
+        assert!(initial_show_tests(&all_test_graph()));
+    }
+
+    #[test]
+    fn initial_show_tests_false_for_an_already_empty_graph() {
+        let empty = ProjectGraph {
+            roots: vec![],
+            nodes: HashMap::new(),
+            edges: vec![],
+        };
+        assert!(!initial_show_tests(&empty));
     }
 
     #[test]

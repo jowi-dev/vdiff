@@ -4,11 +4,11 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use vdiff::cli::{self, Cli};
-use vdiff::core::app::{App, Pane, Screen};
+use vdiff::core::app::{initial_show_tests, App, Pane, Screen};
 use vdiff::graph::filter::focus_on_changes;
 use vdiff::graph::layout::layout;
 use vdiff::graph::model::{NodeId, ProjectGraph};
-use vdiff::graph::test_modules::hide_test_modules;
+use vdiff::graph::test_modules::{group_matched_test_modules, hide_test_modules};
 use vdiff::nvim::session::nvim_available;
 use vdiff::pipeline::git2_repo::Git2Repo;
 use vdiff::pipeline::pr::PrCheckout;
@@ -340,10 +340,22 @@ fn run_gui(
     }
     let want_nvim = want_nvim && nvim_available();
     let repo_root = repo_path.to_path_buf();
-    // `show_tests` defaults to false, so the layout/layers vdiff opens on
-    // must be built from the test-hidden graph, not the raw (possibly
-    // test-heavy) one -- see `App::visible_graph`.
-    let visible = hide_test_modules(&graph).0;
+    // `show_tests` normally starts false, so the layout/layers vdiff opens
+    // on is built from the test-hidden graph, not the raw (possibly
+    // test-heavy) one -- see `App::visible_graph`. But if the change set is
+    // *only* test modules, hiding them would blank the graph entirely (an
+    // empty canvas with a sentinel focus, `NodeId("")` -- see
+    // `initial_show_tests`'s doc), so start with tests shown instead.
+    let show_tests = initial_show_tests(&graph);
+    // Mirrors `App::visible_graph`'s own branching exactly, so the layout
+    // computed here for the very first frame is the same one a later
+    // `Msg::ToggleTests` round-trip back to this `show_tests` value would
+    // recompute.
+    let visible = if show_tests {
+        group_matched_test_modules(&graph)
+    } else {
+        hide_test_modules(&graph).0
+    };
     let layout_result = layout(&visible);
     // The first node of the first layer, not `graph.sorted_roots()[0]` --
     // roots can be synthetic namespace containers, which are never drawn or
@@ -366,7 +378,7 @@ fn run_gui(
         screen: Screen::Graph,
         diff: None,
         picker: None,
-        show_tests: false,
+        show_tests,
         file_view: None,
         pane: Pane::Graph,
         viewport_rows: 1,
