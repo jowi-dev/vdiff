@@ -1,12 +1,17 @@
 //! Pure data model for local review comments: the [`Comment`] struct, its
-//! serde round-trip, sorting/id-generation helpers, and markdown rendering
-//! for `--export-comments`. Zero IO -- loading/saving `comments.json` lives
-//! in [`crate::review::store`], the thin glue-side wrapper around this
-//! module. See the `review` module doc for the feature this backs.
+//! serde round-trip, sorting/id-generation helpers, markdown rendering for
+//! `--export-comments`, and [`map_comments`], which attaches comments to
+//! graph nodes for the graph's comment badge (issue #14). Zero IO --
+//! loading/saving `comments.json` lives in [`crate::review::store`], the
+//! thin glue-side wrapper around this module. See the `review` module doc
+//! for the feature this backs.
 
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
+
+use crate::graph::model::{NodeId, ProjectGraph};
 
 /// One review comment, either anchored to a line range in a file (captured
 /// via `:VdiffComment` inside the embedded nvim pane) or to a node as a
@@ -147,6 +152,48 @@ pub fn render_markdown(comments: &[Comment], repo: &str, branch: &str) -> String
         ));
     }
     out
+}
+
+/// Attach every comment in `comments` to the node(s) it's about, same
+/// spirit as [`crate::review::findings::map_findings`]: a comment with
+/// [`Comment::node`] set attaches directly to that node (an unknown id --
+/// the comment predates the current graph shape -- is skipped silently,
+/// not reported anywhere, since unlike a findings agent there's no "just
+/// ran this" contract to warn a human about), and `path` attaches to every
+/// node whose [`crate::graph::model::FileRef::path`] matches it (one file
+/// can back more than one node -- see [`crate::graph::model::FileRef`]'s
+/// doc). When both `node` and `path` resolve to the same node, that node
+/// gets the comment exactly once, never twice.
+pub fn map_comments(graph: &ProjectGraph, comments: &[Comment]) -> HashMap<NodeId, Vec<Comment>> {
+    let mut result: HashMap<NodeId, Vec<Comment>> = HashMap::new();
+    for comment in comments {
+        for target in resolve_targets(graph, comment) {
+            result.entry(target).or_default().push(comment.clone());
+        }
+    }
+    result
+}
+
+/// The node id(s) `comment` resolves to in `graph`: `node` directly (if it
+/// names a node that exists in `graph`), plus every node whose `files`
+/// contains `path` -- deduplicated so a comment whose `node` and `path`
+/// both point at the same node only appears once in the result.
+fn resolve_targets(graph: &ProjectGraph, comment: &Comment) -> Vec<NodeId> {
+    let mut targets = Vec::new();
+    if let Some(node_id) = &comment.node {
+        let id = NodeId::from(node_id.clone());
+        if graph.node(&id).is_some() {
+            targets.push(id);
+        }
+    }
+    for node in graph.nodes.values() {
+        if node.files.iter().any(|f| f.path.to_string_lossy() == comment.path)
+            && !targets.contains(&node.id)
+        {
+            targets.push(node.id.clone());
+        }
+    }
+    targets
 }
 
 #[cfg(test)]
@@ -297,5 +344,94 @@ mod tests {
         let a_pos = out.find("a.rs").unwrap();
         let b_pos = out.find("b.rs").unwrap();
         assert!(a_pos < b_pos);
+    }
+
+    use crate::graph::model::{FileRef, GitStatus, ModuleNode};
+    use std::collections::HashMap as StdHashMap;
+    use std::path::PathBuf;
+
+    fn file(path: &str) -> FileRef {
+        FileRef {
+            path: PathBuf::from(path),
+            base_blob: Some("b".to_string()),
+            head_blob: Some("h".to_string()),
+        }
+    }
+
+    fn node(id: &str, files: Vec<FileRef>) -> ModuleNode {
+        ModuleNode {
+            id: NodeId::from(id),
+            display_name: id.to_string(),
+            parent: None,
+            children: vec![],
+            status: GitStatus::Modified,
+            files,
+        }
+    }
+
+    fn graph_with(nodes: Vec<ModuleNode>) -> ProjectGraph {
+        let mut map = StdHashMap::new();
+        let mut roots = Vec::new();
+        for n in nodes {
+            roots.push(n.id.clone());
+            map.insert(n.id.clone(), n);
+        }
+        ProjectGraph {
+            nodes: map,
+            roots,
+            edges: vec![],
+        }
+    }
+
+    #[test]
+    fn map_comments_attaches_by_node_field() {
+        let graph = graph_with(vec![node("a", vec![file("a.rs")])]);
+        let mut c = comment("unrelated.rs", 1, 1);
+        c.node = Some("a".to_string());
+        let mapped = map_comments(&graph, &[c]);
+        assert_eq!(mapped.get(&NodeId::from("a")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn map_comments_skips_unknown_node_id_silently() {
+        let graph = graph_with(vec![node("a", vec![file("a.rs")])]);
+        let mut c = comment("a.rs", 1, 1);
+        c.node = Some("ghost".to_string());
+        let mapped = map_comments(&graph, &[c]);
+        // The unknown node id contributes nothing, but the path still
+        // matches "a" independently.
+        assert_eq!(mapped.get(&NodeId::from("a")).unwrap().len(), 1);
+        assert!(!mapped.contains_key(&NodeId::from("ghost")));
+    }
+
+    #[test]
+    fn map_comments_attaches_by_path_to_every_matching_node() {
+        let graph = graph_with(vec![
+            node("a", vec![file("shared.rs")]),
+            node("b", vec![file("shared.rs")]),
+            node("c", vec![file("other.rs")]),
+        ]);
+        let c = comment("shared.rs", 1, 1);
+        let mapped = map_comments(&graph, &[c]);
+        assert!(mapped.contains_key(&NodeId::from("a")));
+        assert!(mapped.contains_key(&NodeId::from("b")));
+        assert!(!mapped.contains_key(&NodeId::from("c")));
+    }
+
+    #[test]
+    fn map_comments_does_not_double_attach_when_node_and_path_match_the_same_node() {
+        let graph = graph_with(vec![node("a", vec![file("a.rs")])]);
+        let mut c = comment("a.rs", 1, 1);
+        c.node = Some("a".to_string());
+        let mapped = map_comments(&graph, &[c]);
+        assert_eq!(mapped.get(&NodeId::from("a")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn map_comments_ignores_comment_matching_nothing() {
+        let graph = graph_with(vec![node("a", vec![file("a.rs")])]);
+        let c = comment("nope.rs", 1, 1);
+        let mapped = map_comments(&graph, &[c]);
+        assert!(mapped.is_empty());
     }
 }
