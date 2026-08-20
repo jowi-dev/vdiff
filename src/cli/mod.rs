@@ -88,6 +88,34 @@ pub struct Cli {
     /// nothing to render them onto.
     #[arg(long, conflicts_with = "dump")]
     pub findings: Option<PathBuf>,
+    /// Batch-publish every captured review comment (see
+    /// [`crate::review::comments`]) to GitHub PR `<n>` as a single review:
+    /// diff-anchored comments become GitHub line comments, everything else
+    /// lands in the review body under a "Comments outside the diff"
+    /// section (see [`crate::review::publish`]). Headless, like
+    /// `--export-comments` -- no GUI, and unlike `--pr`, no temporary
+    /// worktree checkout: comments were captured against the *current*
+    /// worktree, which is assumed to already be PR `<n>`'s head (give or
+    /// take local edits). Already-published comments (tracked in
+    /// `<git_dir>/vdiff/published-comments.json`, scoped per PR number)
+    /// are skipped unless `--republish` is given. Conflicts with `--dump`,
+    /// `--pr`, and `--export-comments`.
+    #[arg(
+        long,
+        conflicts_with_all = ["dump", "pr", "export_comments"]
+    )]
+    pub publish_comments: Option<u64>,
+    /// With `--publish-comments`, print the plan -- every line comment
+    /// that would be posted and the review body -- without touching `gh`
+    /// at all, then exit 0. Meaningless without `--publish-comments`,
+    /// which clap enforces.
+    #[arg(long, requires = "publish_comments")]
+    pub dry_run: bool,
+    /// With `--publish-comments`, ignore the published-comments sidecar
+    /// and post every matching comment again, even ones already recorded
+    /// as published to this PR.
+    #[arg(long, requires = "publish_comments")]
+    pub republish: bool,
 }
 
 /// `--dump` output format.

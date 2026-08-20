@@ -1,5 +1,7 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::SystemTime;
 
 use clap::Parser;
 
@@ -11,11 +13,15 @@ use vdiff::graph::model::{NodeId, ProjectGraph};
 use vdiff::graph::test_modules::{group_matched_test_modules, hide_test_modules};
 use vdiff::nvim::session::nvim_available;
 use vdiff::pipeline::git2_repo::Git2Repo;
-use vdiff::pipeline::pr::PrCheckout;
+use vdiff::pipeline::pr::{resolve_pr_base_ref, PrCheckout};
+use vdiff::pipeline::publish::{changed_ranges_for_paths, post_review, repo_name_with_owner};
 use vdiff::pipeline::repo::GitRepo;
 use vdiff::pipeline::{build_graph, PipelineOptions};
-use vdiff::review::comments::{map_comments, Comment};
+use vdiff::review::comments::{format_iso8601, map_comments, Comment};
 use vdiff::review::findings::{map_findings, parse_findings, Finding};
+use vdiff::review::publish::{
+    build_payload, filter_unpublished, partition_comments, render_body, render_plan,
+};
 use vdiff::ui::eframe_app::{DiffLoader, NvimConfig, ReviewConfig, VdiffApp};
 use vdiff::ui::nvim_pane::NvimPane;
 
@@ -107,6 +113,10 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
 
     if cli.export_comments {
         return export_comments(repo_path);
+    }
+
+    if let Some(pr_number) = cli.publish_comments {
+        return publish_comments(repo_path, pr_number, cli.dry_run, cli.republish);
     }
 
     // Resolved once up front and reused for both the graph build and the
@@ -272,6 +282,132 @@ fn export_comments(repo_path: &Path) -> ExitCode {
     print!(
         "{}",
         vdiff::review::comments::render_markdown(&comments, &repo_name, &branch)
+    );
+    ExitCode::SUCCESS
+}
+
+/// `--publish-comments <n>`: batch-post every not-yet-published local
+/// comment to GitHub PR `n` as one review. Headless like
+/// [`export_comments`], and -- unlike `--pr` -- never checks out a
+/// temporary worktree: comments were captured against the *current*
+/// worktree, which is assumed to already be PR `n`'s head. Diff-anchored
+/// vs body-only partitioning ([`partition_comments`]), the sidecar dedup
+/// ([`filter_unpublished`]), and the payload/plan text
+/// ([`build_payload`]/[`render_plan`]) are all pure (see
+/// [`vdiff::review::publish`]); this function is purely the IO glue: load,
+/// filter, resolve the PR's base and diff against it, decide, and either
+/// print the plan (`dry_run`) or actually POST via `gh` and record success
+/// in the sidecar. A failed POST fails the whole run (exit 1, sidecar
+/// untouched) -- GitHub's create-review endpoint is one atomic call, so
+/// there's no partial-success state to record.
+fn publish_comments(repo_path: &Path, pr_number: u64, dry_run: bool, republish: bool) -> ExitCode {
+    let repo = match git2::Repository::discover(repo_path) {
+        Ok(repo) => repo,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let git_dir = repo.path();
+
+    let comments = match vdiff::review::store::load(git_dir) {
+        Ok(comments) => comments,
+        Err(err) => {
+            eprintln!(
+                "error loading {}: {err}",
+                vdiff::review::store::comments_path(git_dir).display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    if comments.is_empty() {
+        println!("nothing to publish");
+        return ExitCode::SUCCESS;
+    }
+
+    let mut published = vdiff::review::store::load_published(git_dir);
+    let to_publish: Vec<Comment> = filter_unpublished(&comments, &published, pr_number, republish)
+        .into_iter()
+        .cloned()
+        .collect();
+    let skipped = comments.len() - to_publish.len();
+    if to_publish.is_empty() {
+        println!("posted 0 line comments + 0 body comments, skipped {skipped} already published");
+        return ExitCode::SUCCESS;
+    }
+
+    let base_ref = match resolve_pr_base_ref(repo_path, pr_number) {
+        Ok(base_ref) => base_ref,
+        Err(err) => {
+            eprintln!("error resolving --publish-comments {pr_number}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let git2_repo = match Git2Repo::open(repo_path) {
+        Ok(repo) => repo,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let base_oid = match git2_repo.default_base_oid(Some(&base_ref)) {
+        Ok(oid) => oid,
+        Err(err) => {
+            eprintln!("error resolving diff base: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let paths: HashSet<String> = to_publish
+        .iter()
+        .map(|comment| comment.path.clone())
+        .collect();
+    let changed_ranges = match changed_ranges_for_paths(&git2_repo, &base_oid, &paths) {
+        Ok(ranges) => ranges,
+        Err(err) => {
+            eprintln!("error computing changed line ranges: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (line_comments, body_comments) = partition_comments(&to_publish, &changed_ranges);
+    let body = render_body(&body_comments);
+
+    if dry_run {
+        println!("{}", render_plan(&line_comments, &body));
+        return ExitCode::SUCCESS;
+    }
+
+    let payload = build_payload(&line_comments, &body);
+    let payload_json = serde_json::to_string(&payload).expect("payload always serializes");
+
+    let owner_repo = match repo_name_with_owner(repo_path) {
+        Ok(owner_repo) => owner_repo,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(err) = post_review(repo_path, &owner_repo, pr_number, &payload_json) {
+        eprintln!("error publishing to PR {pr_number}: {err}");
+        return ExitCode::FAILURE;
+    }
+
+    let published_at = format_iso8601(SystemTime::now());
+    for comment in &to_publish {
+        published.record(&comment.id, pr_number, published_at.clone());
+    }
+    if let Err(err) = vdiff::review::store::save_published(git_dir, &published) {
+        eprintln!(
+            "warning: failed to save {}: {err}",
+            vdiff::review::store::published_path(git_dir).display()
+        );
+    }
+
+    println!(
+        "posted {} line comments + {} body comments, skipped {skipped} already published",
+        line_comments.len(),
+        body_comments.len()
     );
     ExitCode::SUCCESS
 }
