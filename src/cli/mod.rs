@@ -22,8 +22,18 @@ pub struct Cli {
     #[arg(long)]
     pub repo: Option<PathBuf>,
     /// Diff base ref override (defaults to the detected default branch).
+    /// When combined with `--pr`, this wins over the PR's own base branch
+    /// (see [`crate::pipeline::pr`]'s module doc).
     #[arg(long)]
     pub base: Option<String>,
+    /// Review a GitHub PR by number: resolves it via `gh pr view` (`gh`
+    /// must be installed and authenticated), fetches its head into a
+    /// temporary git worktree (never touching this checkout), and opens
+    /// vdiff there with `--base` defaulted to the PR's base branch. The
+    /// temporary worktree is removed on exit if it has no local
+    /// modifications; see [`crate::pipeline::pr`].
+    #[arg(long)]
+    pub pr: Option<u64>,
     /// Dump the project graph instead of launching the GUI.
     #[arg(long, value_enum)]
     pub dump: Option<DumpFormat>,

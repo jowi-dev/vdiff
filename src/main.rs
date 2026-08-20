@@ -11,6 +11,7 @@ use vdiff::graph::model::{NodeId, ProjectGraph};
 use vdiff::graph::test_modules::hide_test_modules;
 use vdiff::nvim::session::nvim_available;
 use vdiff::pipeline::git2_repo::Git2Repo;
+use vdiff::pipeline::pr::PrCheckout;
 use vdiff::pipeline::repo::GitRepo;
 use vdiff::pipeline::{build_graph, PipelineOptions};
 use vdiff::ui::eframe_app::{DiffLoader, NvimConfig, VdiffApp};
@@ -18,9 +19,52 @@ use vdiff::ui::nvim_pane::NvimPane;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let requested_repo_path = cli.repo.clone().unwrap_or_else(|| PathBuf::from("."));
 
-    let repo_path = cli.repo.clone().unwrap_or_else(|| PathBuf::from("."));
-    let repo = match Git2Repo::open(&repo_path) {
+    // `--pr <n>` resolves against the caller's actual checkout (that's
+    // where `gh`/`git fetch` run), then substitutes a temporary worktree
+    // and the PR's base branch for the rest of startup -- see
+    // `vdiff::pipeline::pr`'s module doc for the `--base` interaction and
+    // cleanup semantics.
+    let pr_checkout = match cli.pr {
+        Some(pr_number) => match PrCheckout::create(&requested_repo_path, pr_number) {
+            Ok(checkout) => Some(checkout),
+            Err(err) => {
+                eprintln!("error resolving --pr {pr_number}: {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
+    let repo_path = pr_checkout
+        .as_ref()
+        .map(|checkout| checkout.worktree_path().to_path_buf())
+        .unwrap_or(requested_repo_path);
+    // `--base` wins over `--pr`'s own base branch when both are given.
+    let base_override = cli.base.clone().or_else(|| {
+        pr_checkout
+            .as_ref()
+            .map(|checkout| checkout.base_ref().to_string())
+    });
+
+    let exit_code = run(&cli, &repo_path, base_override);
+
+    if let Some(checkout) = &pr_checkout {
+        checkout.cleanup_best_effort();
+    }
+
+    exit_code
+}
+
+/// The bulk of vdiff's startup logic: open the repo at `repo_path`, resolve
+/// the diff base (`base_override`, defaulting per [`GitRepo::default_base_oid`]),
+/// build the graph, and either dump or launch the GUI. Parameterized on
+/// `repo_path`/`base_override` rather than reading them off `cli` directly
+/// so `main`'s `--pr` handling can substitute a temporary worktree and the
+/// PR's base branch transparently.
+fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
+    let repo = match Git2Repo::open(repo_path) {
         Ok(repo) => repo,
         Err(err) => {
             eprintln!("error: {err}");
@@ -29,13 +73,13 @@ fn main() -> ExitCode {
     };
 
     if cli.export_comments {
-        return export_comments(&repo_path);
+        return export_comments(repo_path);
     }
 
     // Resolved once up front and reused for both the graph build and the
     // diff pane's later `Cmd::LoadDiff` lookups, so both agree on the same
     // base commit for the lifetime of this run.
-    let base_oid = match repo.default_base_oid(cli.base.as_deref()) {
+    let base_oid = match repo.default_base_oid(base_override.as_deref()) {
         Ok(oid) => oid,
         Err(err) => {
             eprintln!("error resolving diff base: {err}");
@@ -45,7 +89,7 @@ fn main() -> ExitCode {
     let repo: Box<dyn GitRepo> = Box::new(repo);
 
     let opts = PipelineOptions {
-        base_override: cli.base.clone(),
+        base_override: base_override.clone(),
     };
     let graph = match build_graph(repo.as_ref(), &opts) {
         Ok(graph) => graph,
@@ -69,16 +113,16 @@ fn main() -> ExitCode {
         Some(format) => dump(&graph, format, cli.include_diffs, repo.as_ref(), &base_oid),
         None => {
             if graph.nodes.is_empty() {
-                let base_ref = cli.base.as_deref().unwrap_or(&base_oid);
+                let base_ref = base_override.as_deref().unwrap_or(&base_oid);
                 eprintln!("no changes vs {base_ref}");
                 return ExitCode::SUCCESS;
             }
             run_gui(
                 graph,
-                &repo_path,
+                repo_path,
                 cli.smoke,
                 cli.nvim,
-                cli.nvim_cmd,
+                cli.nvim_cmd.clone(),
                 DiffLoader { repo, base_oid },
             )
         }
