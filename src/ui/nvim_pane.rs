@@ -196,6 +196,12 @@ impl NvimPane {
         self.session.take_diff_request()
     }
 
+    /// Whether `vdiff.nvim` saved a comment in this session since the last
+    /// call -- see [`NvimSession::take_comment_saved`].
+    pub fn take_comment_saved(&self) -> bool {
+        self.session.take_comment_saved()
+    }
+
     /// Open (or refresh) the diffsplit-against-merge-base view for
     /// whatever file is currently open: a read-only scratch buffer holding
     /// `base_content`, vertically split to the left, both windows in

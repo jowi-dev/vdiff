@@ -44,6 +44,7 @@ use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome, Pending};
 use crate::nvim::session::NvimCmd;
 use crate::pipeline::file_diff::{changed_head_ranges, load_file_diff};
 use crate::pipeline::repo::GitRepo;
+use crate::review::comments::map_comments;
 use crate::review::review_state::ReviewStore;
 use crate::review::store as review_store;
 use crate::ui::diff_view;
@@ -558,6 +559,41 @@ impl VdiffApp {
         }
     }
 
+    /// Drain any `vdiff_comment_saved` notifications that arrived since
+    /// last frame (see [`NvimPane::take_comment_saved`] -- fed by
+    /// `vdiff.nvim`'s compose UI `rpcnotify`-ing this host once a comment
+    /// is written) and reload+remap the comment store (issue #14) once for
+    /// however many piled up, so a comment captured mid-session shows up
+    /// as a graph badge without a restart.
+    fn poll_comment_saved(&mut self) {
+        let saved = self.nvim.as_ref().is_some_and(NvimPane::take_comment_saved);
+        if saved {
+            self.reload_comments();
+        }
+    }
+
+    /// Reload `<git_dir>/vdiff/comments.json` and remap it onto
+    /// [`App::graph`], replacing [`App::comments`] wholesale -- the same
+    /// load-then-map [`crate::review::comments::map_comments`] does at
+    /// startup, just re-run on demand. A read/parse failure is logged and
+    /// leaves the previous badges in place rather than clearing them: a
+    /// transient error mid-session shouldn't make comments a reviewer
+    /// already saw disappear from the graph.
+    fn reload_comments(&mut self) {
+        let git_dir = self.diff_loader.repo.git_dir();
+        match review_store::load(&git_dir) {
+            Ok(comments) => {
+                self.app.comments = map_comments(&self.app.graph, &comments);
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to reload {}: {err}",
+                    review_store::comments_path(&git_dir).display()
+                );
+            }
+        }
+    }
+
     /// The diffsplit-against-merge-base flow itself, shared by
     /// `:VdiffDiff` (typed inside nvim) and the nvim-mode `d` binding
     /// (typed from the graph). Resolves which file to diff from nvim's
@@ -787,6 +823,7 @@ impl eframe::App for VdiffApp {
 
         self.reclaim_focus_from_dead_nvim();
         self.poll_vdiff_diff_requests();
+        self.poll_comment_saved();
         self.handle_keys(ctx);
         self.handle_zoom_keys(ctx);
     }

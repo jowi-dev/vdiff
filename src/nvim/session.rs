@@ -142,6 +142,14 @@ pub struct NvimSession {
     /// arrives (the embedded `:VdiffDiff` Ex command's `rpcnotify`) --
     /// drained by [`Self::take_diff_request`] on the UI thread each frame.
     diff_requests: mpsc::Receiver<()>,
+    /// Fed by the reader thread every time a `vdiff_comment_saved`
+    /// notification arrives (`vdiff.nvim`'s compose UI `rpcnotify`-ing this
+    /// host once a comment is written to `comments.json`) -- drained by
+    /// [`Self::take_comment_saved`] on the UI thread each frame, so the
+    /// glue can reload the store and remap the graph's comment badges
+    /// (issue #14) without the user having to restart vdiff to see a
+    /// comment they just captured.
+    comment_saved: mpsc::Receiver<()>,
     _writer: JoinHandle<()>,
     _reader: JoinHandle<()>,
 }
@@ -184,6 +192,7 @@ impl NvimSession {
         });
 
         let (diff_tx, diff_rx) = mpsc::channel::<()>();
+        let (comment_tx, comment_rx) = mpsc::channel::<()>();
         let grid_for_reader = grid.clone();
         let reader_alive = alive.clone();
         let reader_pending = pending.clone();
@@ -195,6 +204,7 @@ impl NvimSession {
                 reader_alive,
                 reader_pending,
                 diff_tx,
+                comment_tx,
             );
         });
 
@@ -204,6 +214,7 @@ impl NvimSession {
             grid,
             alive,
             diff_requests: diff_rx,
+            comment_saved: comment_rx,
             _writer: writer,
             _reader: reader,
         })
@@ -261,6 +272,19 @@ impl NvimSession {
     pub fn take_diff_request(&self) -> bool {
         let mut seen = false;
         while self.diff_requests.try_recv().is_ok() {
+            seen = true;
+        }
+        seen
+    }
+
+    /// Whether at least one `vdiff_comment_saved` notification has arrived
+    /// since the last call -- drains every queued one (there's no reason
+    /// to reload `comments.json` more than once even if several piled up
+    /// between frames) and reports whether there was anything to drain.
+    /// See [`Self::comment_saved`]'s doc.
+    pub fn take_comment_saved(&self) -> bool {
+        let mut seen = false;
+        while self.comment_saved.try_recv().is_ok() {
             seen = true;
         }
         seen
@@ -630,6 +654,7 @@ fn run_reader(
     alive: Arc<AtomicBool>,
     pending: PendingReplies,
     diff_tx: Sender<()>,
+    comment_tx: Sender<()>,
 ) {
     let mut reader = BufReader::new(stdout);
     while let Ok(value) = rmpv::decode::read_value(&mut reader) {
@@ -658,12 +683,14 @@ fn run_reader(
                     repaint(); // wake the UI thread so it drains the request promptly.
                 }
                 Some("vdiff_comment_saved") => {
-                    // `vdiff.nvim` notifies this once a comment is saved, so
-                    // a future graph-side comment badge has something to key
-                    // off of. Nothing reads it yet -- accepted and ignored
-                    // rather than falling through to the "unknown event"
-                    // branch below, so it's clear this one's *expected*, not
-                    // just tolerated.
+                    // `vdiff.nvim` notifies this once a comment is saved --
+                    // fed to `comment_saved` so the UI thread (via
+                    // `NvimSession::take_comment_saved`,
+                    // `VdiffApp::poll_comment_saved`) reloads
+                    // `comments.json` and remaps the graph's comment
+                    // badges (issue #14) without needing a restart.
+                    let _ = comment_tx.send(());
+                    repaint(); // wake the UI thread so it drains the request promptly.
                 }
                 _ => {} // an event this spike doesn't know about -- ignored, forward-compat.
             },
