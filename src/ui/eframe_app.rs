@@ -780,12 +780,15 @@ impl VdiffApp {
     }
 
     /// [`Screen::Graph`]: the graph always fills the whole viewport now --
-    /// no side panel, ever (see the module doc for why the earlier 50%
-    /// split was replaced with this). [`Pane::File`] with a file open
-    /// instead paints [`overlay::show`] fullscreen on top of the
-    /// already-painted graph -- a scrim, an opaque header strip, then
-    /// either the nvim grid or the built-in [`crate::ui::file_view::show`] beneath
-    /// it. Records the row count [`overlay::show`] reports back (only
+    /// no side panel, ever (see [`overlay`]'s module doc for the
+    /// rationale behind replacing the earlier 50%-width side panel with
+    /// this). [`Pane::File`] with a file open instead paints
+    /// [`overlay::show`] fullscreen on top of the already-painted graph --
+    /// an opaque header strip, then either the nvim grid or the built-in
+    /// [`crate::ui::file_view::show`] beneath it, its own background
+    /// painted translucent rather than sitting under a separate scrim (see
+    /// [`overlay`]'s doc again). Records the row count [`overlay::show`]
+    /// reports back (only
     /// meaningful in built-in mode -- nvim's `Ctrl-d`/`Ctrl-u` are
     /// forwarded raw, see [`Self::handle_nvim_keys`]) as
     /// [`App::viewport_rows`], read one frame later by
