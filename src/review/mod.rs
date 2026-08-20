@@ -41,8 +41,18 @@
 //! logic.
 //!
 //! [`Finding`]: findings::Finding
+//!
+//! [`publish`] is the pure half of `vdiff --publish-comments <pr>` (issue
+//! #7 phase 2): batch-posting every captured comment to a GitHub PR as one
+//! review, partitioning them into diff-anchored line comments vs a
+//! body-level "outside the diff" section, and the
+//! `<git_dir>/vdiff/published-comments.json` sidecar tracking what's
+//! already been posted (per PR number) so a repeat run doesn't double-post.
+//! The `gh`-shelling-out glue lives in [`crate::pipeline::publish`]; the
+//! sidecar's IO lives in [`store`], alongside `comments.json`'s.
 
 pub mod comments;
 pub mod findings;
+pub mod publish;
 pub mod review_state;
 pub mod store;
