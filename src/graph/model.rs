@@ -168,6 +168,39 @@ impl ProjectGraph {
         }
     }
 
+    /// True if `id` belongs to a web namespace (Phoenix's `lib/*_web/`
+    /// convention and the `FooWeb` module namespace it maps to) -- see
+    /// [`crate::graph::layers`], which uses this to pin web modules to the
+    /// top of the layered graph so it reads controller -> context -> schema
+    /// like a call stack. Two independent signals, either sufficient:
+    /// - any of `id`'s backing files sits under a directory component
+    ///   ending in `_web` (Phoenix's `lib/<app>_web/` convention, including
+    ///   umbrella apps like `lib/my_app_web/apps/...`);
+    /// - `id`'s top-level namespace root (see [`Self::top_level_root`]) has
+    ///   a `display_name` ending in `Web` (e.g. `MyAppWeb`).
+    ///
+    /// Always `false` for an unknown id, and for graphs with no Elixir-style
+    /// web namespace at all (Rust crates, plain file trees) -- neither
+    /// signal ever fires there.
+    pub fn is_web_node(&self, id: &NodeId) -> bool {
+        let Some(node) = self.node(id) else {
+            return false;
+        };
+
+        let file_signals_web = node.files.iter().any(|file| {
+            file.path
+                .components()
+                .any(|c| c.as_os_str().to_str().is_some_and(|s| s.ends_with("_web")))
+        });
+        if file_signals_web {
+            return true;
+        }
+
+        let root = self.top_level_root(id);
+        self.node(&root)
+            .is_some_and(|root_node| root_node.display_name.ends_with("Web"))
+    }
+
     /// Sort a slice of node ids by their `display_name`, dropping any id
     /// that isn't present in `nodes`.
     fn sorted_by_name(&self, ids: &[NodeId]) -> Vec<NodeId> {
@@ -267,5 +300,111 @@ mod tests {
         let from_string: NodeId = String::from("foo::bar").into();
         assert_eq!(from_str, from_string);
         assert_eq!(from_str.to_string(), "foo::bar");
+    }
+
+    fn leaf_node(id: &str, parent: Option<&str>, path: &str) -> (NodeId, ModuleNode) {
+        let node_id = NodeId::from(id);
+        (
+            node_id.clone(),
+            ModuleNode {
+                id: node_id,
+                display_name: id.rsplit('.').next().unwrap_or(id).to_string(),
+                parent: parent.map(NodeId::from),
+                children: vec![],
+                status: GitStatus::Unchanged,
+                files: vec![FileRef {
+                    path: PathBuf::from(path),
+                    base_blob: Some("b".to_string()),
+                    head_blob: Some("h".to_string()),
+                }],
+            },
+        )
+    }
+
+    fn namespace_root(id: &str, display_name: &str, children: &[&str]) -> (NodeId, ModuleNode) {
+        let node_id = NodeId::from(id);
+        (
+            node_id.clone(),
+            ModuleNode {
+                id: node_id,
+                display_name: display_name.to_string(),
+                parent: None,
+                children: children.iter().map(|c| NodeId::from(*c)).collect(),
+                status: GitStatus::Unchanged,
+                files: vec![],
+            },
+        )
+    }
+
+    #[test]
+    fn is_web_node_true_when_top_level_root_name_ends_in_web() {
+        let root_id = NodeId::from("elixir:MyAppWeb");
+        let leaf_id = "elixir:MyAppWeb.PageController";
+        let (_, root_node) = namespace_root("elixir:MyAppWeb", "MyAppWeb", &[leaf_id]);
+        let (_, leaf) = leaf_node(
+            leaf_id,
+            Some("elixir:MyAppWeb"),
+            "lib/my_app_web/controllers/page_controller.ex",
+        );
+        let graph = ProjectGraph {
+            nodes: [(root_id.clone(), root_node), (NodeId::from(leaf_id), leaf)]
+                .into_iter()
+                .collect(),
+            roots: vec![root_id],
+            edges: vec![],
+        };
+
+        assert!(graph.is_web_node(&NodeId::from(leaf_id)));
+    }
+
+    #[test]
+    fn is_web_node_true_when_file_path_is_under_a_web_directory_even_without_web_root_name() {
+        // Root display name doesn't end in "Web", but the backing file
+        // lives under a `lib/*_web/` directory -- the file signal alone
+        // should be enough.
+        let root_id = NodeId::from("elixir:MyApp");
+        let leaf_id = "elixir:MyApp.PageController";
+        let (_, root_node) = namespace_root("elixir:MyApp", "MyApp", &[leaf_id]);
+        let (_, leaf) = leaf_node(
+            leaf_id,
+            Some("elixir:MyApp"),
+            "lib/my_app_web/controllers/page_controller.ex",
+        );
+        let graph = ProjectGraph {
+            nodes: [(root_id.clone(), root_node), (NodeId::from(leaf_id), leaf)]
+                .into_iter()
+                .collect(),
+            roots: vec![root_id],
+            edges: vec![],
+        };
+
+        assert!(graph.is_web_node(&NodeId::from(leaf_id)));
+    }
+
+    #[test]
+    fn is_web_node_false_for_plain_module_with_no_web_signal() {
+        let root_id = NodeId::from("elixir:MyApp");
+        let leaf_id = "elixir:MyApp.Accounts.User";
+        let (_, root_node) = namespace_root("elixir:MyApp", "MyApp", &[leaf_id]);
+        let (_, leaf) = leaf_node(leaf_id, Some("elixir:MyApp"), "lib/my_app/accounts/user.ex");
+        let graph = ProjectGraph {
+            nodes: [(root_id.clone(), root_node), (NodeId::from(leaf_id), leaf)]
+                .into_iter()
+                .collect(),
+            roots: vec![root_id],
+            edges: vec![],
+        };
+
+        assert!(!graph.is_web_node(&NodeId::from(leaf_id)));
+    }
+
+    #[test]
+    fn is_web_node_false_for_unknown_id() {
+        let graph = ProjectGraph {
+            nodes: HashMap::new(),
+            roots: vec![],
+            edges: vec![],
+        };
+        assert!(!graph.is_web_node(&NodeId::from("missing")));
     }
 }
