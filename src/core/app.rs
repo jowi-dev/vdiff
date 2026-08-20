@@ -6,7 +6,7 @@
 //! chunk) should perform next; `DiffLoaded`/`LoadFailed` feed its result back
 //! in without `update` ever needing to touch git/egui itself.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub use crate::core::diff_state::DiffPaneState;
 use crate::core::file_view::FileViewState;
@@ -17,6 +17,7 @@ use crate::graph::model::{NodeId, ProjectGraph};
 use crate::graph::test_modules::{
     group_matched_test_modules, hide_test_modules, matched_test_module,
 };
+use crate::review::findings::Finding;
 
 /// Which screen is currently shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +121,13 @@ pub struct App {
     /// this set via [`review::toggle_reviewed`] and reports it back out
     /// through [`App::review_progress`].
     pub reviewed: HashSet<NodeId>,
+    /// AI review findings (see [`crate::review::findings`]), already mapped
+    /// onto node ids by [`crate::review::findings::map_findings`] once at
+    /// startup from `--findings <path>` -- empty when the flag wasn't
+    /// given. `core` never re-derives this from a node id/path itself;
+    /// it's pure lookup data the rendering glue (graph badges, the focus
+    /// overlay, the file pane) reads via [`App::findings_for`].
+    pub findings: HashMap<NodeId, Vec<Finding>>,
 }
 
 impl App {
@@ -128,6 +136,14 @@ impl App {
     /// unknown id. [`Msg::FocusSet`] rejects any target that isn't.
     fn is_drawn(&self, id: &NodeId) -> bool {
         self.layers.iter().any(|layer| layer.contains(id))
+    }
+
+    /// `id`'s attached findings, or an empty slice if it has none -- the
+    /// one lookup every findings-rendering call site (badge, focus
+    /// overlay, file pane) should go through rather than matching on
+    /// `self.findings.get(id)` directly.
+    pub fn findings_for(&self, id: &NodeId) -> &[Finding] {
+        self.findings.get(id).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// The graph actually drawn: with every test module pruned out (see
@@ -808,6 +824,7 @@ mod tests {
             pane: Pane::Graph,
             viewport_rows: 20,
             reviewed: HashSet::new(),
+            findings: HashMap::new(),
         }
     }
 
@@ -1286,6 +1303,7 @@ mod tests {
             pane: Pane::Graph,
             viewport_rows: 20,
             reviewed: HashSet::new(),
+            findings: HashMap::new(),
         };
         assert!(!app
             .layers
@@ -1325,6 +1343,7 @@ mod tests {
             pane: Pane::Graph,
             viewport_rows: 20,
             reviewed: HashSet::new(),
+            findings: HashMap::new(),
         };
 
         let (app, cmd) = update(app, Msg::ToggleTests);
@@ -1501,6 +1520,7 @@ mod tests {
             pane: Pane::Graph,
             viewport_rows: 20,
             reviewed: HashSet::new(),
+            findings: HashMap::new(),
         }
     }
 

@@ -79,6 +79,15 @@ pub struct Cli {
     /// empty or hasn't been created yet.
     #[arg(long)]
     pub export_comments: bool,
+    /// Load AI review findings (see [`crate::review::findings`]) from a
+    /// JSON file and render them on the graph -- a severity badge per
+    /// flagged node, summaries in the focus overlay, and per-line markers
+    /// in the built-in file pane. See `docs/findings-schema.md` for the
+    /// wire contract. Conflicts with `--dump`: findings are a GUI-only
+    /// rendering feature, and `--dump`'s headless graph/JSON output has
+    /// nothing to render them onto.
+    #[arg(long, conflicts_with = "dump")]
+    pub findings: Option<PathBuf>,
 }
 
 /// `--dump` output format.

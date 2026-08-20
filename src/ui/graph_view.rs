@@ -20,6 +20,7 @@ use crate::graph::model::{GitStatus, NodeId, ProjectGraph};
 use crate::graph::test_modules::{
     hide_test_modules, nodes_with_changed_tests, test_strips, TestStrip,
 };
+use crate::review::findings::{self, Finding};
 use crate::ui::theme;
 
 /// Zoom lower bound (10%).
@@ -162,6 +163,7 @@ pub fn show(
         strips: &strips,
         show_tests: app.show_tests,
         reviewed: &app.reviewed,
+        findings: &app.findings,
     };
 
     paint_band_separators(&painter, layout, transform, response.rect);
@@ -382,6 +384,11 @@ struct NodeOverlay<'a> {
     strips: &'a HashMap<NodeId, TestStrip>,
     show_tests: bool,
     reviewed: &'a HashSet<NodeId>,
+    /// AI review findings (issue #5), keyed by node -- painted as a small
+    /// count+severity badge (see [`findings::badge`]) at the main rect's
+    /// top-left corner, opposite the existing tested-badge's top-right
+    /// corner so the two never overlap.
+    findings: &'a HashMap<NodeId, Vec<Finding>>,
 }
 
 /// Paint `id`'s rect: status fill/border, a left-edge stripe in its
@@ -477,6 +484,10 @@ fn paint_node(
         );
     }
 
+    if let Some(findings) = overlay.findings.get(id) {
+        paint_findings_badge(painter, main_rect, transform, findings);
+    }
+
     if id == focus {
         painter.rect_stroke(
             screen_rect,
@@ -541,6 +552,38 @@ fn fit_label(label: &str, available_px: f32, font_size: f32) -> String {
     let keep = max_chars.saturating_sub(1).max(1);
     let truncated: String = label.chars().take(keep).collect();
     format!("{truncated}…")
+}
+
+/// Paint `findings`'s count+severity badge (issue #5) at `main_rect`'s
+/// top-left corner, just past the root-hue stripe -- a small filled circle
+/// in [`theme::severity_color`] of the highest severity present (see
+/// [`findings::badge`]), with the count as white text on top. Anchored
+/// opposite the existing tested-checkmark badge's top-right corner (and
+/// always on `main_rect`, never `screen_rect`, so it never collides with an
+/// attached test strip below) so the two badges -- plus the reviewed-dimmed
+/// fill, which only touches the fill color, never a badge -- all stay
+/// legible together. A no-op if `findings` is empty (shouldn't happen --
+/// callers only reach this with a non-empty `overlay.findings` entry -- but
+/// defended rather than assumed).
+fn paint_findings_badge(
+    painter: &egui::Painter,
+    main_rect: EguiRect,
+    transform: &Transform,
+    findings: &[Finding],
+) {
+    let Some((count, severity)) = findings::badge(findings) else {
+        return;
+    };
+    let radius = (7.0 * transform.scale.max(0.3)).max(5.0);
+    let center = main_rect.min + Vec2::new(STRIPE_W + radius + 2.0, radius + 2.0);
+    painter.circle_filled(center, radius, theme::severity_color(severity));
+    painter.text(
+        center,
+        Align2::CENTER_CENTER,
+        format!("{count}"),
+        FontId::proportional((radius * 1.1).max(6.0)),
+        Color32::WHITE,
+    );
 }
 
 /// The legend, anchored to the bottom-LEFT corner of the screen (not

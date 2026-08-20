@@ -8,6 +8,7 @@ use std::hash::{Hash, Hasher};
 use egui::{Color32, Stroke};
 
 use crate::graph::model::GitStatus;
+use crate::review::findings::Severity;
 
 // `abbreviated_label` is a pure string function with no egui dependency --
 // it lives in `crate::graph::labels` so `crate::graph::layout` can use it
@@ -98,6 +99,20 @@ pub fn edge_stroke_incoming() -> Stroke {
 /// distinct from [`leaf_fill`]'s `Added` green so it doesn't read as a
 /// status change.
 pub const TESTED_BADGE_COLOR: Color32 = Color32::from_rgb(0x6a, 0xc9, 0x6a);
+
+/// Color for a findings badge (see [`crate::review::findings::badge`]) of
+/// `severity` -- red `high`, orange `medium`, yellow `low`, matching the
+/// severity's own urgency the way [`leaf_fill`]'s status colors already
+/// map git status to hue. Distinct from every [`leaf_fill`]/
+/// [`TESTED_BADGE_COLOR`] hue so a findings badge never gets mistaken for
+/// either.
+pub fn severity_color(severity: Severity) -> Color32 {
+    match severity {
+        Severity::High => Color32::from_rgb(0xe0, 0x4a, 0x4a),
+        Severity::Medium => Color32::from_rgb(0xe0, 0x8a, 0x3d),
+        Severity::Low => Color32::from_rgb(0xd9, 0xc9, 0x3d),
+    }
+}
 
 /// Screen-space breathing room kept above the topmost node when the graph
 /// first opens (baked into [`crate::ui::graph_view::Transform`]'s default

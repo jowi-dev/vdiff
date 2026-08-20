@@ -19,6 +19,7 @@ use egui::{Align2, FontId, Pos2, Rect, Ui, UiBuilder, Vec2};
 use crate::core::app::App;
 use crate::core::file_view::{FileViewEntry, FileViewState};
 use crate::graph::model::NodeId;
+use crate::review::findings::{format_finding_line, Finding};
 use crate::ui::file_view;
 use crate::ui::nvim_pane::{self, NvimPane};
 use crate::ui::theme;
@@ -28,6 +29,10 @@ const HEADER_HEIGHT: f32 = 28.0;
 
 /// Horizontal padding before the header text.
 const HEADER_PADDING: f32 = 8.0;
+
+/// Height of one line in the findings strip (issue #5) -- see
+/// [`findings_strip_height`]/[`paint_findings_strip`].
+const FINDING_ROW_HEIGHT: f32 = 20.0;
 
 /// Paint the fullscreen overlay into `ui`'s current `max_rect` (the whole
 /// viewport -- the graph has already been painted underneath by the
@@ -65,8 +70,19 @@ pub fn show(
         theme::OVERLAY_HEADER_TEXT,
     );
 
+    let displayed = displayed_node(app, file_view_state);
+    let node_findings = app.findings_for(displayed);
+    let strip_height = findings_strip_height(node_findings);
+    let strip_rect = Rect::from_min_size(
+        header_rect.left_bottom(),
+        Vec2::new(screen_rect.width(), strip_height),
+    );
+    if strip_height > 0.0 {
+        paint_findings_strip(ui.painter(), strip_rect, node_findings);
+    }
+
     let content_rect = Rect::from_min_max(
-        Pos2::new(screen_rect.left(), header_rect.bottom()),
+        Pos2::new(screen_rect.left(), strip_rect.bottom()),
         screen_rect.max,
     );
     let mut content_ui = ui.new_child(UiBuilder::new().max_rect(content_rect));
@@ -84,7 +100,11 @@ pub fn show(
             // for a second translucent layer to stack under.
             ui.painter()
                 .rect_filled(content_rect, 0.0, theme::translucent(theme::CANVAS_BG));
-            Some(file_view::show(&mut content_ui, file_view_state))
+            Some(file_view::show(
+                &mut content_ui,
+                file_view_state,
+                node_findings,
+            ))
         }
     }
 }
@@ -94,13 +114,7 @@ pub fn show(
 /// whose file is actually shown, which is `app.focus` except right after
 /// `gt` (see [`crate::core::app::Msg::GoToTest`]).
 fn header_text(app: &App, file_view: &FileViewState, nvim_mode: bool) -> String {
-    // The pane shows `file_view.node`'s file -- normally `app.focus`, but
-    // after `gt` (see `Msg::GoToTest`) focus stays on the module while the
-    // pane shows its matched test's file, so the header must name the node
-    // actually on screen. `focus` is only a fallback for the (should-never-
-    // happen) case where `file_view.node` isn't in the graph at all.
-    let display_node = app.graph.node(&file_view.node).map(|_| &file_view.node);
-    let display_node = display_node.unwrap_or(&app.focus);
+    let display_node = displayed_node(app, file_view);
     let display_name = app
         .graph
         .node(display_node)
@@ -125,6 +139,48 @@ fn header_text(app: &App, file_view: &FileViewState, nvim_mode: bool) -> String 
         file_view.files.len(),
         !nvim_mode,
     )
+}
+
+/// The node whose file is actually shown in the pane: `file_view.node`
+/// normally, but falls back to `app.focus` in the (should-never-happen)
+/// case where `file_view.node` isn't in the graph at all. Shared by
+/// [`header_text`] (naming the pane) and [`show`] (looking up which node's
+/// findings to list in the findings strip) -- both need "the node actually
+/// on screen", which after `gt` (see `Msg::GoToTest`) is the matched test,
+/// not `app.focus` itself (focus stays on the module it was called from).
+fn displayed_node<'a>(app: &'a App, file_view: &'a FileViewState) -> &'a NodeId {
+    let display_node = app.graph.node(&file_view.node).map(|_| &file_view.node);
+    display_node.unwrap_or(&app.focus)
+}
+
+/// The height of the findings strip painted between the header and the
+/// editor content -- one [`FINDING_ROW_HEIGHT`] row per finding, or `0.0`
+/// for no findings (in which case [`show`] skips painting it at all, so an
+/// unflagged node's pane looks exactly as it did before this feature).
+fn findings_strip_height(findings: &[Finding]) -> f32 {
+    findings.len() as f32 * FINDING_ROW_HEIGHT
+}
+
+/// Paint one severity-tagged line per finding in `findings`, top to bottom
+/// inside `strip_rect`, over an opaque [`theme::OVERLAY_HEADER_BG`]
+/// backing (matching the header strip's own opaque chrome, not the
+/// translucent editor content below it -- this is UI chrome naming what's
+/// flagged, not part of the "graph shows through" surface). No scrolling:
+/// per the issue's "keep it simple" guidance, every finding gets its own
+/// row -- `findings_strip_height` already sized the strip to fit them all.
+fn paint_findings_strip(painter: &egui::Painter, strip_rect: Rect, findings: &[Finding]) {
+    painter.rect_filled(strip_rect, 0.0, theme::OVERLAY_HEADER_BG);
+    for (i, finding) in findings.iter().enumerate() {
+        let row_top = strip_rect.top() + i as f32 * FINDING_ROW_HEIGHT;
+        let text_pos = Pos2::new(strip_rect.left() + HEADER_PADDING, row_top + 2.0);
+        painter.text(
+            text_pos,
+            Align2::LEFT_TOP,
+            format_finding_line(finding),
+            FontId::proportional(12.0),
+            theme::severity_color(finding.severity),
+        );
+    }
 }
 
 /// Pure text assembly given already-resolved pieces -- split out from
@@ -181,6 +237,51 @@ mod tests {
             changed_ranges: vec![],
             deleted,
         }
+    }
+
+    fn finding(severity: crate::review::findings::Severity, summary: &str) -> Finding {
+        Finding {
+            node_id: Some("n".to_string()),
+            path: None,
+            line: None,
+            severity,
+            summary: summary.to_string(),
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn findings_strip_height_zero_for_no_findings() {
+        assert_eq!(findings_strip_height(&[]), 0.0);
+    }
+
+    #[test]
+    fn findings_strip_height_one_row_per_finding() {
+        use crate::review::findings::Severity;
+        let findings = vec![
+            finding(Severity::Low, "a"),
+            finding(Severity::High, "b"),
+            finding(Severity::Medium, "c"),
+        ];
+        assert_eq!(findings_strip_height(&findings), 3.0 * FINDING_ROW_HEIGHT);
+    }
+
+    #[test]
+    fn displayed_node_prefers_file_view_node_when_present_in_graph() {
+        let mut app = app_with_test_module();
+        app.focus = NodeId::from("module");
+        let file_view = FileViewState::new(NodeId::from("module_test"), vec![]);
+        assert_eq!(
+            displayed_node(&app, &file_view),
+            &NodeId::from("module_test")
+        );
+    }
+
+    #[test]
+    fn displayed_node_falls_back_to_focus_when_file_view_node_unknown() {
+        let app = app_with_test_module();
+        let file_view = FileViewState::new(NodeId::from("nonexistent"), vec![]);
+        assert_eq!(displayed_node(&app, &file_view), &app.focus);
     }
 
     #[test]
@@ -308,6 +409,7 @@ mod tests {
             pane: Pane::File,
             viewport_rows: 20,
             reviewed: std::collections::HashSet::new(),
+            findings: std::collections::HashMap::new(),
         }
     }
 

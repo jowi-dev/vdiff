@@ -14,6 +14,7 @@ use vdiff::pipeline::git2_repo::Git2Repo;
 use vdiff::pipeline::pr::PrCheckout;
 use vdiff::pipeline::repo::GitRepo;
 use vdiff::pipeline::{build_graph, PipelineOptions};
+use vdiff::review::findings::{map_findings, parse_findings, Finding};
 use vdiff::ui::eframe_app::{DiffLoader, NvimConfig, ReviewConfig, VdiffApp};
 use vdiff::ui::nvim_pane::NvimPane;
 
@@ -21,11 +22,21 @@ use vdiff::ui::nvim_pane::NvimPane;
 /// review-completion store (issue #4), bundled so `run_gui` stays under
 /// clippy's argument-count limit: the repository's actual git directory
 /// (see [`vdiff::pipeline::repo::GitRepo::git_dir`]) and current branch
-/// name (see [`GitRepo::current_branch`]).
+/// name (see [`GitRepo::current_branch`]). Also carries `--findings
+/// <path>`'s already-loaded-and-mapped result (see [`load_findings`]) --
+/// unrelated to review-completion, but seeded once at startup exactly the
+/// same way, so it rides along in this bundle rather than pushing
+/// `run_gui` over the argument-count limit on its own.
 struct ReviewSetup {
     git_dir: PathBuf,
     branch: String,
+    findings: Findings,
 }
+
+/// `--findings <path>`'s already-loaded-and-mapped result (see
+/// [`load_findings`]), threaded into `App::findings` as-is -- `core` never
+/// re-derives this, it's pure lookup data seeded once at startup.
+type Findings = std::collections::HashMap<NodeId, Vec<Finding>>;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -127,9 +138,17 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
                 eprintln!("no changes vs {base_ref}");
                 return ExitCode::SUCCESS;
             }
+            let findings = match load_findings(cli.findings.as_deref(), &graph) {
+                Ok(findings) => findings,
+                Err(message) => {
+                    eprintln!("error: {message}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let review_setup = ReviewSetup {
                 git_dir: repo.git_dir(),
                 branch: repo.current_branch(),
+                findings,
             };
             run_gui(
                 graph,
@@ -142,6 +161,35 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
             )
         }
     }
+}
+
+/// `--findings <path>`: read the file, parse it (see
+/// [`vdiff::review::findings::parse_findings`]), and map it onto `graph`
+/// (see [`map_findings`]) -- `None` (the flag wasn't given) short-circuits
+/// to an empty map with no IO at all. A read or parse/validation error is
+/// fatal, per `--findings`'s doc: a `findings.json` a review agent produced
+/// is an agent-contract artifact, and silently limping past a broken one
+/// would hide a broken pipeline rather than surface it. An unmatched
+/// finding (unknown `node_id`, or a `path` matching nothing in `graph`)
+/// is not fatal -- see [`map_findings`]'s doc -- but is worth a one-line
+/// warning per entry so a reviewer running with a narrower graph than the
+/// one the agent saw (the default `focus_on_changes` view, say) knows why
+/// a finding they expected isn't showing up.
+fn load_findings(path: Option<&Path>, graph: &ProjectGraph) -> Result<Findings, String> {
+    let Some(path) = path else {
+        return Ok(Findings::new());
+    };
+    let contents = std::fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let findings = parse_findings(&contents).map_err(|err| format!("{}: {err}", path.display()))?;
+    let mapped = map_findings(graph, &findings);
+    for index in &mapped.unmatched {
+        eprintln!(
+            "warning: finding at index {index} in {} matched no node in the current graph (unknown node_id, or a path not backing any drawn node)",
+            path.display()
+        );
+    }
+    Ok(mapped.by_node)
 }
 
 /// `--export-comments`: print every captured review comment (see
@@ -244,7 +292,11 @@ fn run_gui(
     diff_loader: DiffLoader,
     review_setup: ReviewSetup,
 ) -> ExitCode {
-    let ReviewSetup { git_dir, branch } = review_setup;
+    let ReviewSetup {
+        git_dir,
+        branch,
+        findings,
+    } = review_setup;
     if want_nvim && !nvim_available() {
         eprintln!("warning: nvim mode is on by default but no `nvim` binary was found on PATH; falling back to the built-in file viewer");
     }
@@ -281,6 +333,7 @@ fn run_gui(
         pane: Pane::Graph,
         viewport_rows: 1,
         reviewed,
+        findings,
     };
 
     let title = format!("vdiff — {}", repo_dir_name(repo_path));

@@ -28,7 +28,21 @@
 //! this feature is still owned by this crate (see
 //! [`crate::core::app::Msg::ToggleReviewed`]) -- there's no nvim-plugin
 //! delegation involved.
+//!
+//! [`findings`] closes the loop the opposite direction from `--dump json
+//! --include-diffs` (the AI-review *input* payload): `vdiff --findings
+//! <path>` reads a review agent's *output* -- a JSON list of [`Finding`]s
+//! keyed by node id or file path -- and renders it on the graph (a severity
+//! badge), the focus overlay (finding summaries for the focused node), and
+//! the built-in file pane (per-line markers). See
+//! `docs/findings-schema.md` for the wire contract. Loaded once at startup
+//! in `main.rs`; `core::App` only ever holds the already-mapped
+//! `HashMap<NodeId, Vec<Finding>>`, never the raw file or path-matching
+//! logic.
+//!
+//! [`Finding`]: findings::Finding
 
 pub mod comments;
+pub mod findings;
 pub mod review_state;
 pub mod store;
