@@ -312,7 +312,11 @@ impl VdiffApp {
     }
 
     /// Dispatch `msg` through the pure reducer and execute the resulting
-    /// [`Cmd`].
+    /// [`Cmd`]. Clones the whole [`App`] on every call so `update` can stay
+    /// a pure `App -> (App, Cmd)` function with no `&mut` anywhere in
+    /// `core` -- a deliberate trade-off (`App` is small and this runs at
+    /// most a few times per user keypress, not per frame) rather than an
+    /// oversight.
     fn dispatch(&mut self, msg: Msg) {
         let (app, cmd) = update(self.app.clone(), msg);
         self.app = app;
