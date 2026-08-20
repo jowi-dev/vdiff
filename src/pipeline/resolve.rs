@@ -141,15 +141,33 @@ fn join(prefix: &str, rest: &str, sep: &str) -> String {
 /// `lang_prefix` (`rust:`/`elixir:`) is prepended to each trimmed candidate
 /// before lookup, since `candidate` itself is an unprefixed path built from
 /// `dep.name`/`crate::`/`self::`/`super::` substitution.
+///
+/// Elixir-only exemption (see issue #12): if `candidate` names more than one
+/// segment, trimming is not allowed to bottom out on a single bare top-level
+/// segment -- that's the "referencing `App.PartnerAccounts` shouldn't draw
+/// bare `App`" failure mode, since a stray edge landing on the namespace
+/// root is indistinguishable from a real reference to it. The ref is
+/// dropped instead once trimming reaches that point. A candidate that was
+/// only ever a single segment to begin with (a literal `alias App`, no
+/// trimming involved) is unaffected and still resolves exactly. Rust's
+/// trim-to-bare-crate-name behavior is untouched either way -- this
+/// exemption only fires for `lang_prefix == "elixir:"`.
 fn progressive_match(
     nodes: &HashMap<NodeId, ModuleNode>,
     candidate: &str,
     sep: &str,
     lang_prefix: &str,
 ) -> Option<NodeId> {
+    let is_elixir = lang_prefix == "elixir:";
+    let originally_multi_segment = candidate.contains(sep);
+
     let mut current = candidate;
     loop {
         if current.is_empty() {
+            return None;
+        }
+        let trimmed_to_bare_top_level = originally_multi_segment && !current.contains(sep);
+        if is_elixir && trimmed_to_bare_top_level {
             return None;
         }
         let id = NodeId::from(format!("{lang_prefix}{current}"));
