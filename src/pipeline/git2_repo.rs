@@ -25,6 +25,20 @@
 //! (`String::from_utf8_lossy`), so a non-UTF8 file (a binary asset)
 //! degrades to garbage text for extraction rather than erroring
 //! `build_graph` out entirely.
+//!
+//! `changed_files` never reports `.git` or `.claude` (vdiff's own
+//! worktree/config directory) -- see `is_ignored_path`. This matters beyond
+//! tidiness: a nested `git worktree add` checkout under, say,
+//! `.claude/worktrees/<name>` has its own gitlink `.git` *file*, which makes
+//! libgit2 treat that directory as a repo boundary it won't recurse into,
+//! surfacing the directory itself as one opaque untracked entry rather than
+//! the files inside it (issue #9). `changed_files` also drops any entry
+//! that resolves to a directory on disk (belt-and-suspenders for the same
+//! failure mode under a different name), and every worktree-byte read
+//! (`read_io`, `head_blob_oid`) treats "not found", "is a directory", and
+//! "permission denied" the same way: `None`, not an error -- so an
+//! unreadable or directory-shaped entry that somehow slips past the
+//! `changed_files` filter still can't abort `build_graph`.
 
 use std::path::{Path, PathBuf};
 
@@ -76,6 +90,23 @@ impl Git2Repo {
         Err(PipelineError::NoBaseRef)
     }
 
+    /// Whether `path`'s first component is a directory the change-set walk
+    /// must never surface: `.git` (already excluded by libgit2's own
+    /// workdir scan, which hardcodes a skip for it) and `.claude` (vdiff's
+    /// own worktree/config directory -- see the module doc for why this
+    /// needs the same treatment: a nested `git worktree add` checkout
+    /// living under `.claude/worktrees/...` has its own gitlink `.git`
+    /// file, which makes libgit2 treat that directory as a repo boundary
+    /// it won't recurse into, surfacing the directory itself as one opaque
+    /// untracked entry instead of the files inside it).
+    fn is_ignored_path(path: &Path) -> bool {
+        matches!(
+            path.components().next(),
+            Some(std::path::Component::Normal(name))
+                if name == ".git" || name == ".claude"
+        )
+    }
+
     fn tree_at(&self, oid_hex: &str) -> Result<git2::Tree<'_>> {
         let oid = Oid::from_str(oid_hex)?;
         let commit = self.repo.find_commit(oid)?;
@@ -91,7 +122,7 @@ impl Git2Repo {
     fn read_io(path: &Path) -> Result<Option<String>> {
         match std::fs::read(path) {
             Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) if is_unreadable_entry(&err) => Ok(None),
             Err(source) => Err(PipelineError::Io {
                 path: path.to_path_buf(),
                 source,
@@ -132,10 +163,34 @@ impl GitRepo for Git2Repo {
         find_opts.renames(true);
         diff.find_similar(Some(&mut find_opts))?;
 
+        let workdir = self.repo.workdir();
         let mut deltas = Vec::new();
         for delta in diff.deltas() {
             let new_path = delta.new_file().path().map(Path::to_path_buf);
             let old_path = delta.old_file().path().map(Path::to_path_buf);
+
+            // `.git`/`.claude` are never real change-set entries (see
+            // `is_ignored_path`), and a directory -- or anything else that
+            // can't be stat'd, e.g. a permission-denied entry -- can't be
+            // read as a file's content downstream, so it must be skipped
+            // here rather than surfacing as a `FileDelta` that later blows
+            // up `load_content`/`head_blob_oid`.
+            let is_unusable = |path: &Option<PathBuf>| {
+                let Some(path) = path else { return false };
+                if Self::is_ignored_path(path) {
+                    return true;
+                }
+                match workdir {
+                    Some(workdir) => {
+                        matches!(std::fs::metadata(workdir.join(path)), Ok(meta) if meta.is_dir())
+                    }
+                    None => false,
+                }
+            };
+            if is_unusable(&new_path) || is_unusable(&old_path) {
+                continue;
+            }
+
             match delta.status() {
                 // `Untracked` -- a brand-new file with no index entry at
                 // all -- is reported distinctly from `Added` (present in
@@ -234,7 +289,7 @@ impl GitRepo for Git2Repo {
             Ok(bytes) => Ok(Some(
                 Oid::hash_object(ObjectType::Blob, &bytes)?.to_string(),
             )),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) if is_unreadable_entry(&err) => Ok(None),
             Err(source) => Err(PipelineError::Io {
                 path: path.to_path_buf(),
                 source,
@@ -245,6 +300,22 @@ impl GitRepo for Git2Repo {
     fn git_dir(&self) -> PathBuf {
         self.repo.path().to_path_buf()
     }
+}
+
+/// Whether an I/O error reading a worktree path means "there's nothing
+/// file-shaped here" rather than a real failure: absent (`NotFound`), a
+/// directory (`IsADirectory` -- the `changed_files` filter should already
+/// keep these out, but this is the last line of defense against `build_graph`
+/// aborting over one), or permission-denied. Every [`GitRepo`] method that
+/// reads worktree bytes treats these the same way `NotFound` always has:
+/// `None`, not an error that kills the whole graph build.
+fn is_unreadable_entry(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::IsADirectory
+            | std::io::ErrorKind::PermissionDenied
+    )
 }
 
 #[cfg(test)]
@@ -332,6 +403,73 @@ mod tests {
         assert!(
             result.is_ok(),
             "detached HEAD must still resolve a base oid: {result:?}"
+        );
+    }
+
+    /// Reproduces issue #9: a nested git worktree (`.git` there is a gitlink
+    /// *file*, not a directory) inside the repo makes libgit2's untracked
+    /// scan surface the worktree's directory itself as one opaque entry
+    /// (it won't recurse into a directory that looks like a repo boundary,
+    /// same as `git status` reporting `?? .claude/` rather than every file
+    /// inside it) instead of recursing into it file by file.
+    /// `changed_files` must not choke on that directory entry, and must not
+    /// report anything under `.claude/` at all.
+    #[test]
+    fn changed_files_skips_nested_git_worktree_directory() {
+        let tmp = TempDir::new().expect("create tempdir");
+        let dir = tmp.path();
+        git(dir, &["init", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "hi\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "initial"]);
+
+        std::fs::create_dir_all(dir.join(".claude/worktrees")).unwrap();
+        git(
+            dir,
+            &["worktree", "add", ".claude/worktrees/x", "-b", "wt-branch"],
+        );
+
+        let repo = Git2Repo::open(dir).expect("open fixture repo");
+        let base_oid = repo.default_base_oid(Some("main")).expect("resolve base");
+        let deltas = repo
+            .changed_files(&base_oid)
+            .expect("changed_files must not error on the nested worktree dir");
+
+        assert!(
+            deltas
+                .iter()
+                .all(|d| { !d.path.starts_with(".claude") && !d.path.starts_with(".git") }),
+            ".claude/ (and .git) must be ignored entirely, got: {deltas:?}"
+        );
+    }
+
+    /// Same repro as above, but through `build_graph`, matching the
+    /// original bug report ("error building graph: ... Is a directory").
+    #[test]
+    fn build_graph_does_not_error_on_nested_git_worktree() {
+        let tmp = TempDir::new().expect("create tempdir");
+        let dir = tmp.path();
+        git(dir, &["init", "-b", "main"]);
+        std::fs::write(dir.join("a.rs"), "fn main() {}\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "initial"]);
+
+        std::fs::create_dir_all(dir.join(".claude/worktrees")).unwrap();
+        git(
+            dir,
+            &["worktree", "add", ".claude/worktrees/x", "-b", "wt-branch"],
+        );
+
+        let repo = Git2Repo::open(dir).expect("open fixture repo");
+        let result = crate::pipeline::build_graph(
+            &repo,
+            &crate::pipeline::PipelineOptions {
+                base_override: Some("main".to_string()),
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "build_graph must not abort on a nested git worktree: {result:?}"
         );
     }
 }
