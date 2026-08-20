@@ -211,6 +211,20 @@ fn cleanup_worktree(repo_path: &Path, worktree_path: &Path) {
     }
 }
 
+/// Resolve PR `pr_number`'s base branch via `gh pr view` (run in
+/// `repo_path`) and fetch it into a local tracking ref, *without* checking
+/// out the PR's head into a temporary worktree -- unlike [`PrCheckout`],
+/// for callers (`vdiff --publish-comments`) that diff against the PR's
+/// base but intend to operate on the caller's own current worktree, which
+/// is assumed to already be the PR's head (give or take local edits).
+/// Returns the resulting `origin/<base>` ref, suitable for
+/// [`crate::pipeline::PipelineOptions::base_override`] or
+/// [`crate::pipeline::repo::GitRepo::default_base_oid`].
+pub fn resolve_pr_base_ref(repo_path: &Path, pr_number: u64) -> Result<String, PrError> {
+    let refs = gh_pr_view(repo_path, pr_number)?;
+    fetch_tracking_ref(repo_path, &refs.base_ref)
+}
+
 /// A checked-out PR: `worktree_path()` is a temporary, detached-HEAD
 /// worktree at the PR's head ref; `base_ref()` is a locally-diffable ref
 /// for the PR's base, suitable for [`crate::pipeline::PipelineOptions::base_override`].
