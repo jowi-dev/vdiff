@@ -48,6 +48,28 @@ pub fn load(git_dir: &Path) -> io::Result<Vec<Comment>> {
     }
 }
 
+/// [`load`], but degrading a missing *or corrupt* store to an empty list
+/// instead of surfacing an error -- the leniency [`crate::main`]'s
+/// `load_comments` wants for `comments.json` (vdiff's own bookkeeping,
+/// written by `vdiff.nvim`, never hand-authored the way a `--findings`
+/// payload is): a read/parse failure degrades to "no comment badges"
+/// rather than refusing to start the GUI over it. The second element of the
+/// tuple is the warning message the caller should print to stderr when the
+/// store failed to load (a *missing* store is not a failure and warns
+/// nothing, same as [`load`] returning `Ok(Vec::new())` for it).
+pub fn load_or_empty(git_dir: &Path) -> (Vec<Comment>, Option<String>) {
+    match load(git_dir) {
+        Ok(comments) => (comments, None),
+        Err(err) => (
+            Vec::new(),
+            Some(format!(
+                "failed to load {}: {err}",
+                comments_path(git_dir).display()
+            )),
+        ),
+    }
+}
+
 /// Save `comments` as pretty-printed JSON, creating `<git_dir>/vdiff/` if
 /// it doesn't exist yet. Callers are expected to have already run
 /// [`crate::review::comments::sort_comments`] (or gone through
@@ -174,6 +196,38 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         save(tmp.path(), &[sample()]).expect("save");
         assert!(comments_path(tmp.path()).exists());
+    }
+
+    #[test]
+    fn load_or_empty_missing_store_returns_empty_with_no_warning() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(load_or_empty(tmp.path()), (Vec::new(), None));
+    }
+
+    #[test]
+    fn load_or_empty_corrupt_store_returns_empty_with_a_warning() {
+        let tmp = TempDir::new().unwrap();
+        let path = comments_path(tmp.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "not json").unwrap();
+
+        let (comments, warning) = load_or_empty(tmp.path());
+        assert_eq!(comments, Vec::new());
+        let warning = warning.expect("expected a warning for a corrupt store");
+        assert!(
+            warning.contains("comments.json"),
+            "expected the warning to name the store, got: {warning}"
+        );
+    }
+
+    #[test]
+    fn load_or_empty_valid_store_parses_normally() {
+        let tmp = TempDir::new().unwrap();
+        let mut comments = Vec::new();
+        add_comment(&mut comments, sample());
+        save(tmp.path(), &comments).expect("save");
+
+        assert_eq!(load_or_empty(tmp.path()), (comments, None));
     }
 
     fn sample_review_store() -> ReviewStore {

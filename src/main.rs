@@ -217,26 +217,22 @@ fn load_findings(path: Option<&Path>, graph: &ProjectGraph) -> Result<Findings, 
     Ok(mapped.by_node)
 }
 
-/// Load `<git_dir>/vdiff/comments.json` (see [`vdiff::review::store::load`])
-/// and map it onto `graph` (see [`map_comments`]) -- a missing store (no
-/// comments captured yet) or a store with nothing in it both come back as
-/// an empty map, no badges drawn, same as `--findings` never having been
-/// given. Unlike [`load_findings`], a read/parse failure here isn't fatal:
-/// `comments.json` is vdiff's own bookkeeping (written by `vdiff.nvim`,
-/// never hand-authored the way a `--findings` payload is), so a corrupt
-/// file degrades to "no comment badges" with a stderr warning rather than
-/// refusing to start the GUI over it.
+/// Load `<git_dir>/vdiff/comments.json` (see
+/// [`vdiff::review::store::load_or_empty`]) and map it onto `graph` (see
+/// [`map_comments`]) -- a missing store (no comments captured yet), a store
+/// with nothing in it, or a corrupt store all come back as an empty map, no
+/// badges drawn, same as `--findings` never having been given. Unlike
+/// [`load_findings`], a read/parse failure here isn't fatal: `comments.json`
+/// is vdiff's own bookkeeping (written by `vdiff.nvim`, never hand-authored
+/// the way a `--findings` payload is), so [`vdiff::review::store::load_or_empty`]
+/// already degrades a corrupt file to "no comment badges" for us -- this
+/// just prints the warning it hands back, if any, to stderr.
 fn load_comments(git_dir: &Path, graph: &ProjectGraph) -> Comments {
-    match vdiff::review::store::load(git_dir) {
-        Ok(comments) => map_comments(graph, &comments),
-        Err(err) => {
-            eprintln!(
-                "warning: failed to load {}: {err}",
-                vdiff::review::store::comments_path(git_dir).display()
-            );
-            Comments::new()
-        }
+    let (comments, warning) = vdiff::review::store::load_or_empty(git_dir);
+    if let Some(warning) = warning {
+        eprintln!("warning: {warning}");
     }
+    map_comments(graph, &comments)
 }
 
 /// `--export-comments`: print every captured review comment (see
