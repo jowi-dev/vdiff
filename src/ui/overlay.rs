@@ -410,6 +410,7 @@ mod tests {
             viewport_rows: 20,
             reviewed: std::collections::HashSet::new(),
             findings: std::collections::HashMap::new(),
+            comments: std::collections::HashMap::new(),
         }
     }
 

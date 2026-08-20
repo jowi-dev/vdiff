@@ -17,6 +17,7 @@ use crate::graph::model::{NodeId, ProjectGraph};
 use crate::graph::test_modules::{
     group_matched_test_modules, hide_test_modules, matched_test_module,
 };
+use crate::review::comments::Comment;
 use crate::review::findings::Finding;
 
 /// Which screen is currently shown.
@@ -128,6 +129,16 @@ pub struct App {
     /// it's pure lookup data the rendering glue (graph badges, the focus
     /// overlay, the file pane) reads via [`App::findings_for`].
     pub findings: HashMap<NodeId, Vec<Finding>>,
+    /// Review comments (see [`crate::review::comments`]), already mapped
+    /// onto node ids by [`crate::review::comments::map_comments`] once at
+    /// startup from `<git_dir>/vdiff/comments.json` -- empty when the store
+    /// doesn't exist or has nothing in it. `core` never re-derives this
+    /// from a node id/path itself; it's pure lookup data the rendering
+    /// glue reads to paint the graph's comment badge (issue #14). Replaced
+    /// wholesale, not incrementally patched, whenever the eframe glue
+    /// reloads the store (e.g. after a `vdiff_comment_saved` notification
+    /// from the embedded nvim session).
+    pub comments: HashMap<NodeId, Vec<Comment>>,
 }
 
 impl App {
@@ -825,6 +836,7 @@ mod tests {
             viewport_rows: 20,
             reviewed: HashSet::new(),
             findings: HashMap::new(),
+            comments: HashMap::new(),
         }
     }
 
@@ -1304,6 +1316,7 @@ mod tests {
             viewport_rows: 20,
             reviewed: HashSet::new(),
             findings: HashMap::new(),
+            comments: HashMap::new(),
         };
         assert!(!app
             .layers
@@ -1344,6 +1357,7 @@ mod tests {
             viewport_rows: 20,
             reviewed: HashSet::new(),
             findings: HashMap::new(),
+            comments: HashMap::new(),
         };
 
         let (app, cmd) = update(app, Msg::ToggleTests);
@@ -1521,6 +1535,7 @@ mod tests {
             viewport_rows: 20,
             reviewed: HashSet::new(),
             findings: HashMap::new(),
+            comments: HashMap::new(),
         }
     }
 

@@ -14,6 +14,7 @@ use vdiff::pipeline::git2_repo::Git2Repo;
 use vdiff::pipeline::pr::PrCheckout;
 use vdiff::pipeline::repo::GitRepo;
 use vdiff::pipeline::{build_graph, PipelineOptions};
+use vdiff::review::comments::{map_comments, Comment};
 use vdiff::review::findings::{map_findings, parse_findings, Finding};
 use vdiff::ui::eframe_app::{DiffLoader, NvimConfig, ReviewConfig, VdiffApp};
 use vdiff::ui::nvim_pane::NvimPane;
@@ -31,12 +32,23 @@ struct ReviewSetup {
     git_dir: PathBuf,
     branch: String,
     findings: Findings,
+    /// The local review-comment store (see [`vdiff::review::comments`]),
+    /// already mapped onto `graph`'s node ids the same way `findings` is --
+    /// see [`load_comments`]. Empty when the store doesn't exist yet or has
+    /// nothing in it; never fatal, unlike a broken `--findings` file, since
+    /// comments are vdiff's own bookkeeping rather than an agent-contract
+    /// artifact.
+    comments: Comments,
 }
 
 /// `--findings <path>`'s already-loaded-and-mapped result (see
 /// [`load_findings`]), threaded into `App::findings` as-is -- `core` never
 /// re-derives this, it's pure lookup data seeded once at startup.
 type Findings = std::collections::HashMap<NodeId, Vec<Finding>>;
+
+/// `<git_dir>/vdiff/comments.json`'s already-loaded-and-mapped result (see
+/// [`load_comments`]), threaded into `App::comments` as-is.
+type Comments = std::collections::HashMap<NodeId, Vec<Comment>>;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -145,10 +157,13 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            let git_dir = repo.git_dir();
+            let comments = load_comments(&git_dir, &graph);
             let review_setup = ReviewSetup {
-                git_dir: repo.git_dir(),
+                git_dir,
                 branch: repo.current_branch(),
                 findings,
+                comments,
             };
             run_gui(
                 graph,
@@ -190,6 +205,28 @@ fn load_findings(path: Option<&Path>, graph: &ProjectGraph) -> Result<Findings, 
         );
     }
     Ok(mapped.by_node)
+}
+
+/// Load `<git_dir>/vdiff/comments.json` (see [`vdiff::review::store::load`])
+/// and map it onto `graph` (see [`map_comments`]) -- a missing store (no
+/// comments captured yet) or a store with nothing in it both come back as
+/// an empty map, no badges drawn, same as `--findings` never having been
+/// given. Unlike [`load_findings`], a read/parse failure here isn't fatal:
+/// `comments.json` is vdiff's own bookkeeping (written by `vdiff.nvim`,
+/// never hand-authored the way a `--findings` payload is), so a corrupt
+/// file degrades to "no comment badges" with a stderr warning rather than
+/// refusing to start the GUI over it.
+fn load_comments(git_dir: &Path, graph: &ProjectGraph) -> Comments {
+    match vdiff::review::store::load(git_dir) {
+        Ok(comments) => map_comments(graph, &comments),
+        Err(err) => {
+            eprintln!(
+                "warning: failed to load {}: {err}",
+                vdiff::review::store::comments_path(git_dir).display()
+            );
+            Comments::new()
+        }
+    }
 }
 
 /// `--export-comments`: print every captured review comment (see
@@ -296,6 +333,7 @@ fn run_gui(
         git_dir,
         branch,
         findings,
+        comments,
     } = review_setup;
     if want_nvim && !nvim_available() {
         eprintln!("warning: nvim mode is on by default but no `nvim` binary was found on PATH; falling back to the built-in file viewer");
@@ -334,6 +372,7 @@ fn run_gui(
         viewport_rows: 1,
         reviewed,
         findings,
+        comments,
     };
 
     let title = format!("vdiff — {}", repo_dir_name(repo_path));
