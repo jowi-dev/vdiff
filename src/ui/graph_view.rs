@@ -227,7 +227,13 @@ pub fn show(
         }
     }
 
-    paint_legend(&painter, app, layout, response.rect, cache.hidden_test_count);
+    paint_legend(
+        &painter,
+        app,
+        layout,
+        response.rect,
+        cache.hidden_test_count,
+    );
     paint_focus_status(&painter, app, response.rect);
 }
 
