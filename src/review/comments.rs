@@ -187,7 +187,10 @@ fn resolve_targets(graph: &ProjectGraph, comment: &Comment) -> Vec<NodeId> {
         }
     }
     for node in graph.nodes.values() {
-        if node.files.iter().any(|f| f.path.to_string_lossy() == comment.path)
+        if node
+            .files
+            .iter()
+            .any(|f| f.path.to_string_lossy() == comment.path)
             && !targets.contains(&node.id)
         {
             targets.push(node.id.clone());

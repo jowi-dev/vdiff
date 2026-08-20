@@ -114,6 +114,14 @@ pub fn severity_color(severity: Severity) -> Color32 {
     }
 }
 
+/// Color for the review-comment badge (issue #14, see
+/// [`crate::review::comments::map_comments`]) -- the same violet
+/// `vdiff.nvim` uses for its own comment-range highlight/extmarks, so a
+/// node carrying a comment reads as "the same kind of mark" whether you're
+/// looking at the graph or the buffer it came from. Distinct from every
+/// [`leaf_fill`]/[`TESTED_BADGE_COLOR`]/[`severity_color`] hue.
+pub const COMMENT_BADGE_COLOR: Color32 = Color32::from_rgb(0x9d, 0x7c, 0xd8);
+
 /// Screen-space breathing room kept above the topmost node when the graph
 /// first opens (baked into [`crate::ui::graph_view::Transform`]'s default
 /// offset) and preserved by auto-pan (see

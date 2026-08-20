@@ -20,6 +20,7 @@ use crate::graph::model::{GitStatus, NodeId, ProjectGraph};
 use crate::graph::test_modules::{
     hide_test_modules, nodes_with_changed_tests, test_strips, TestStrip,
 };
+use crate::review::comments::Comment;
 use crate::review::findings::{self, Finding};
 use crate::ui::theme;
 
@@ -164,6 +165,7 @@ pub fn show(
         show_tests: app.show_tests,
         reviewed: &app.reviewed,
         findings: &app.findings,
+        comments: &app.comments,
     };
 
     paint_band_separators(&painter, layout, transform, response.rect);
@@ -389,6 +391,13 @@ struct NodeOverlay<'a> {
     /// top-left corner, opposite the existing tested-badge's top-right
     /// corner so the two never overlap.
     findings: &'a HashMap<NodeId, Vec<Finding>>,
+    /// Review comments (issue #14, see [`crate::review::comments::map_comments`]),
+    /// keyed by node -- painted as a small violet count badge (see
+    /// [`paint_comments_badge`]) at the main rect's bottom-right corner, the
+    /// one corner the findings badge (top-left), tested checkmark
+    /// (top-right), and attached test strip (below `main_rect`) never
+    /// touch.
+    comments: &'a HashMap<NodeId, Vec<Comment>>,
 }
 
 /// Paint `id`'s rect: status fill/border, a left-edge stripe in its
@@ -405,7 +414,11 @@ struct NodeOverlay<'a> {
 /// [`NodeOverlay::reviewed`], the main rect's fill (only the fill -- status
 /// border stroke, root stripe, and badges are untouched) is desaturated via
 /// [`theme::dim_reviewed`], the visual cue that this node's been marked
-/// reviewed (`v`, see [`crate::core::app::Msg::ToggleReviewed`]).
+/// reviewed (`v`, see [`crate::core::app::Msg::ToggleReviewed`]). Also
+/// paints a small violet comment-count badge at the bottom-right corner if
+/// [`NodeOverlay::comments`] has an entry for `id` (issue #14) -- see
+/// [`paint_comments_badge`] for why that corner never collides with any of
+/// this function's other badges/decorations.
 fn paint_node(
     painter: &egui::Painter,
     graph: &ProjectGraph,
@@ -486,6 +499,10 @@ fn paint_node(
 
     if let Some(findings) = overlay.findings.get(id) {
         paint_findings_badge(painter, main_rect, transform, findings);
+    }
+
+    if let Some(comments) = overlay.comments.get(id) {
+        paint_comments_badge(painter, main_rect, transform, comments);
     }
 
     if id == focus {
@@ -581,6 +598,38 @@ fn paint_findings_badge(
         center,
         Align2::CENTER_CENTER,
         format!("{count}"),
+        FontId::proportional((radius * 1.1).max(6.0)),
+        Color32::WHITE,
+    );
+}
+
+/// Paint `comments`'s count badge (issue #14) at `main_rect`'s
+/// bottom-right corner: a small filled circle in [`theme::COMMENT_BADGE_COLOR`]
+/// (the same violet `vdiff.nvim` highlights a commented range with), count
+/// as white text on top. Bottom-right is the one corner none of the other
+/// three badge/decoration spots ever reach: the findings badge sits
+/// top-left (just past the root-hue stripe), the tested checkmark sits
+/// top-right, and an attached test strip (when `show_tests` is on) is
+/// painted below `main_rect` entirely, never overlapping it -- so all four
+/// can coexist legibly on the same node. A no-op if `comments` is empty
+/// (shouldn't happen -- callers only reach this with a non-empty
+/// `overlay.comments` entry -- but defended rather than assumed).
+fn paint_comments_badge(
+    painter: &egui::Painter,
+    main_rect: EguiRect,
+    transform: &Transform,
+    comments: &[Comment],
+) {
+    if comments.is_empty() {
+        return;
+    }
+    let radius = (7.0 * transform.scale.max(0.3)).max(5.0);
+    let center = main_rect.max - Vec2::new(radius + 2.0, radius + 2.0);
+    painter.circle_filled(center, radius, theme::COMMENT_BADGE_COLOR);
+    painter.text(
+        center,
+        Align2::CENTER_CENTER,
+        format!("{}", comments.len()),
         FontId::proportional((radius * 1.1).max(6.0)),
         Color32::WHITE,
     );
