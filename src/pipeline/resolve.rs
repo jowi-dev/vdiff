@@ -14,11 +14,13 @@
 //! silently once trimming runs out of segments with no match.
 //!
 //! Elixir: no `crate::`/`self::`/`super::` syntax exists, so a [`DepRef`]'s
-//! name -- already the literal text of the alias/import/use/require target
-//! -- is matched the same progressive way. Per the v1 scope, only the
-//! directive itself becomes an edge; a subsequent bare reference the alias
-//! brought into scope (e.g. using `Repo` after `alias MyApp.Repo`) is not
-//! chased.
+//! name -- already the literal text of the alias/import/use/require target,
+//! or of a fully qualified remote call's/struct literal's target module
+//! (see [`crate::pipeline::extract::elixir_extract`]) -- is matched the
+//! same progressive way. A bare reference an `alias` brought into scope
+//! (e.g. using `Repo` after `alias MyApp.Repo`) is still not chased -- only
+//! the directive itself, or a call/struct literal that names the target
+//! module in full, becomes an edge.
 //!
 //! Known limitation: `super::` is only substituted once per path, against
 //! the referencing node's immediate parent -- a chained `super::super::x`

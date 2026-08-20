@@ -99,6 +99,10 @@ pub enum DepKind {
     Alias,
     /// Elixir `require`.
     Require,
+    /// An Elixir fully qualified remote call (`App.Leads.create_lead(...)`)
+    /// or struct literal (`%App.Leads.Lead{}`) with no `alias` directive
+    /// bringing the target module into scope.
+    RemoteCall,
     /// A cross-reference call resolved via `mix xref graph`.
     XrefCall,
 }

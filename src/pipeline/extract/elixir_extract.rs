@@ -10,6 +10,17 @@
 //! the other four attribute a [`DepRef`] to the innermost enclosing module.
 //! Directives outside any `defmodule` (script-style top-level code) are
 //! dropped -- they have no module to attach to.
+//!
+//! Two more shapes attribute a [`DepRef`] without needing any directive at
+//! all, since dotted module names lex as a single `alias` token in
+//! tree-sitter-elixir: a fully qualified remote call (`App.Leads.create_lead(...)`
+//! parses as `call target: (dot left: (alias) right: (identifier))`, so
+//! `dot.left`'s text is already the full target module name) and a struct
+//! literal (`%App.Leads.Lead{}` parses as `(map (struct (alias)))`). Both
+//! are attributed as [`DepKind::RemoteCall`]. A dot-call whose left side is
+//! not an `alias` node -- a variable (`foo.bar()`) or an atom
+//! (`:erlang.node()`) -- is not a module reference and is skipped;
+//! erlang-atom-module calls are out of scope for this extractor.
 
 use std::path::Path;
 
@@ -56,17 +67,23 @@ struct Ctx<'a> {
 fn walk(ctx: &mut Ctx, node: Node) {
     if node.kind() == "call" {
         if let Some(target) = node.child_by_field_name("target") {
-            if target.kind() == "identifier" {
-                let name = node_text(ctx.src, target);
-                match name.as_str() {
-                    "defmodule" => return handle_defmodule(ctx, node),
-                    "alias" | "import" | "use" | "require" => {
-                        return handle_directive(ctx, node, &name)
+            match target.kind() {
+                "identifier" => {
+                    let name = node_text(ctx.src, target);
+                    match name.as_str() {
+                        "defmodule" => return handle_defmodule(ctx, node),
+                        "alias" | "import" | "use" | "require" => {
+                            return handle_directive(ctx, node, &name)
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
+                "dot" => handle_remote_call(ctx, target),
+                _ => {}
             }
         }
+    } else if node.kind() == "struct" {
+        handle_struct_literal(ctx, node);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -129,6 +146,52 @@ fn handle_directive(ctx: &mut Ctx, node: Node, directive: &str) {
     };
     for name in directive_target_names(ctx.src, arg) {
         ctx.defs[current_idx].dep_refs.push(DepRef { name, kind });
+    }
+}
+
+/// Handle a `call` node's `dot` target (`App.Leads.create_lead(...)`):
+/// attribute a [`DepKind::RemoteCall`] [`DepRef`] to the innermost enclosing
+/// module if the dot's left side is a module alias, i.e. skip dot-calls on
+/// a variable (`foo.bar()`) or an atom (`:erlang.node()`). A no-op if there
+/// is no enclosing module.
+fn handle_remote_call(ctx: &mut Ctx, dot: Node) {
+    let Some(&current_idx) = ctx.stack.last() else {
+        return;
+    };
+    let Some(left) = dot.child_by_field_name("left") else {
+        return;
+    };
+    if left.kind() != "alias" {
+        return;
+    }
+    let name = node_text(ctx.src, left);
+    push_dep_ref(ctx, current_idx, name, DepKind::RemoteCall);
+}
+
+/// Handle a `%App.Leads.Lead{}` struct literal (parses as `(struct
+/// (alias))`): attribute a [`DepKind::RemoteCall`] [`DepRef`] to the
+/// innermost enclosing module. A no-op for update syntax on a variable
+/// (`%struct_var{}`, whose child is not an `alias`) or if there is no
+/// enclosing module.
+fn handle_struct_literal(ctx: &mut Ctx, node: Node) {
+    let Some(&current_idx) = ctx.stack.last() else {
+        return;
+    };
+    let Some(alias_node) = child_of_kind(node, "alias") else {
+        return;
+    };
+    let name = node_text(ctx.src, alias_node);
+    push_dep_ref(ctx, current_idx, name, DepKind::RemoteCall);
+}
+
+/// Push a [`DepRef`] onto `defs[idx].dep_refs`, unless one with the same
+/// name and kind is already present -- so repeated remote calls/struct
+/// literals targeting the same module within one file produce a single
+/// dep ref (and therefore a single edge once resolved).
+fn push_dep_ref(ctx: &mut Ctx, idx: usize, name: String, kind: DepKind) {
+    let refs = &mut ctx.defs[idx].dep_refs;
+    if !refs.iter().any(|d| d.name == name && d.kind == kind) {
+        refs.push(DepRef { name, kind });
     }
 }
 
@@ -293,6 +356,93 @@ mod tests {
     fn directive_outside_any_module_is_dropped() {
         let defs = extract("alias Foo.Bar\n");
         assert!(defs.is_empty());
+    }
+
+    #[test]
+    fn alias_as_still_yields_one_ref_to_the_aliased_target() {
+        let defs = extract(
+            r#"
+            defmodule MyApp.Accounts do
+                alias MyApp.Repo, as: R
+            end
+            "#,
+        );
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].dep_refs, vec![dep("MyApp.Repo", DepKind::Alias)]);
+    }
+
+    #[test]
+    fn fully_qualified_remote_call_with_no_alias_yields_a_dep_ref() {
+        let defs = extract(
+            r#"
+            defmodule MyApp.Accounts do
+                def create(attrs) do
+                    App.Leads.create_lead(attrs)
+                end
+            end
+            "#,
+        );
+        assert_eq!(defs.len(), 1);
+        assert_eq!(
+            defs[0].dep_refs,
+            vec![dep("App.Leads", DepKind::RemoteCall)]
+        );
+    }
+
+    #[test]
+    fn struct_literal_yields_a_dep_ref_to_its_module() {
+        let defs = extract(
+            r#"
+            defmodule MyApp.Accounts do
+                def build do
+                    %App.Leads.Lead{}
+                end
+            end
+            "#,
+        );
+        assert_eq!(defs.len(), 1);
+        assert_eq!(
+            defs[0].dep_refs,
+            vec![dep("App.Leads.Lead", DepKind::RemoteCall)]
+        );
+    }
+
+    #[test]
+    fn repeated_remote_calls_to_the_same_module_dedupe_to_one_ref() {
+        let defs = extract(
+            r#"
+            defmodule MyApp.Accounts do
+                def create(attrs) do
+                    App.Leads.create_lead(attrs)
+                end
+
+                def update(attrs) do
+                    App.Leads.update_lead(attrs)
+                end
+            end
+            "#,
+        );
+        assert_eq!(defs.len(), 1);
+        assert_eq!(
+            defs[0].dep_refs,
+            vec![dep("App.Leads", DepKind::RemoteCall)]
+        );
+    }
+
+    #[test]
+    fn dot_call_on_variable_or_atom_is_not_a_module_reference() {
+        let defs = extract(
+            r#"
+            defmodule MyApp.Accounts do
+                def check(foo) do
+                    foo.bar()
+                    :erlang.node()
+                end
+            end
+            "#,
+        );
+        assert_eq!(defs.len(), 1);
+        assert!(defs[0].dep_refs.is_empty());
     }
 
     #[test]

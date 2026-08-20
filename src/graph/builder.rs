@@ -593,6 +593,41 @@ mod tests {
     }
 
     #[test]
+    fn elixir_remote_call_dep_ref_produces_an_edge_and_focus_can_see_it() {
+        // Simulates ElixirExtract's output for a file that calls
+        // `App.Leads.create_lead(...)` with no `alias App.Leads` directive
+        // -- a fully qualified remote call must still produce a real edge
+        // in the built graph, not just an alias/import/use/require one.
+        let files = vec![
+            FileInput {
+                file_ref: file_ref("lib/my_app/accounts.ex"),
+                lang: Lang::Elixir,
+                defs: vec![module(
+                    "MyApp.Accounts",
+                    vec![dep("App.Leads", DepKind::RemoteCall)],
+                )],
+            },
+            FileInput {
+                file_ref: file_ref("lib/app/leads.ex"),
+                lang: Lang::Elixir,
+                defs: vec![module("App.Leads", vec![])],
+            },
+        ];
+        let graph = build(files, &changes(vec![]), &HashMap::new());
+
+        let edge = crate::graph::model::DepEdge {
+            from: NodeId::from("elixir:MyApp.Accounts"),
+            to: NodeId::from("elixir:App.Leads"),
+            kind: DepKind::RemoteCall,
+        };
+        assert!(graph.edges.contains(&edge));
+
+        let targets =
+            crate::core::focus::dep_targets(&graph, &NodeId::from("elixir:MyApp.Accounts"));
+        assert!(targets.contains(&NodeId::from("elixir:App.Leads")));
+    }
+
+    #[test]
     fn real_defmodule_takes_precedence_over_synthetic_namespace() {
         let files = vec![
             FileInput {
