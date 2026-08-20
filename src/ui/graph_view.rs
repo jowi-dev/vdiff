@@ -103,6 +103,55 @@ impl Transform {
     }
 }
 
+/// The three test-module-derived pieces of [`show`]'s per-frame state that
+/// only change when [`App::graph`] or [`App::show_tests`] does -- `graph`
+/// never changes after startup (see `main::run_gui`'s doc), and
+/// `show_tests` only flips on [`crate::core::app::Msg::ToggleTests`], which
+/// always returns [`crate::core::app::Cmd::Relayout`]. Recomputing these
+/// from scratch on every repaint meant a full clone+prune
+/// ([`hide_test_modules`]) plus two more whole-graph scans
+/// ([`nodes_with_changed_tests`]/[`test_strips`]) dozens of times a second
+/// for data that was almost always unchanged since the last frame. The
+/// caller (`crate::ui::eframe_app::VdiffApp`) builds this once via
+/// [`GraphViewCache::rebuild`] at construction and again whenever it
+/// executes a `Cmd::Relayout`, and hands it to [`show`] by reference.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GraphViewCache {
+    /// How many test modules [`hide_test_modules`] would prune -- the
+    /// legend's "N test modules hidden/showing" hint (see
+    /// `paint_hint_row`).
+    pub hidden_test_count: usize,
+    /// [`nodes_with_changed_tests`]'s output over the full graph -- the
+    /// tested-checkmark badge drawn on a node whose *hidden* matched test
+    /// changed, meaningful regardless of `show_tests`.
+    pub changed_test_nodes: HashSet<NodeId>,
+    /// [`test_strips`]'s output, only ever non-empty while `show_tests` is
+    /// on (see [`App::visible_graph`]'s doc for why a matched test's
+    /// info moves from `changed_test_nodes`'s badge to this attached strip
+    /// once tests are shown).
+    pub strips: HashMap<NodeId, TestStrip>,
+}
+
+impl GraphViewCache {
+    /// Recompute every field from `app.graph`/`app.show_tests`. Cheap
+    /// relative to a repaint budget, but not cheap enough to redo on every
+    /// frame -- see the struct doc for when the caller should call this.
+    pub fn rebuild(app: &App) -> Self {
+        let (_, hidden_test_count) = hide_test_modules(&app.graph);
+        let changed_test_nodes = nodes_with_changed_tests(&app.graph);
+        let strips = if app.show_tests {
+            test_strips(&app.graph)
+        } else {
+            HashMap::new()
+        };
+        Self {
+            hidden_test_count,
+            changed_test_nodes,
+            strips,
+        }
+    }
+}
+
 /// Paint the graph into `ui`'s available space: background, edges, node
 /// rects, then the pinned legend row on top. Handles pan (drag) and zoom
 /// (scroll) on the empty canvas, and auto-pans so a newly focused node comes
@@ -119,12 +168,16 @@ impl Transform {
 /// painted as flicker on the node rects. Gating on a real focus change
 /// makes the pan run once per focus move and leaves the transform alone
 /// otherwise.
+///
+/// `cache` is [`GraphViewCache`]'s already-computed test-module data --
+/// see its doc for why this doesn't recompute it itself.
 pub fn show(
     ui: &mut Ui,
     app: &App,
     layout: &LayoutResult,
     transform: &mut Transform,
     last_focus: &mut Option<NodeId>,
+    cache: &GraphViewCache,
 ) {
     let viewport = ui.max_rect();
     let response = ui.allocate_rect(viewport, Sense::click_and_drag());
@@ -149,19 +202,9 @@ pub fn show(
     let painter = ui.painter_at(response.rect);
     painter.rect_filled(response.rect, 0.0, theme::CANVAS_BG);
 
-    let tested = nodes_with_changed_tests(&app.graph);
-    // Only ever non-empty once `show_tests` is on -- see
-    // `App::visible_graph`'s doc for why a matched test's info moves from
-    // the hidden-mode badge (`tested`, above) to an attached strip here.
-    let strips = if app.show_tests {
-        test_strips(&app.graph)
-    } else {
-        HashMap::new()
-    };
-
     let node_overlay = NodeOverlay {
-        tested: &tested,
-        strips: &strips,
+        tested: &cache.changed_test_nodes,
+        strips: &cache.strips,
         show_tests: app.show_tests,
         reviewed: &app.reviewed,
         findings: &app.findings,
@@ -184,7 +227,7 @@ pub fn show(
         }
     }
 
-    paint_legend(&painter, app, layout, response.rect);
+    paint_legend(&painter, app, layout, response.rect, cache.hidden_test_count);
     paint_focus_status(&painter, app, response.rect);
 }
 
@@ -642,7 +685,13 @@ fn paint_comments_badge(
 /// backing chip: root-hue swatches, then a hint row -- the hidden/shown
 /// test-module count with the `t` key reminder, and two edge-color swatches
 /// explaining [`theme::edge_stroke_outgoing`]/[`theme::edge_stroke_incoming`].
-fn paint_legend(painter: &egui::Painter, app: &App, layout: &LayoutResult, viewport: EguiRect) {
+fn paint_legend(
+    painter: &egui::Painter,
+    app: &App,
+    layout: &LayoutResult,
+    viewport: EguiRect,
+    hidden_test_count: usize,
+) {
     let chip_height = LEGEND_H * 2.0;
     let chip_rect = EguiRect::from_min_size(
         Pos2::new(
@@ -656,7 +705,7 @@ fn paint_legend(painter: &egui::Painter, app: &App, layout: &LayoutResult, viewp
     let root_row_y = chip_rect.top() + LEGEND_H / 2.0;
     let hint_row_y = chip_rect.top() + LEGEND_H + LEGEND_H / 2.0;
     paint_root_legend(painter, &app.graph, layout, viewport, root_row_y);
-    paint_hint_row(painter, app, viewport, hint_row_y);
+    paint_hint_row(painter, app, viewport, hint_row_y, hidden_test_count);
 }
 
 /// Row 1: every distinct top-level root's name in its
@@ -703,7 +752,13 @@ fn paint_root_legend(
 /// [`App::review_progress`]), the test-module hidden/shown hint (only drawn
 /// once there are any test modules to mention at all), then the two
 /// edge-color swatches.
-fn paint_hint_row(painter: &egui::Painter, app: &App, viewport: EguiRect, text_y: f32) {
+fn paint_hint_row(
+    painter: &egui::Painter,
+    app: &App,
+    viewport: EguiRect,
+    text_y: f32,
+    hidden_count: usize,
+) {
     const HINT_COLOR: Color32 = Color32::from_rgb(0xaa, 0xaa, 0xaa);
 
     let mut cursor_x = viewport.left() + CORNER_MARGIN;
@@ -722,7 +777,6 @@ fn paint_hint_row(painter: &egui::Painter, app: &App, viewport: EguiRect, text_y
         cursor_x = paint_text(painter, &progress, cursor_x, text_y, HINT_COLOR) + 20.0;
     }
 
-    let (_, hidden_count) = hide_test_modules(&app.graph);
     if hidden_count > 0 {
         let hint = if app.show_tests {
             format!("showing {hidden_count} test modules — t to hide")

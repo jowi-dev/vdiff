@@ -48,7 +48,7 @@ use crate::review::comments::map_comments;
 use crate::review::review_state::ReviewStore;
 use crate::review::store as review_store;
 use crate::ui::diff_view;
-use crate::ui::graph_view::{self, Transform};
+use crate::ui::graph_view::{self, GraphViewCache, Transform};
 use crate::ui::nvim_pane::{self, NvimAction, NvimPane};
 use crate::ui::overlay;
 
@@ -227,6 +227,12 @@ pub struct VdiffApp {
     /// The current branch name (or `"HEAD"` if detached -- see
     /// [`GitRepo::current_branch`]), keying [`Self::review_store`].
     review_branch: String,
+    /// [`GraphViewCache`]'s expensive-to-recompute, `graph`/`show_tests`-
+    /// derived data for [`graph_view::show`] -- built once in [`Self::new`]
+    /// and rebuilt in [`Self::execute`]'s [`Cmd::Relayout`] arm, the only
+    /// two moments either input can change. See its own doc for why this
+    /// isn't just recomputed inline in `show` on every repaint.
+    graph_view_cache: GraphViewCache,
 }
 
 /// Everything [`VdiffApp::new`] needs to set up (and later respawn) the
@@ -280,6 +286,7 @@ impl VdiffApp {
         nvim: NvimConfig,
         review: ReviewConfig,
     ) -> Self {
+        let graph_view_cache = GraphViewCache::rebuild(&app);
         Self {
             app,
             layout,
@@ -300,6 +307,7 @@ impl VdiffApp {
             warned_missing_comment_plugin: false,
             review_store: review.store,
             review_branch: review.branch,
+            graph_view_cache,
         }
     }
 
@@ -314,7 +322,9 @@ impl VdiffApp {
     /// Execute a [`Cmd`]: `LoadDiff` reads file content via `diff_loader`
     /// and reports the result back through the reducer as `DiffLoaded`/
     /// `LoadFailed`; `Relayout` rebuilds `self.layout` from
-    /// [`App::visible_graph`] now that `self.app.layers` changed shape.
+    /// [`App::visible_graph`] now that `self.app.layers` changed shape, and
+    /// rebuilds [`Self::graph_view_cache`] alongside it (see
+    /// [`GraphViewCache`]'s doc).
     fn execute(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::None => {}
@@ -324,12 +334,17 @@ impl VdiffApp {
             },
             Cmd::LoadFile(node) => self.load_file(node),
             Cmd::Relayout => {
-                let test_strips = if self.app.show_tests {
-                    crate::graph::test_modules::test_strips(&self.app.graph)
-                } else {
-                    std::collections::HashMap::new()
-                };
-                self.layout = layout_with_test_strips(&self.app.visible_graph(), &test_strips);
+                // `graph`/`show_tests` are exactly what changed to produce
+                // this `Cmd::Relayout` (see `core::app::toggle_tests`), so
+                // `GraphViewCache` needs rebuilding here too -- see its own
+                // doc for why `graph_view::show` doesn't just recompute it
+                // itself every frame. Rebuilt first so `layout_with_test_strips`
+                // below reuses its `strips` instead of computing them twice.
+                self.graph_view_cache = GraphViewCache::rebuild(&self.app);
+                self.layout = layout_with_test_strips(
+                    &self.app.visible_graph(),
+                    &self.graph_view_cache.strips,
+                );
             }
             Cmd::CommentNode(node) => self.comment_node(node),
             Cmd::PersistReviewState => self.persist_review_state(),
@@ -796,6 +811,7 @@ impl VdiffApp {
                 &self.layout,
                 &mut self.transform,
                 &mut self.last_focus,
+                &self.graph_view_cache,
             );
             if self.app.pane == Pane::File {
                 if let Some(file_view) = self.app.file_view.as_ref() {
