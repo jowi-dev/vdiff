@@ -12,12 +12,22 @@
 //! sharing one. Pretty-printed and always re-saved in
 //! [`crate::review::comments::sort_comments`] order, so a `git diff` of
 //! `comments.json` itself (if anyone ever did track it) stays sane.
+//!
+//! Also owns IO for two sibling sidecar files that live alongside
+//! `comments.json` under the same `<git_dir>/vdiff/` directory:
+//! `review-state.json` (which nodes are marked reviewed, per branch -- see
+//! [`ReviewStore`]) and `published-comments.json` (which comments have
+//! already been posted to which GitHub PR, via `vdiff --publish-comments`
+//! -- see [`PublishedStore`]). Unlike `comments.json`, vdiff itself owns
+//! writing both of these outright: they're pure bookkeeping nothing else
+//! ever needs to touch.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use super::comments::Comment;
+use super::publish::PublishedStore;
 use super::review_state::ReviewStore;
 
 /// Where the comment store lives, given the repository's actual git
@@ -81,6 +91,42 @@ pub fn load_review_state(git_dir: &Path) -> ReviewStore {
 /// doesn't exist yet -- the review-completion counterpart to [`save`].
 pub fn save_review_state(git_dir: &Path, store: &ReviewStore) -> io::Result<()> {
     let path = review_state_path(git_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(store)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    fs::write(path, json)
+}
+
+/// Where the `--publish-comments` sidecar lives, given the repository's
+/// actual git directory -- see [`comments_path`]'s doc for why this has to
+/// be [`crate::pipeline::repo::GitRepo::git_dir`], never a hand-joined
+/// `<worktree>/.git`.
+pub fn published_path(git_dir: &Path) -> PathBuf {
+    git_dir.join("vdiff").join("published-comments.json")
+}
+
+/// Load the `--publish-comments` sidecar, or an empty [`PublishedStore`] if
+/// the file doesn't exist yet, can't be read, or fails to parse. Degrades
+/// the same way [`load_review_state`] does (never fatal): this file is
+/// vdiff's own bookkeeping, written only after a successful `gh` post, and
+/// a corrupt copy should cost a re-publish at worst, not a refusal to run.
+pub fn load_published(git_dir: &Path) -> PublishedStore {
+    let path = published_path(git_dir);
+    match fs::read_to_string(&path) {
+        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+        Err(_) => PublishedStore::default(),
+    }
+}
+
+/// Save `store` as pretty-printed JSON, creating `<git_dir>/vdiff/` if it
+/// doesn't exist yet -- the `--publish-comments` sidecar's counterpart to
+/// [`save_review_state`]. Callers must only call this after `gh` has
+/// already confirmed the review was posted -- see
+/// [`crate::pipeline::publish`]'s module doc.
+pub fn save_published(git_dir: &Path, store: &PublishedStore) -> io::Result<()> {
+    let path = published_path(git_dir);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -185,6 +231,50 @@ mod tests {
         assert_eq!(
             comments_path(tmp.path()).parent(),
             review_state_path(tmp.path()).parent()
+        );
+    }
+
+    #[test]
+    fn load_published_missing_file_returns_empty_store() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(load_published(tmp.path()), PublishedStore::default());
+    }
+
+    #[test]
+    fn load_published_corrupt_file_returns_empty_store_not_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let path = published_path(tmp.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{ not valid json").unwrap();
+        assert_eq!(load_published(tmp.path()), PublishedStore::default());
+    }
+
+    #[test]
+    fn save_published_then_load_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = PublishedStore::default();
+        store.record("c1", 12, "2026-08-18T00:00:00Z".to_string());
+        save_published(tmp.path(), &store).expect("save");
+        assert_eq!(load_published(tmp.path()), store);
+    }
+
+    #[test]
+    fn save_published_creates_git_vdiff_directory() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = PublishedStore::default();
+        store.record("c1", 12, "2026-08-18T00:00:00Z".to_string());
+        save_published(tmp.path(), &store).expect("save");
+        assert!(published_path(tmp.path()).exists());
+    }
+
+    #[test]
+    fn published_sidecar_lives_alongside_comments_and_review_state() {
+        let tmp = TempDir::new().unwrap();
+        assert_ne!(comments_path(tmp.path()), published_path(tmp.path()));
+        assert_ne!(review_state_path(tmp.path()), published_path(tmp.path()));
+        assert_eq!(
+            comments_path(tmp.path()).parent(),
+            published_path(tmp.path()).parent()
         );
     }
 }
