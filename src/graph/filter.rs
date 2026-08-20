@@ -17,6 +17,17 @@ use crate::graph::model::{GitStatus, ModuleNode, NodeId, ProjectGraph};
 /// (no nodes, no roots, no edges) -- callers render that specially (the GUI
 /// prints "no changes vs `<base>`" and exits without opening a window; dump
 /// mode just emits the empty graph).
+///
+/// One exception to "every ancestor of a kept node survives": a kept
+/// ancestor that's `Unchanged`, has no edges of its own in the pruned edge
+/// set, and was pulled in *only* by the ancestor rule (not itself changed,
+/// not on a connecting path) is a bare namespace parent -- e.g. referencing
+/// `App.PartnerAccounts` alone shouldn't surface a box for `App` itself
+/// (issue #12). Such a node stays in the result's node table (hierarchy
+/// lookups like [`ProjectGraph::top_level_root`] and label abbreviation
+/// still need it) but is relabeled as a synthetic namespace container by
+/// clearing its `files` -- see [`hide_bare_namespace_ancestors`] -- so
+/// [`crate::graph::layers::assign_layers`] never gives it a box.
 pub fn focus_on_changes(graph: &ProjectGraph) -> ProjectGraph {
     let changed = changed_node_ids(graph);
     if changed.is_empty() {
@@ -31,10 +42,53 @@ pub fn focus_on_changes(graph: &ProjectGraph) -> ProjectGraph {
     let backward = reachable(graph, &changed, Direction::Backward);
     let on_a_connecting_path: HashSet<NodeId> = forward.intersection(&backward).cloned().collect();
 
-    let mut keep: HashSet<NodeId> = changed.into_iter().chain(on_a_connecting_path).collect();
+    let keep_before_ancestors: HashSet<NodeId> =
+        changed.into_iter().chain(on_a_connecting_path).collect();
+    let mut keep = keep_before_ancestors.clone();
     add_ancestors(graph, &mut keep);
 
-    prune(graph, &keep)
+    let pruned = prune(graph, &keep);
+    hide_bare_namespace_ancestors(pruned, &keep_before_ancestors)
+}
+
+/// Exempt a pure-namespace ancestor from being drawn (see the module docs'
+/// summary and issue #12): a node the ancestor rule pulled in *only* because
+/// one of its descendants survived -- i.e. it wasn't itself changed and
+/// didn't sit on a connecting path (`keep_before_ancestors` is the keep set
+/// from just before [`add_ancestors`] ran) -- and that ends up with no edges
+/// of its own in `graph`'s already-pruned edge set is relabeled as a
+/// synthetic namespace container (`files` cleared) rather than dropped
+/// outright.
+///
+/// This deliberately reuses the existing "no files means not drawn"
+/// convention ([`crate::graph::layers::drawn_node_ids`]) instead of adding a
+/// new field or filtering the node out of `nodes` entirely: everything that
+/// still needs the node's *presence* -- [`ProjectGraph::top_level_root`],
+/// [`crate::graph::labels::abbreviated_label`], `h`/`l` layer navigation
+/// (which only ever walks [`crate::graph::layers::assign_layers`]'s output,
+/// so a non-drawn node is simply never a target -- no special-casing
+/// needed), and layout roots -- keeps working unchanged, since `id`,
+/// `parent`, `children`, `status` and the node's membership in `nodes`/
+/// `roots` are all left exactly as `prune` produced them. Only whether the
+/// node gets a box on screen changes.
+fn hide_bare_namespace_ancestors(
+    mut graph: ProjectGraph,
+    keep_before_ancestors: &HashSet<NodeId>,
+) -> ProjectGraph {
+    let mut has_edge: HashSet<NodeId> = HashSet::new();
+    for edge in &graph.edges {
+        has_edge.insert(edge.from.clone());
+        has_edge.insert(edge.to.clone());
+    }
+
+    for (id, node) in graph.nodes.iter_mut() {
+        let ancestor_only = !keep_before_ancestors.contains(id);
+        if ancestor_only && node.status == GitStatus::Unchanged && !has_edge.contains(id) {
+            node.files.clear();
+        }
+    }
+
+    graph
 }
 
 /// Every node id whose status isn't [`GitStatus::Unchanged`].
@@ -320,12 +374,7 @@ mod tests {
         let g = graph(
             vec![
                 node("App", GitStatus::Unchanged, None, &["App.PartnerAccounts"]),
-                node(
-                    "App.PartnerAccounts",
-                    GitStatus::Modified,
-                    Some("App"),
-                    &[],
-                ),
+                node("App.PartnerAccounts", GitStatus::Modified, Some("App"), &[]),
             ],
             &["App"],
             vec![],
