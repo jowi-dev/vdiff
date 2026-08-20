@@ -307,6 +307,46 @@ mod tests {
             .all(|e| e.from != NodeId::from("changed") || e.to != NodeId::from("dead")));
     }
 
+    /// Reproduces issue #12: referencing `App.PartnerAccounts` alone must not
+    /// surface the bare `App` node. `App` is file-bearing (it has its own
+    /// `app.ex`, matching a real `defmodule App do end` namespace shell),
+    /// `Unchanged`, and has no edges of its own -- it's kept only by the
+    /// ancestor rule because its child `App.PartnerAccounts` changed. The
+    /// focused graph's node table may still carry `App` for hierarchy
+    /// bookkeeping, but [`crate::graph::layers::assign_layers`] -- which
+    /// decides what's actually painted -- must never place it in a layer.
+    #[test]
+    fn bare_namespace_ancestor_with_no_edges_is_not_drawn() {
+        let g = graph(
+            vec![
+                node("App", GitStatus::Unchanged, None, &["App.PartnerAccounts"]),
+                node(
+                    "App.PartnerAccounts",
+                    GitStatus::Modified,
+                    Some("App"),
+                    &[],
+                ),
+            ],
+            &["App"],
+            vec![],
+        );
+
+        let focused = focus_on_changes(&g);
+
+        assert!(
+            focused.node(&NodeId::from("App")).is_some(),
+            "App stays in the node table as ancestor bookkeeping"
+        );
+
+        let layers = crate::graph::layers::assign_layers(&focused);
+        let drawn: Vec<&NodeId> = layers.iter().flatten().collect();
+        assert!(
+            !drawn.contains(&&NodeId::from("App")),
+            "bare namespace ancestor App must not be drawn just because its child changed"
+        );
+        assert!(drawn.contains(&&NodeId::from("App.PartnerAccounts")));
+    }
+
     /// Zero changed nodes yields an empty graph.
     #[test]
     fn no_changed_nodes_yields_empty_graph() {

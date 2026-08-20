@@ -250,6 +250,44 @@ mod tests {
         assert_eq!(edges[0].to, NodeId::from("rust:myapp::foo::sibling"));
     }
 
+    /// Reproduces issue #12's suspected resolve-trim mechanism: an Elixir
+    /// ref naming a nested module nothing matches (`App.PartnerAccounts.Foo`)
+    /// must NOT fall back onto the bare top-level `App` node once trimming
+    /// has stripped away every segment past the first. Trimming down to an
+    /// intermediate multi-segment match (e.g. `App.PartnerAccounts`) is
+    /// still fine -- only landing all the way down to a single segment is
+    /// the failure mode this guards against.
+    #[test]
+    fn elixir_ref_trimmed_to_a_single_segment_does_not_resolve_to_bare_top_level_node() {
+        let nodes = nodes(&[("elixir:App", None)]);
+        let ctx = NodeContext {
+            id: NodeId::from("elixir:App"),
+            dep_refs: vec![dep("App.PartnerAccounts.Foo")],
+            rust_crate_name: None,
+        };
+        let edges = resolve_edges(&nodes, &[ctx]);
+        assert!(
+            edges.is_empty(),
+            "trimming all the way down to bare `App` must drop the ref, not resolve it: {edges:?}"
+        );
+    }
+
+    /// The exemption above must not break a genuine single-segment Elixir
+    /// ref: a literal `alias App` (no trimming involved -- the name IS
+    /// `App` from the start) still resolves to `App` exactly.
+    #[test]
+    fn elixir_genuine_single_segment_ref_still_resolves() {
+        let nodes = nodes(&[("elixir:App", None)]);
+        let ctx = NodeContext {
+            id: NodeId::from("elixir:App.PartnerAccounts"),
+            dep_refs: vec![dep("App")],
+            rust_crate_name: None,
+        };
+        let edges = resolve_edges(&nodes, &[ctx]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].to, NodeId::from("elixir:App"));
+    }
+
     #[test]
     fn elixir_exact_dotted_match_with_no_prefix_syntax() {
         let nodes = nodes(&[
