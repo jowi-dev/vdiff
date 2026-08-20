@@ -81,6 +81,14 @@ pub trait GitRepo {
     /// is per-worktree the way a `git worktree add` checkout's own comments
     /// should be, rather than shared with the main worktree's `.git`.
     fn git_dir(&self) -> PathBuf;
+
+    /// The repository's current branch name, or `"HEAD"` if it's currently
+    /// detached (matching the fallback `main.rs`'s `--export-comments` path
+    /// already uses for its own markdown header) -- keys the
+    /// review-completion store (see [`crate::review::review_state`]) so
+    /// switching branches doesn't read/clobber a different branch's
+    /// progress.
+    fn current_branch(&self) -> String;
 }
 
 /// In-memory [`GitRepo`] for pipeline tests: scripted deltas plus base/head
@@ -99,6 +107,8 @@ pub struct FakeRepo {
     pub tracked_files: Vec<PathBuf>,
     /// Returned verbatim by `git_dir`.
     pub git_dir: PathBuf,
+    /// Returned verbatim by `current_branch`.
+    pub current_branch: String,
 }
 
 impl GitRepo for FakeRepo {
@@ -134,6 +144,10 @@ impl GitRepo for FakeRepo {
 
     fn git_dir(&self) -> PathBuf {
         self.git_dir.clone()
+    }
+
+    fn current_branch(&self) -> String {
+        self.current_branch.clone()
     }
 }
 

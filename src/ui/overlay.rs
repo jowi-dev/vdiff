@@ -307,6 +307,7 @@ mod tests {
             file_view: None,
             pane: Pane::File,
             viewport_rows: 20,
+            reviewed: std::collections::HashSet::new(),
         }
     }
 

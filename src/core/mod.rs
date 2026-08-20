@@ -6,3 +6,4 @@ pub mod app;
 pub mod diff_state;
 pub mod file_view;
 pub mod focus;
+pub mod review;

@@ -300,6 +300,20 @@ impl GitRepo for Git2Repo {
     fn git_dir(&self) -> PathBuf {
         self.repo.path().to_path_buf()
     }
+
+    /// Mirrors `main.rs`'s `--export-comments` path's own branch lookup
+    /// (`head().ok().and_then(|head| head.shorthand()...)`): `shorthand()`
+    /// is `None` for a detached HEAD (or any other unborn/unnamed state),
+    /// in which case every branch falls back to sharing the same `"HEAD"`
+    /// key in the review-completion store -- an edge case not worth a
+    /// richer identity scheme for.
+    fn current_branch(&self) -> String {
+        self.repo
+            .head()
+            .ok()
+            .and_then(|head| head.shorthand().ok().map(str::to_string))
+            .unwrap_or_else(|| "HEAD".to_string())
+    }
 }
 
 /// Whether an I/O error reading a worktree path means "there's nothing
@@ -471,5 +485,32 @@ mod tests {
             result.is_ok(),
             "build_graph must not abort on a nested git worktree: {result:?}"
         );
+    }
+
+    #[test]
+    fn current_branch_returns_the_checked_out_branch_name() {
+        let tmp = TempDir::new().expect("create tempdir");
+        let dir = tmp.path();
+        git(dir, &["init", "-b", "feature-x"]);
+        std::fs::write(dir.join("a.txt"), "hi\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "initial"]);
+
+        let repo = Git2Repo::open(dir).expect("open fixture repo");
+        assert_eq!(repo.current_branch(), "feature-x");
+    }
+
+    #[test]
+    fn current_branch_falls_back_to_head_when_detached() {
+        let tmp = TempDir::new().expect("create tempdir");
+        let dir = tmp.path();
+        git(dir, &["init", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "hi\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "initial"]);
+        git(dir, &["checkout", "--detach", "HEAD"]);
+
+        let repo = Git2Repo::open(dir).expect("open fixture repo");
+        assert_eq!(repo.current_branch(), "HEAD");
     }
 }

@@ -6,9 +6,12 @@
 //! chunk) should perform next; `DiffLoaded`/`LoadFailed` feed its result back
 //! in without `update` ever needing to touch git/egui itself.
 
+use std::collections::HashSet;
+
 pub use crate::core::diff_state::DiffPaneState;
 use crate::core::file_view::FileViewState;
 use crate::core::focus::{dep_targets, dependent_sources, move_focus, Direction};
+use crate::core::review;
 use crate::graph::layout::{layout, rows_with_x_centers};
 use crate::graph::model::{NodeId, ProjectGraph};
 use crate::graph::test_modules::{
@@ -107,6 +110,16 @@ pub struct App {
     /// never divides by (or scrolls by) zero before the first frame has
     /// measured anything.
     pub viewport_rows: usize,
+    /// Ids marked reviewed via [`Msg::ToggleReviewed`] (`v` on a focused
+    /// changed node in [`Pane::Graph`]). Seeded at startup by the eframe
+    /// glue from `<git_dir>/vdiff/review-state.json`, already filtered
+    /// through [`crate::core::review::invalidate`] against the current
+    /// graph -- so by the time `App` exists, every id in here is known to
+    /// still match the fingerprint it was marked reviewed under. `core`
+    /// itself never reads the on-disk shape; it only ever grows/shrinks
+    /// this set via [`review::toggle_reviewed`] and reports it back out
+    /// through [`App::review_progress`].
+    pub reviewed: HashSet<NodeId>,
 }
 
 impl App {
@@ -136,6 +149,13 @@ impl App {
         } else {
             hide_test_modules(&self.graph).0
         }
+    }
+
+    /// "N/M changed modules reviewed" over the nodes currently drawn (see
+    /// [`Self::layers`], which already reflects `show_tests`) -- delegates
+    /// straight to [`review::review_progress`], the pure counting logic.
+    pub fn review_progress(&self) -> (usize, usize) {
+        review::review_progress(&self.graph, self.layers.iter().flatten(), &self.reviewed)
     }
 }
 
@@ -262,6 +282,15 @@ pub enum Msg {
     /// onto; the module stays focused while its test's file shows in
     /// [`Pane::File`].
     GoToTest,
+    /// `v` on [`Pane::Graph`]: toggle the focused node's reviewed flag (see
+    /// [`App::reviewed`]). Only acted on on [`Screen::Graph`]/[`Pane::Graph`]
+    /// with no picker open, matching every other graph-pane message; a
+    /// further no-op (via [`review::toggle_reviewed`] itself) if the focused
+    /// node isn't [`crate::core::review::is_changed`] -- only changed nodes
+    /// are markable. Emits [`Cmd::PersistReviewState`] exactly when the
+    /// toggle actually did something, so a `v` on an unchanged node (or off
+    /// the graph pane) never triggers a save.
+    ToggleReviewed,
 }
 
 /// I/O the caller should perform as a result of [`update`]. `update` never
@@ -289,6 +318,15 @@ pub enum Cmd {
     /// nvim mode, there's no text-input surface to compose with, so glue
     /// just logs a one-time stderr note instead.
     CommentNode(NodeId),
+    /// [`Msg::ToggleReviewed`] actually toggled something: the glue should
+    /// re-derive the on-disk review state from [`App::graph`]/
+    /// [`App::reviewed`] and save it (see
+    /// [`crate::review::review_state::capture`]/
+    /// [`crate::review::store::save_review_state`]). Fired on every
+    /// successful toggle rather than batched -- crash-safety (an
+    /// interrupted review resumes from the last mark) matters more here
+    /// than avoiding a few extra small writes.
+    PersistReviewState,
 }
 
 /// Advance `app` in response to `msg`, returning the new state and any
@@ -443,7 +481,26 @@ pub fn update(mut app: App, msg: Msg) -> (App, Cmd) {
             (app, Cmd::CommentNode(focus))
         }
         Msg::GoToTest => go_to_test(app),
+        Msg::ToggleReviewed => toggle_reviewed(app),
     }
+}
+
+/// Handle [`Msg::ToggleReviewed`]: only on [`Screen::Graph`]/[`Pane::Graph`]
+/// with no picker open, delegate to [`review::toggle_reviewed`] for the
+/// focused node and emit [`Cmd::PersistReviewState`] iff `reviewed` actually
+/// changed (so a `v` on an unchanged node -- a no-op inside
+/// `toggle_reviewed` itself -- never triggers a save).
+fn toggle_reviewed(mut app: App) -> (App, Cmd) {
+    if !on_graph_with_no_picker_and_graph_pane(&app) {
+        return (app, Cmd::None);
+    }
+    let focus = app.focus.clone();
+    let before = app.reviewed.clone();
+    review::toggle_reviewed(&mut app.reviewed, &app.graph, &focus);
+    if app.reviewed == before {
+        return (app, Cmd::None);
+    }
+    (app, Cmd::PersistReviewState)
 }
 
 /// Handle [`Msg::ToggleTests`]: flip `show_tests`, recompute `layers`/`rows`
@@ -750,6 +807,7 @@ mod tests {
             file_view: None,
             pane: Pane::Graph,
             viewport_rows: 20,
+            reviewed: HashSet::new(),
         }
     }
 
@@ -1227,6 +1285,7 @@ mod tests {
             file_view: None,
             pane: Pane::Graph,
             viewport_rows: 20,
+            reviewed: HashSet::new(),
         };
         assert!(!app
             .layers
@@ -1265,6 +1324,7 @@ mod tests {
             file_view: None,
             pane: Pane::Graph,
             viewport_rows: 20,
+            reviewed: HashSet::new(),
         };
 
         let (app, cmd) = update(app, Msg::ToggleTests);
@@ -1440,6 +1500,7 @@ mod tests {
             file_view: None,
             pane: Pane::Graph,
             viewport_rows: 20,
+            reviewed: HashSet::new(),
         }
     }
 

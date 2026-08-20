@@ -157,10 +157,11 @@ pub fn show(
         HashMap::new()
     };
 
-    let test_overlay = TestOverlay {
+    let node_overlay = NodeOverlay {
         tested: &tested,
         strips: &strips,
         show_tests: app.show_tests,
+        reviewed: &app.reviewed,
     };
 
     paint_band_separators(&painter, layout, transform, response.rect);
@@ -174,7 +175,7 @@ pub fn show(
                 transform,
                 id,
                 &app.focus,
-                &test_overlay,
+                &node_overlay,
             );
         }
     }
@@ -369,15 +370,18 @@ fn layer_extent(layer: &[NodeId], layout: &LayoutResult) -> Option<(f32, f32)> {
 /// truncating and to inset the text draw itself.
 const LABEL_PAD: f32 = 6.0;
 
-/// The test-module-related paint state [`paint_node`] needs, bundled so the
-/// function stays under clippy's argument-count limit: the changed-test
-/// hidden-mode badge set, the shown-mode attached-strip map, and whether
-/// `show_tests` is on at all (which picks between the two -- see
-/// [`paint_node`]'s doc).
-struct TestOverlay<'a> {
+/// Per-node paint state [`paint_node`] needs beyond the graph/layout
+/// themselves, bundled so the function stays under clippy's argument-count
+/// limit: the changed-test hidden-mode badge set, the shown-mode
+/// attached-strip map, whether `show_tests` is on at all (which picks
+/// between the two -- see [`paint_node`]'s doc), and the set of node ids
+/// marked reviewed (issue #4) -- desaturates a node's fill without
+/// touching its status stripe or badges.
+struct NodeOverlay<'a> {
     tested: &'a HashSet<NodeId>,
     strips: &'a HashMap<NodeId, TestStrip>,
     show_tests: bool,
+    reviewed: &'a HashSet<NodeId>,
 }
 
 /// Paint `id`'s rect: status fill/border, a left-edge stripe in its
@@ -390,7 +394,11 @@ struct TestOverlay<'a> {
 /// room for the strip in `layout.rects[id]`'s height in the first place).
 /// The combined box stays one focusable node -- the strip is display-only,
 /// navigation never lands on it separately. Draws the focus ring around the
-/// whole (possibly combined) box on top if `id` is `focus`.
+/// whole (possibly combined) box on top if `id` is `focus`. If `id` is in
+/// [`NodeOverlay::reviewed`], the main rect's fill (only the fill -- status
+/// border stroke, root stripe, and badges are untouched) is desaturated via
+/// [`theme::dim_reviewed`], the visual cue that this node's been marked
+/// reviewed (`v`, see [`crate::core::app::Msg::ToggleReviewed`]).
 fn paint_node(
     painter: &egui::Painter,
     graph: &ProjectGraph,
@@ -398,7 +406,7 @@ fn paint_node(
     transform: &Transform,
     id: &NodeId,
     focus: &NodeId,
-    test_overlay: &TestOverlay,
+    overlay: &NodeOverlay,
 ) {
     let Some(node) = graph.node(id) else {
         return;
@@ -407,7 +415,7 @@ fn paint_node(
         return;
     };
     let screen_rect = transform.to_screen_rect(*rect);
-    let strip = test_overlay.strips.get(id);
+    let strip = overlay.strips.get(id);
 
     let main_rect = match strip {
         Some(_) => {
@@ -423,10 +431,15 @@ fn paint_node(
         None => screen_rect,
     };
 
+    let fill = if overlay.reviewed.contains(id) {
+        theme::dim_reviewed(theme::leaf_fill(node.status))
+    } else {
+        theme::leaf_fill(node.status)
+    };
     painter.rect(
         main_rect,
         2.0,
-        theme::leaf_fill(node.status),
+        fill,
         theme::leaf_border_stroke(node.status),
         StrokeKind::Inside,
     );
@@ -451,7 +464,7 @@ fn paint_node(
 
     if let Some(strip) = strip {
         paint_test_strip(painter, screen_rect, main_rect, transform, strip);
-    } else if !test_overlay.show_tests && test_overlay.tested.contains(id) {
+    } else if !overlay.show_tests && overlay.tested.contains(id) {
         painter.text(
             Pos2::new(
                 screen_rect.right() - LABEL_PAD,
@@ -593,9 +606,11 @@ fn paint_root_legend(
     }
 }
 
-/// Row 2: the `Enter`/`d`/`c` pane-open/comment hint, the test-module
-/// hidden/shown hint (only drawn once there are any test modules to
-/// mention at all), then the two edge-color swatches.
+/// Row 2: the `Enter`/`d`/`c`/`v` pane-open/comment/review hint, the review
+/// progress readout ("N/M changed modules reviewed" -- see
+/// [`App::review_progress`]), the test-module hidden/shown hint (only drawn
+/// once there are any test modules to mention at all), then the two
+/// edge-color swatches.
 fn paint_hint_row(painter: &egui::Painter, app: &App, viewport: EguiRect, text_y: f32) {
     const HINT_COLOR: Color32 = Color32::from_rgb(0xaa, 0xaa, 0xaa);
 
@@ -603,11 +618,17 @@ fn paint_hint_row(painter: &egui::Painter, app: &App, viewport: EguiRect, text_y
 
     cursor_x = paint_text(
         painter,
-        "Enter: file   d: diff   c: comment",
+        "Enter: file   d: diff   c: comment   v: review",
         cursor_x,
         text_y,
         HINT_COLOR,
     ) + 20.0;
+
+    let (reviewed_count, total_changed) = app.review_progress();
+    if total_changed > 0 {
+        let progress = format!("{reviewed_count}/{total_changed} changed modules reviewed");
+        cursor_x = paint_text(painter, &progress, cursor_x, text_y, HINT_COLOR) + 20.0;
+    }
 
     let (_, hidden_count) = hide_test_modules(&app.graph);
     if hidden_count > 0 {

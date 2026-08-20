@@ -90,7 +90,8 @@ pub enum KeyOutcome {
 ///      [`Msg::FocusMove`], `Enter` -> [`Msg::OpenFile`], `d` ->
 ///      [`Msg::OpenDiff`], `g` -> [`KeyOutcome::Pending`] (`gt` ->
 ///      [`Msg::GoToTest`]), `t` -> [`Msg::ToggleTests`], `c` ->
-///      [`Msg::CommentNode`], `Ctrl-w` -> [`KeyOutcome::Pending`].
+///      [`Msg::CommentNode`], `v` -> [`Msg::ToggleReviewed`], `Ctrl-w` ->
+///      [`KeyOutcome::Pending`].
 ///    - [`Screen::Graph`]/[`Pane::File`]: `j`/`k` -> [`Msg::FileScroll`],
 ///      `Ctrl-d`/`Ctrl-u` -> [`Msg::FileHalfPage`], `g`/`]`/`[` ->
 ///      [`KeyOutcome::Pending`], `G` -> [`Msg::FileJumpBottom`], `d` ->
@@ -128,6 +129,7 @@ pub fn map_key(key: KeyInput, ctx: KeyContext) -> KeyOutcome {
                 KeyInput::Char('g') => KeyOutcome::Pending(Pending::Char('g')),
                 KeyInput::Char('t') => KeyOutcome::Msg(Msg::ToggleTests),
                 KeyInput::Char('c') => KeyOutcome::Msg(Msg::CommentNode),
+                KeyInput::Char('v') => KeyOutcome::Msg(Msg::ToggleReviewed),
                 KeyInput::Ctrl('w') => KeyOutcome::Pending(Pending::CtrlW),
                 _ => KeyOutcome::None,
             },
@@ -307,6 +309,12 @@ mod tests {
                 graph_ctx(),
                 KeyOutcome::Msg(Msg::CommentNode),
             ),
+            (
+                KeyInput::Char('v'),
+                graph_ctx(),
+                KeyOutcome::Msg(Msg::ToggleReviewed),
+            ),
+            (KeyInput::Char('v'), file_pane_ctx(), KeyOutcome::None),
             // 'g' and Ctrl-w start chords.
             (
                 KeyInput::Char('g'),

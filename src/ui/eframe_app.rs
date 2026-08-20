@@ -44,6 +44,8 @@ use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome, Pending};
 use crate::nvim::session::NvimCmd;
 use crate::pipeline::file_diff::{changed_head_ranges, load_file_diff};
 use crate::pipeline::repo::GitRepo;
+use crate::review::review_state::ReviewStore;
+use crate::review::store as review_store;
 use crate::ui::diff_view;
 use crate::ui::graph_view::{self, Transform};
 use crate::ui::nvim_pane::{self, NvimAction, NvimPane};
@@ -215,6 +217,15 @@ pub struct VdiffApp {
     /// actually handles `c` isn't installed") since a user hitting each one
     /// needs to fix a different thing. See [`Self::comment_node`].
     warned_missing_comment_plugin: bool,
+    /// The whole loaded `<git_dir>/vdiff/review-state.json` (every branch,
+    /// not just this one) -- kept around so [`Self::persist_review_state`]
+    /// can replace just [`Self::review_branch`]'s entry via
+    /// [`crate::review::review_state::ReviewStore::set_branch`] without
+    /// clobbering any other branch's saved progress.
+    review_store: crate::review::review_state::ReviewStore,
+    /// The current branch name (or `"HEAD"` if detached -- see
+    /// [`GitRepo::current_branch`]), keying [`Self::review_store`].
+    review_branch: String,
 }
 
 /// Everything [`VdiffApp::new`] needs to set up (and later respawn) the
@@ -239,6 +250,21 @@ pub struct NvimConfig {
     pub egui_ctx: Context,
 }
 
+/// Everything [`VdiffApp::new`] needs to persist review-completion state
+/// (issue #4): the whole loaded store (every branch, so
+/// [`VdiffApp::persist_review_state`] can save back just this run's branch
+/// entry without touching any other) and which branch this run is on.
+/// `App::reviewed` itself (already seeded/invalidated by the caller before
+/// `App` was even built) is not part of this -- it lives on [`core::App`],
+/// the one piece of review state `core` does own.
+pub struct ReviewConfig {
+    /// The store loaded at startup via
+    /// [`crate::review::store::load_review_state`].
+    pub store: ReviewStore,
+    /// The current branch name (see [`GitRepo::current_branch`]).
+    pub branch: String,
+}
+
 impl VdiffApp {
     /// Build a fresh GUI app wrapping an already-constructed [`App`] and its
     /// [`LayoutResult`]. `smoke` enables the self-closing startup self-test
@@ -251,6 +277,7 @@ impl VdiffApp {
         smoke: bool,
         diff_loader: DiffLoader,
         nvim: NvimConfig,
+        review: ReviewConfig,
     ) -> Self {
         Self {
             app,
@@ -270,6 +297,8 @@ impl VdiffApp {
             nvim_current_file: None,
             warned_comments_need_nvim: false,
             warned_missing_comment_plugin: false,
+            review_store: review.store,
+            review_branch: review.branch,
         }
     }
 
@@ -302,6 +331,28 @@ impl VdiffApp {
                 self.layout = layout_with_test_strips(&self.app.visible_graph(), &test_strips);
             }
             Cmd::CommentNode(node) => self.comment_node(node),
+            Cmd::PersistReviewState => self.persist_review_state(),
+        }
+    }
+
+    /// Handle [`Cmd::PersistReviewState`]: recompute
+    /// [`Self::review_branch`]'s entry from the current
+    /// `self.app.graph`/`self.app.reviewed` (see
+    /// [`crate::review::review_state::capture`]), fold it into
+    /// [`Self::review_store`] (leaving every other branch's entry alone),
+    /// and write the whole store back to
+    /// `<git_dir>/vdiff/review-state.json`. A write failure is logged, not
+    /// fatal -- losing this save just means the next toggle tries again;
+    /// there's nothing else in `App` that depends on it having succeeded.
+    fn persist_review_state(&mut self) {
+        let captured = crate::review::review_state::capture(&self.app.graph, &self.app.reviewed);
+        self.review_store.set_branch(&self.review_branch, captured);
+        let git_dir = self.diff_loader.repo.git_dir();
+        if let Err(err) = review_store::save_review_state(&git_dir, &self.review_store) {
+            eprintln!(
+                "warning: failed to save {}: {err}",
+                review_store::review_state_path(&git_dir).display()
+            );
         }
     }
 
@@ -812,6 +863,7 @@ pub fn egui_key_to_input(key: Key, modifiers: Modifiers) -> Option<KeyInput> {
         Key::T => Some(KeyInput::Char('t')),
         Key::S => Some(KeyInput::Char('s')),
         Key::C => Some(KeyInput::Char('c')),
+        Key::V => Some(KeyInput::Char('v')),
         Key::F => Some(KeyInput::Char('f')),
         Key::OpenBracket => Some(KeyInput::Char('[')),
         Key::CloseBracket => Some(KeyInput::Char(']')),
@@ -850,6 +902,7 @@ mod tests {
             (Key::T, KeyInput::Char('t')),
             (Key::S, KeyInput::Char('s')),
             (Key::C, KeyInput::Char('c')),
+            (Key::V, KeyInput::Char('v')),
             (Key::F, KeyInput::Char('f')),
             (Key::OpenBracket, KeyInput::Char('[')),
             (Key::CloseBracket, KeyInput::Char(']')),

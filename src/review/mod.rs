@@ -18,6 +18,17 @@
 //! [`store`] is the thin glue-side IO wrapper around it, both used by
 //! `vdiff --export-comments`. See `docs/comments-schema.md` for the wire
 //! contract itself.
+//!
+//! [`review_state`] is the sibling data model backing review-completion
+//! tracking (issue #4): which nodes have been marked reviewed, keyed by
+//! branch and guarded by a per-node file fingerprint so a stale mark never
+//! survives the files it was made against changing underneath it. Lives at
+//! `<git_dir>/vdiff/review-state.json`, alongside `comments.json`, via the
+//! same [`store`] module. Unlike comments, the toggle/compose/paint side of
+//! this feature is still owned by this crate (see
+//! [`crate::core::app::Msg::ToggleReviewed`]) -- there's no nvim-plugin
+//! delegation involved.
 
 pub mod comments;
+pub mod review_state;
 pub mod store;

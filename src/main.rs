@@ -14,8 +14,18 @@ use vdiff::pipeline::git2_repo::Git2Repo;
 use vdiff::pipeline::pr::PrCheckout;
 use vdiff::pipeline::repo::GitRepo;
 use vdiff::pipeline::{build_graph, PipelineOptions};
-use vdiff::ui::eframe_app::{DiffLoader, NvimConfig, VdiffApp};
+use vdiff::ui::eframe_app::{DiffLoader, NvimConfig, ReviewConfig, VdiffApp};
 use vdiff::ui::nvim_pane::NvimPane;
+
+/// Everything [`run_gui`] needs to seed and later persist the
+/// review-completion store (issue #4), bundled so `run_gui` stays under
+/// clippy's argument-count limit: the repository's actual git directory
+/// (see [`vdiff::pipeline::repo::GitRepo::git_dir`]) and current branch
+/// name (see [`GitRepo::current_branch`]).
+struct ReviewSetup {
+    git_dir: PathBuf,
+    branch: String,
+}
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -117,6 +127,10 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
                 eprintln!("no changes vs {base_ref}");
                 return ExitCode::SUCCESS;
             }
+            let review_setup = ReviewSetup {
+                git_dir: repo.git_dir(),
+                branch: repo.current_branch(),
+            };
             run_gui(
                 graph,
                 repo_path,
@@ -124,6 +138,7 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
                 cli.nvim,
                 cli.nvim_cmd.clone(),
                 DiffLoader { repo, base_oid },
+                review_setup,
             )
         }
     }
@@ -214,7 +229,12 @@ fn dump(
 /// if set but no `nvim` binary is on `PATH`, prints a warning and falls
 /// back to the built-in file viewer rather than failing to start.
 /// `nvim_cmd` is `--nvim-cmd`'s Ex commands, run after every attach/
-/// respawn; ignored (silently) when nvim mode isn't active.
+/// respawn; ignored (silently) when nvim mode isn't active. `git_dir`/
+/// `branch` seed and later persist the review-completion store (issue #4):
+/// `<git_dir>/vdiff/review-state.json` is loaded here, `branch`'s entry run
+/// through `core::review::invalidate` against `graph`, and the result
+/// seeds `App::reviewed` -- the same `git_dir`/branch then back `VdiffApp`'s
+/// own save-on-toggle via `ReviewConfig`.
 fn run_gui(
     graph: ProjectGraph,
     repo_path: &Path,
@@ -222,7 +242,9 @@ fn run_gui(
     want_nvim: bool,
     nvim_cmd: Vec<String>,
     diff_loader: DiffLoader,
+    review_setup: ReviewSetup,
 ) -> ExitCode {
+    let ReviewSetup { git_dir, branch } = review_setup;
     if want_nvim && !nvim_available() {
         eprintln!("warning: nvim mode is on by default but no `nvim` binary was found on PATH; falling back to the built-in file viewer");
     }
@@ -242,6 +264,10 @@ fn run_gui(
         .and_then(|layer| layer.first())
         .cloned()
         .unwrap_or_else(|| NodeId::from(""));
+    let review_store = vdiff::review::store::load_review_state(&git_dir);
+    let reviewed =
+        vdiff::review::review_state::seed_reviewed(&review_store.branch(&branch), &graph);
+
     let app = App {
         graph,
         layers: layout_result.layers.clone(),
@@ -254,6 +280,7 @@ fn run_gui(
         file_view: None,
         pane: Pane::Graph,
         viewport_rows: 1,
+        reviewed,
     };
 
     let title = format!("vdiff — {}", repo_dir_name(repo_path));
@@ -297,6 +324,10 @@ fn run_gui(
                     cwd: repo_root.clone(),
                     init_cmds: nvim_cmd.clone(),
                     egui_ctx: cc.egui_ctx.clone(),
+                },
+                ReviewConfig {
+                    store: review_store,
+                    branch,
                 },
             )))
         }),

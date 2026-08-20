@@ -36,6 +36,20 @@ pub fn leaf_fill(status: GitStatus) -> Color32 {
     }
 }
 
+/// Desaturate `color` toward its own gray (average-channel luminance),
+/// keeping alpha untouched -- the fill treatment for a reviewed node (see
+/// [`crate::ui::graph_view::paint_node`]'s doc): the status color is still
+/// legible (it's not fully grayed out), just visibly muted next to an
+/// unreviewed sibling of the same status. Blends 1/3 original color, 2/3
+/// gray; deliberately not full grayscale, so added/modified/deleted still
+/// read apart from each other even once reviewed.
+pub fn dim_reviewed(color: Color32) -> Color32 {
+    let [r, g, b, a] = color.to_array();
+    let gray = ((r as u32 + g as u32 + b as u32) / 3) as u8;
+    let mix = |c: u8| ((c as u16 + 2 * gray as u16) / 3) as u8;
+    Color32::from_rgba_unmultiplied(mix(r), mix(g), mix(b), a)
+}
+
 /// Leaf node border color for `status` -- a lighter tint of [`leaf_fill`].
 pub fn leaf_border(status: GitStatus) -> Color32 {
     match status {
@@ -202,6 +216,37 @@ mod tests {
     #[test]
     fn root_hue_color_is_deterministic() {
         assert_eq!(root_hue_color("App.Leads"), root_hue_color("App.Leads"));
+    }
+
+    #[test]
+    fn dim_reviewed_leaves_alpha_untouched() {
+        let color = Color32::from_rgba_unmultiplied(0x6b, 0x5c, 0x1f, 0xaa);
+        assert_eq!(dim_reviewed(color).a(), 0xaa);
+    }
+
+    #[test]
+    fn dim_reviewed_moves_every_channel_toward_gray_without_flattening() {
+        // Modified's fill is (0x6b, 0x5c, 0x1f): r and g sit above their
+        // shared average, b sits below it -- dimming should pull r/g down
+        // and b up, landing strictly between the original and full gray,
+        // never collapsing all three channels to one value.
+        let modified = leaf_fill(GitStatus::Modified);
+        let dimmed = dim_reviewed(modified);
+        let [r, g, b, _] = modified.to_array();
+        let [dr, dg, db, _] = dimmed.to_array();
+        assert!(dr < r, "r should move down toward gray: {dr} vs {r}");
+        assert!(dg < g, "g should move down toward gray: {dg} vs {g}");
+        assert!(db > b, "b should move up toward gray: {db} vs {b}");
+        assert_ne!(
+            dr, dg,
+            "channels shouldn't fully collapse to a single gray value"
+        );
+    }
+
+    #[test]
+    fn dim_reviewed_is_a_noop_on_true_gray() {
+        let gray = Color32::from_rgb(0x40, 0x40, 0x40);
+        assert_eq!(dim_reviewed(gray), gray);
     }
 
     #[test]
