@@ -18,6 +18,25 @@
 //! current DFS stack) -- back edges are exactly the ones that would make
 //! longest-path layering loop forever, and dropping them leaves a DAG
 //! without needing to decide which module "really" belongs above the other.
+//!
+//! One deliberate exception to "layer index is pure structural depth": any
+//! node [`crate::graph::model::ProjectGraph::is_web_node`] flags as
+//! belonging to a web namespace (Phoenix's `FooWeb`/`lib/*_web/`
+//! convention) is pinned to the top of the graph as a post-processing pass
+//! over the structural layers, regardless of its edge shape. Web-namespace
+//! modules are entry points -- controllers calling into contexts calling
+//! into schemas -- and reading that as a call stack (web at the top,
+//! sinking into the rest of the app) matters more than raw dependency
+//! depth. Concretely: web nodes keep their relative order among themselves
+//! but move to the top band(s); non-web bands shift down to make room but
+//! otherwise keep their relative order; a web node with no edges at all
+//! joins the top web band instead of falling into the trailing isolated
+//! band, since "no edges" is the same "nothing depends on it" property
+//! that puts a connected node at structural layer 0. Graphs with no web
+//! nodes are unaffected -- this pass is a no-op when [`is_web_node`] never
+//! fires.
+//!
+//! [`is_web_node`]: crate::graph::model::ProjectGraph::is_web_node
 
 use std::collections::{HashMap, HashSet};
 
@@ -26,8 +45,10 @@ use crate::graph::model::{NodeId, ProjectGraph};
 /// Assign every drawn node (see the module docs) a layer, returned as one
 /// `Vec<NodeId>` per layer, outermost-first (layer 0 first). Nodes with no
 /// edges at all are appended as a trailing layer after every connected
-/// layer, so they don't pollute layer 0. Within a layer, nodes are ordered
-/// by `(top-level root id, display_name)` so namespace-mates sit adjacent.
+/// layer, so they don't pollute layer 0 -- *unless* they're a web-namespace
+/// node (see the module docs' "pinned to the top" exception), in which case
+/// they join the top web band instead. Within a layer, nodes are ordered by
+/// `(top-level root id, display_name)` so namespace-mates sit adjacent.
 pub fn assign_layers(graph: &ProjectGraph) -> Vec<Vec<NodeId>> {
     let drawn = drawn_node_ids(graph);
     let edges = drawn_edges(graph, &drawn);
@@ -51,22 +72,67 @@ pub fn assign_layers(graph: &ProjectGraph) -> Vec<Vec<NodeId>> {
     }
 
     let max_layer = by_layer.keys().copied().max();
-    let mut layers: Vec<Vec<NodeId>> = match max_layer {
+    let mut structural: Vec<Vec<NodeId>> = match max_layer {
         Some(max) => (0..=max)
             .map(|l| by_layer.remove(&l).unwrap_or_default())
             .collect(),
         None => Vec::new(),
     };
-    for layer in &mut layers {
+    for layer in &mut structural {
         sort_by_root_then_name(graph, layer);
     }
 
-    if !isolated.is_empty() {
-        let mut trailing = isolated;
-        sort_by_root_then_name(graph, &mut trailing);
-        layers.push(trailing);
+    let mut isolated_sorted = isolated;
+    sort_by_root_then_name(graph, &mut isolated_sorted);
+
+    pin_web_namespace(graph, structural, isolated_sorted)
+}
+
+/// Post-process structural layers (plus the trailing isolated-node bucket)
+/// to pin web-namespace nodes to the top -- see the module docs. Splits
+/// every band into its web and non-web halves (order-preserving, so each
+/// half stays sorted since the input band already was), keeps only the
+/// non-empty halves, then reassembles as `[web bands..., non-web
+/// bands..., non-web isolated trailing band]`. Isolated web nodes merge
+/// into the top-most web band (re-sorting just that band) rather than
+/// getting their own trailing band -- they have the same "nothing depends
+/// on it" property as structural layer 0, so that's where they belong.
+fn pin_web_namespace(
+    graph: &ProjectGraph,
+    structural: Vec<Vec<NodeId>>,
+    isolated: Vec<NodeId>,
+) -> Vec<Vec<NodeId>> {
+    let (web_isolated, nonweb_isolated): (Vec<NodeId>, Vec<NodeId>) =
+        isolated.into_iter().partition(|id| graph.is_web_node(id));
+
+    let mut web_bands: Vec<Vec<NodeId>> = Vec::new();
+    let mut nonweb_bands: Vec<Vec<NodeId>> = Vec::new();
+    for band in structural {
+        let (web, nonweb): (Vec<NodeId>, Vec<NodeId>) =
+            band.into_iter().partition(|id| graph.is_web_node(id));
+        if !web.is_empty() {
+            web_bands.push(web);
+        }
+        if !nonweb.is_empty() {
+            nonweb_bands.push(nonweb);
+        }
     }
 
+    if !web_isolated.is_empty() {
+        match web_bands.first_mut() {
+            Some(top) => {
+                top.extend(web_isolated);
+                sort_by_root_then_name(graph, top);
+            }
+            None => web_bands.push(web_isolated),
+        }
+    }
+
+    let mut layers = web_bands;
+    layers.extend(nonweb_bands);
+    if !nonweb_isolated.is_empty() {
+        layers.push(nonweb_isolated);
+    }
     layers
 }
 
@@ -469,6 +535,110 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["leaf", "other"]);
+    }
+
+    /// Like `leaf`, but its backing file sits under a `lib/*_web/`
+    /// directory so [`crate::graph::model::ProjectGraph::is_web_node`]
+    /// picks it up regardless of the node's own display name/root.
+    fn web_leaf(id: &str, name: &str, parent: Option<&str>) -> (NodeId, ModuleNode) {
+        let node_id = NodeId::from(id);
+        (
+            node_id.clone(),
+            ModuleNode {
+                id: node_id,
+                display_name: name.to_string(),
+                parent: parent.map(NodeId::from),
+                children: vec![],
+                status: GitStatus::Unchanged,
+                files: vec![crate::graph::model::FileRef {
+                    path: PathBuf::from(format!("lib/app_web/{id}.ex")),
+                    base_blob: Some("b".to_string()),
+                    head_blob: Some("h".to_string()),
+                }],
+            },
+        )
+    }
+
+    #[test]
+    fn web_nodes_are_pinned_to_the_top_band_even_when_structurally_deeper() {
+        // controller -> context -> schema, plus a lone web node with no
+        // edges at all. Structurally: controller layer 0, context layer 1,
+        // schema layer 2, lonely_web isolated. Desired reading: both web
+        // nodes (controller, lonely_web) end up in the top band(s), above
+        // every non-web node, and lonely_web must NOT land in a trailing
+        // isolated band.
+        let g = graph_from(
+            vec![
+                web_leaf("controller", "controller", None),
+                leaf("context", "context", None),
+                leaf("schema", "schema", None),
+                web_leaf("lonely_web", "lonely_web", None),
+            ],
+            vec!["controller", "context", "schema", "lonely_web"],
+            vec![edge("controller", "context"), edge("context", "schema")],
+        );
+
+        let layers = assign_layers(&g);
+
+        // Every web node must appear strictly before every non-web node,
+        // i.e. no non-web node's band index is <= a web node's band index.
+        let band_of = |id: &NodeId| -> usize {
+            layers
+                .iter()
+                .position(|band| band.contains(id))
+                .expect("node must be placed in some band")
+        };
+        let controller_band = band_of(&NodeId::from("controller"));
+        let lonely_band = band_of(&NodeId::from("lonely_web"));
+        let context_band = band_of(&NodeId::from("context"));
+        let schema_band = band_of(&NodeId::from("schema"));
+
+        assert!(controller_band < context_band);
+        assert!(lonely_band < context_band);
+        assert!(context_band < schema_band);
+
+        // `lonely_web` must not be alone in a trailing band after
+        // everything else (the old isolated-node behavior) -- it should
+        // share a top band with (or precede) the connected web node.
+        assert_ne!(layers.last().unwrap(), &ids(&["lonely_web"]));
+    }
+
+    #[test]
+    fn no_web_nodes_produces_identical_layers_to_pure_structural_layering() {
+        // Same fixture as `no_edge_nodes_land_in_a_trailing_layer_after_connected_ones`
+        // -- with zero web nodes, pinning must be a no-op.
+        let g = graph_from(
+            vec![
+                leaf("a", "a", None),
+                leaf("b", "b", None),
+                leaf("lonely", "lonely", None),
+            ],
+            vec!["a", "b", "lonely"],
+            vec![edge("a", "b")],
+        );
+
+        let layers = assign_layers(&g);
+
+        assert_eq!(layers.len(), 3, "a, b, then a trailing layer for `lonely`");
+        assert_eq!(layers[0], ids(&["a"]));
+        assert_eq!(layers[1], ids(&["b"]));
+        assert_eq!(layers[2], ids(&["lonely"]));
+    }
+
+    #[test]
+    fn web_pinning_runs_twice_with_identical_result() {
+        let g = graph_from(
+            vec![
+                web_leaf("controller", "controller", None),
+                leaf("context", "context", None),
+                leaf("schema", "schema", None),
+                web_leaf("lonely_web", "lonely_web", None),
+            ],
+            vec!["controller", "context", "schema", "lonely_web"],
+            vec![edge("controller", "context"), edge("context", "schema")],
+        );
+
+        assert_eq!(assign_layers(&g), assign_layers(&g));
     }
 
     #[test]
