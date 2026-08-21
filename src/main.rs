@@ -276,13 +276,13 @@ fn launch_gui(
     ExitCode::FAILURE
 }
 
-/// `--tui`: build the same starting [`App`] `run_gui` builds (same
-/// `show_tests`/layers/focus seeding -- see that function's doc, which this
-/// mirrors exactly), then hand it to [`vdiff::tui::run`] instead of opening
-/// an eframe window. Split out from a hypothetical shared `run_gui`/
-/// `run_tui` the same way [`launch_gui`] is: `vdiff::tui` only exists
-/// behind the `tui` feature, so `diff_source` stays a plain [`DiffSource`]
-/// at this call site rather than already being wrapped in
+/// `--tui`: build the same starting [`App`] [`run_gui`] builds (via the
+/// shared [`build_initial_app`], see that function's doc for the seeding
+/// rationale), then hand it to [`vdiff::tui::run`] instead of opening an
+/// eframe window. Split out from a hypothetical shared `run_gui`/`run_tui`
+/// the same way [`launch_gui`] is: `vdiff::tui` only exists behind the
+/// `tui` feature, so `diff_source` stays a plain [`DiffSource`] at this
+/// call site rather than already being wrapped in
 /// `crate::tui::loader::TuiLoader`.
 #[cfg(feature = "tui")]
 fn launch_tui(
@@ -298,40 +298,13 @@ fn launch_tui(
         findings,
         comments,
     } = review_setup;
-    let show_tests = initial_show_tests(&graph);
-    let visible = if show_tests {
-        group_matched_test_modules(&graph)
-    } else {
-        hide_test_modules(&graph).0
-    };
-    let layout_result = layout(&visible);
-    let focus = layout_result
-        .layers
-        .first()
-        .and_then(|layer| layer.first())
-        .cloned()
-        .unwrap_or_else(|| NodeId::from(""));
-    let review_store = vdiff::review::store::load_review_state(&git_dir);
-    let reviewed =
-        vdiff::review::review_state::seed_reviewed(&review_store.branch(&branch), &graph);
-
-    let rows = vdiff::graph::layout::rows_with_x_centers(&layout_result);
-    let app = App {
-        graph,
-        layers: layout_result.layers,
-        rows,
-        focus,
-        screen: Screen::Graph,
-        diff: None,
-        picker: None,
-        show_tests,
-        file_view: None,
-        pane: Pane::Graph,
-        viewport_rows: 1,
-        reviewed,
-        findings,
-        comments,
-    };
+    // The TUI's neighborhood view never consults layout rects (see
+    // `vdiff::tui`'s module doc) -- only `layers`/`rows`, both already
+    // folded into `app` -- so the returned `LayoutResult` is dropped here
+    // unlike `run_gui`, which threads it into `VdiffApp::new` for its
+    // pixel geometry.
+    let (app, review_store, _layout_result) =
+        build_initial_app(graph, &git_dir, &branch, findings, comments);
 
     let config = vdiff::tui::TuiConfig {
         loader: vdiff::tui::loader::TuiLoader {
@@ -622,6 +595,86 @@ fn dump(
     ExitCode::SUCCESS
 }
 
+/// Seed the starting [`App`] both frontends open on, from the just-built
+/// `graph` plus `--findings`/comments already loaded by the caller.
+/// Shared by [`run_gui`] and [`launch_tui`] so the two frontends can never
+/// drift into seeding different initial state by accident (this used to be
+/// duplicated verbatim between them).
+///
+/// `show_tests` normally starts false, so the layout/layers vdiff opens on
+/// is built from the test-hidden graph, not the raw (possibly test-heavy)
+/// one -- see [`App::visible_graph`]. But if the change set is *only* test
+/// modules, hiding them would blank the graph entirely (an empty canvas
+/// with a sentinel focus, `NodeId("")` -- see [`initial_show_tests`]'s
+/// doc), so start with tests shown instead. The layout computed here for
+/// the very first frame mirrors `App::visible_graph`'s own branching
+/// exactly, so it's the same one a later `Msg::ToggleTests` round-trip back
+/// to this `show_tests` value would recompute. Focus lands on the first
+/// node of the first layer, not `graph.sorted_roots()[0]` -- roots can be
+/// synthetic namespace containers, which are never drawn or focusable (see
+/// `graph::layers`).
+///
+/// `git_dir`/`branch` seed (and, later, persist) the review-completion
+/// store (issue #4): `<git_dir>/vdiff/review-state.json` is loaded here,
+/// `branch`'s entry run through [`vdiff::review::review_state::seed_reviewed`]
+/// against `graph`, and the result seeds `App::reviewed` -- the same
+/// `git_dir`/branch then back each frontend's own save-on-toggle (the
+/// GUI's `ReviewConfig`, the TUI's `TuiConfig`).
+///
+/// Returns the loaded [`vdiff::review::review_state::ReviewStore`]
+/// alongside (both callers need it again: `run_gui` for `ReviewConfig`,
+/// `launch_tui` for `TuiConfig`) and the full [`vdiff::graph::layout::LayoutResult`]
+/// (`run_gui` needs its rects for `VdiffApp::new`'s pixel geometry;
+/// `launch_tui` only needs `layers`/`rows`, already folded into the
+/// returned `App`, and drops the rest).
+#[cfg(any(feature = "gui", feature = "tui"))]
+fn build_initial_app(
+    graph: ProjectGraph,
+    git_dir: &Path,
+    branch: &str,
+    findings: Findings,
+    comments: Comments,
+) -> (
+    App,
+    vdiff::review::review_state::ReviewStore,
+    vdiff::graph::layout::LayoutResult,
+) {
+    let show_tests = initial_show_tests(&graph);
+    let visible = if show_tests {
+        group_matched_test_modules(&graph)
+    } else {
+        hide_test_modules(&graph).0
+    };
+    let layout_result = layout(&visible);
+    let focus = layout_result
+        .layers
+        .first()
+        .and_then(|layer| layer.first())
+        .cloned()
+        .unwrap_or_else(|| NodeId::from(""));
+    let review_store = vdiff::review::store::load_review_state(git_dir);
+    let reviewed = vdiff::review::review_state::seed_reviewed(&review_store.branch(branch), &graph);
+    let rows = vdiff::graph::layout::rows_with_x_centers(&layout_result);
+
+    let app = App {
+        graph,
+        layers: layout_result.layers.clone(),
+        rows,
+        focus,
+        screen: Screen::Graph,
+        diff: None,
+        picker: None,
+        show_tests,
+        file_view: None,
+        pane: Pane::Graph,
+        viewport_rows: 1,
+        reviewed,
+        findings,
+        comments,
+    };
+    (app, review_store, layout_result)
+}
+
 /// Open the eframe window on `graph`, titled after `repo_path`'s directory
 /// name. `smoke` closes the window after a couple seconds instead of
 /// waiting for the user, for headless-ish startup verification.
@@ -657,52 +710,8 @@ fn run_gui(
     }
     let want_nvim = want_nvim && nvim_available();
     let repo_root = repo_path.to_path_buf();
-    // `show_tests` normally starts false, so the layout/layers vdiff opens
-    // on is built from the test-hidden graph, not the raw (possibly
-    // test-heavy) one -- see `App::visible_graph`. But if the change set is
-    // *only* test modules, hiding them would blank the graph entirely (an
-    // empty canvas with a sentinel focus, `NodeId("")` -- see
-    // `initial_show_tests`'s doc), so start with tests shown instead.
-    let show_tests = initial_show_tests(&graph);
-    // Mirrors `App::visible_graph`'s own branching exactly, so the layout
-    // computed here for the very first frame is the same one a later
-    // `Msg::ToggleTests` round-trip back to this `show_tests` value would
-    // recompute.
-    let visible = if show_tests {
-        group_matched_test_modules(&graph)
-    } else {
-        hide_test_modules(&graph).0
-    };
-    let layout_result = layout(&visible);
-    // The first node of the first layer, not `graph.sorted_roots()[0]` --
-    // roots can be synthetic namespace containers, which are never drawn or
-    // focusable (see `graph::layers`).
-    let focus = layout_result
-        .layers
-        .first()
-        .and_then(|layer| layer.first())
-        .cloned()
-        .unwrap_or_else(|| NodeId::from(""));
-    let review_store = vdiff::review::store::load_review_state(&git_dir);
-    let reviewed =
-        vdiff::review::review_state::seed_reviewed(&review_store.branch(&branch), &graph);
-
-    let app = App {
-        graph,
-        layers: layout_result.layers.clone(),
-        rows: vdiff::graph::layout::rows_with_x_centers(&layout_result),
-        focus,
-        screen: Screen::Graph,
-        diff: None,
-        picker: None,
-        show_tests,
-        file_view: None,
-        pane: Pane::Graph,
-        viewport_rows: 1,
-        reviewed,
-        findings,
-        comments,
-    };
+    let (app, review_store, layout_result) =
+        build_initial_app(graph, &git_dir, &branch, findings, comments);
 
     let title = format!("vdiff — {}", repo_dir_name(repo_path));
     // Start maximized rather than macOS native fullscreen: fullscreen opens
