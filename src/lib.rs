@@ -8,4 +8,5 @@ pub mod keymap;
 pub mod nvim;
 pub mod pipeline;
 pub mod review;
+#[cfg(feature = "gui")]
 pub mod ui;

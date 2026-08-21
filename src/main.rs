@@ -6,11 +6,15 @@ use std::time::SystemTime;
 use clap::Parser;
 
 use vdiff::cli::{self, Cli};
+#[cfg(feature = "gui")]
 use vdiff::core::app::{initial_show_tests, App, Pane, Screen};
 use vdiff::graph::filter::focus_on_changes;
+#[cfg(feature = "gui")]
 use vdiff::graph::layout::layout;
 use vdiff::graph::model::{NodeId, ProjectGraph};
+#[cfg(feature = "gui")]
 use vdiff::graph::test_modules::{group_matched_test_modules, hide_test_modules};
+#[cfg(feature = "gui")]
 use vdiff::nvim::session::nvim_available;
 use vdiff::pipeline::git2_repo::Git2Repo;
 use vdiff::pipeline::pr::{resolve_pr_base_ref, PrCheckout};
@@ -22,7 +26,9 @@ use vdiff::review::findings::{map_findings, parse_findings, Finding};
 use vdiff::review::publish::{
     build_payload, filter_unpublished, partition_comments, render_body, render_plan,
 };
+#[cfg(feature = "gui")]
 use vdiff::ui::eframe_app::{DiffLoader, NvimConfig, ReviewConfig, VdiffApp};
+#[cfg(feature = "gui")]
 use vdiff::ui::nvim_pane::NvimPane;
 
 /// Everything [`run_gui`] needs to seed and later persist the
@@ -33,7 +39,12 @@ use vdiff::ui::nvim_pane::NvimPane;
 /// <path>`'s already-loaded-and-mapped result (see [`load_findings`]) --
 /// unrelated to review-completion, but seeded once at startup exactly the
 /// same way, so it rides along in this bundle rather than pushing
-/// `run_gui` over the argument-count limit on its own.
+/// `run_gui` over the argument-count limit on its own. In a
+/// `--no-default-features` (headless) build these fields are computed and
+/// then dropped unread by `launch_gui`'s headless stub, which errors out
+/// before ever looking at them -- harmless, but `dead_code` doesn't know
+/// that, hence the lint override.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 struct ReviewSetup {
     git_dir: PathBuf,
     branch: String,
@@ -175,17 +186,70 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
                 findings,
                 comments,
             };
-            run_gui(
+            launch_gui(
                 graph,
                 repo_path,
                 cli.smoke,
                 cli.nvim,
                 cli.nvim_cmd.clone(),
-                DiffLoader { repo, base_oid },
+                repo,
+                base_oid,
                 review_setup,
             )
         }
     }
+}
+
+/// The `--dump`/`--export-comments`/`--publish-comments`-less default
+/// path: open the GUI. Split out from [`run_gui`] itself (rather than
+/// `#[cfg]`-ing `run_gui`'s body in place) so the `--no-default-features`
+/// headless build -- which has no `egui`/`eframe`/[`vdiff::ui`] at all --
+/// still compiles this call site: [`DiffLoader`] only exists behind the
+/// `gui` feature, so `repo`/`base_oid` are threaded through here instead of
+/// being bundled into it before the call.
+#[cfg(feature = "gui")]
+fn launch_gui(
+    graph: ProjectGraph,
+    repo_path: &Path,
+    smoke: bool,
+    want_nvim: bool,
+    nvim_cmd: Vec<String>,
+    repo: Box<dyn GitRepo>,
+    base_oid: String,
+    review_setup: ReviewSetup,
+) -> ExitCode {
+    run_gui(
+        graph,
+        repo_path,
+        smoke,
+        want_nvim,
+        nvim_cmd,
+        DiffLoader { repo, base_oid },
+        review_setup,
+    )
+}
+
+/// The headless-build (`--no-default-features`) counterpart of
+/// [`launch_gui`]: there's no GUI to open at all, so any invocation that
+/// would otherwise launch it (no `--dump`/`--export-comments`/
+/// `--publish-comments`, whether or not `--smoke`/`--nvim` were also given)
+/// fails cleanly with a stderr message and a nonzero exit rather than a
+/// compile hole or a silent no-op.
+#[cfg(not(feature = "gui"))]
+fn launch_gui(
+    _graph: ProjectGraph,
+    _repo_path: &Path,
+    _smoke: bool,
+    _want_nvim: bool,
+    _nvim_cmd: Vec<String>,
+    _repo: Box<dyn GitRepo>,
+    _base_oid: String,
+    _review_setup: ReviewSetup,
+) -> ExitCode {
+    eprintln!(
+        "error: vdiff was built without the `gui` feature (--no-default-features); only --dump, --export-comments, and --publish-comments are available in this build"
+    );
+    ExitCode::FAILURE
 }
 
 /// `--findings <path>`: read the file, parse it (see
@@ -452,6 +516,7 @@ fn dump(
 /// through `core::review::invalidate` against `graph`, and the result
 /// seeds `App::reviewed` -- the same `git_dir`/branch then back `VdiffApp`'s
 /// own save-on-toggle via `ReviewConfig`.
+#[cfg(feature = "gui")]
 fn run_gui(
     graph: ProjectGraph,
     repo_path: &Path,
@@ -580,6 +645,7 @@ fn run_gui(
 
 /// Run each `--nvim-cmd` in order via [`NvimPane::run_init_command`],
 /// logging (never failing the run over) any that error out or time out.
+#[cfg(feature = "gui")]
 /// `VdiffApp::respawn_nvim` re-runs the same commands after a dead session
 /// is replaced (see `NvimConfig::init_cmds`, which carries `commands`
 /// forward for that).

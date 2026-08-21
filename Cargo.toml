@@ -14,11 +14,22 @@ path = "src/lib.rs"
 name = "vdiff"
 path = "src/main.rs"
 
+[features]
+default = ["gui"]
+# The egui/eframe GUI. On by default; `--no-default-features` builds the
+# headless CLI only (`--dump`, `--export-comments`, `--publish-comments`),
+# with no egui/eframe/syntect in the dependency tree at all. See
+# `src/main.rs`'s `launch_gui` for the headless-build error path.
+gui = ["egui", "eframe", "egui_extras"]
+
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
-eframe = "0.36.1"
-egui = "0.36.1"
-egui_extras = { version = "0.36.1", features = ["syntect"] }
+eframe = { version = "0.36.1", optional = true }
+egui = { version = "0.36.1", optional = true }
+# `syntect` (source highlighting) is reachable only through this crate's
+# `syntax_highlighting` module, gated behind `gui` -- not a direct
+# dependency of vdiff. Issue #16 will add it directly for the TUI.
+egui_extras = { version = "0.36.1", features = ["syntect"], optional = true }
 git2 = "0.21.0"
 imara-diff = "0.2.0"
 rmpv = "1.3"
