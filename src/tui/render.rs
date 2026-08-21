@@ -50,8 +50,12 @@ pub fn file_view_visible_rows(terminal_rows: u16) -> usize {
 /// Paint one frame for the current `app` state: the graph screen (focused
 /// neighborhood or file pane, per [`App::pane`]) or the full-screen diff
 /// pane, per [`App::screen`], plus the bottom legend strip and any open
-/// edge-picker overlay.
-pub fn draw(frame: &mut Frame, app: &App) {
+/// edge-picker overlay. `notice`, when set, takes over the legend strip's
+/// hint line for this one frame -- see `crate::tui::TuiState::notice`'s doc
+/// for why the TUI needs this display-only glue state at all (in short:
+/// `eprintln!` is invisible/garbled while the alternate screen owns the
+/// terminal).
+pub fn draw(frame: &mut Frame, app: &App, notice: Option<&str>) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(LayoutDirection::Vertical)
@@ -77,7 +81,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::Diff => draw_diff(frame, main_area, app),
     }
 
-    draw_legend(frame, legend_area, app);
+    draw_legend(frame, legend_area, app, notice);
 
     if app.pane == Pane::Graph {
         draw_picker(frame, area, app);
@@ -452,16 +456,23 @@ fn draw_diff_side_by_side(
 /// The bottom legend/status strip: the keymap hint row plus review
 /// progress -- the terminal equivalent of the GUI's floating hint overlay,
 /// rendered as plain text since there's no floating-window concept in a
-/// terminal grid.
-fn draw_legend(frame: &mut Frame, area: Rect, app: &App) {
-    let hint = match (app.screen, app.pane) {
-        (Screen::Graph, Pane::Graph) => {
-            "h/j/k/l move  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
-        }
-        (Screen::Graph, Pane::File) => {
-            "j/k scroll  Ctrl-d/u half-page  gg/G top/bottom  ]c/[c change  ]f/[f file  Ctrl-e edit  d diff  Esc back"
-        }
-        (Screen::Diff, _) => "j/k scroll  ]c/[c hunk  ]f/[f file  s toggle mode  Esc back",
+/// terminal grid. `notice`, when `Some`, replaces the hint line for this
+/// frame rather than appending a third line -- see [`draw`]'s doc for why
+/// the TUI needs a notice mechanism at all in place of `eprintln!`.
+fn draw_legend(frame: &mut Frame, area: Rect, app: &App, notice: Option<&str>) {
+    let hint = match notice {
+        Some(notice) => notice.to_string(),
+        None => match (app.screen, app.pane) {
+            (Screen::Graph, Pane::Graph) => {
+                "h/j/k/l move  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
+                    .to_string()
+            }
+            (Screen::Graph, Pane::File) => {
+                "j/k scroll  Ctrl-d/u half-page  gg/G top/bottom  ]c/[c change  ]f/[f file  Ctrl-e edit  d diff  Esc back"
+                    .to_string()
+            }
+            (Screen::Diff, _) => "j/k scroll  ]c/[c hunk  ]f/[f file  s toggle mode  Esc back".to_string(),
+        },
     };
     let (reviewed, total) = app.review_progress();
     let status = format!("{reviewed}/{total} changed modules reviewed");
@@ -593,9 +604,19 @@ mod tests {
     /// buffer to a single string (row-major, no separators) for substring
     /// assertions -- headless, no real terminal involved.
     fn render_to_string(app: &App) -> String {
+        render_to_string_with_notice(app, None)
+    }
+
+    /// Like [`render_to_string`], but with a legend-strip notice (see
+    /// [`draw`]'s `notice` parameter) -- used by tests exercising
+    /// `crate::tui::TuiState::notice`'s render side without needing the
+    /// glue that sets it.
+    pub(crate) fn render_to_string_with_notice(app: &App, notice: Option<&str>) -> String {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test backend");
-        terminal.draw(|frame| draw(frame, app)).expect("draw");
+        terminal
+            .draw(|frame| draw(frame, app, notice))
+            .expect("draw");
         let buffer = terminal.backend().buffer();
         let mut out = String::new();
         for y in 0..buffer.area.height {

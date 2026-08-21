@@ -4,6 +4,15 @@
 //! useless here, since this build may have no egui at all. This module
 //! does the same `syntect` highlighting pass directly and maps its color/
 //! font-style output onto `ratatui`'s span styling instead.
+//!
+//! Accepted phase-1 limitation: [`highlight_line`] constructs a fresh
+//! `HighlightLines` per call, so its parse state resets every line rather
+//! than carrying forward across the file the way a real syntax-aware
+//! editor would; multi-line constructs (block comments, raw strings,
+//! multi-line f-strings, ...) can highlight incorrectly as a result. A
+//! correct fix means threading one `HighlightLines` per rendered file
+//! across calls instead of building one per line, which is deferred to a
+//! later pass.
 
 use std::path::Path;
 use std::sync::OnceLock;
