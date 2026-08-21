@@ -35,6 +35,29 @@
 //! vice versa), the crossing renders as `┼` rather than either original
 //! glyph silently overwriting the other.
 //!
+//! # Channel height budget (issue #18)
+//!
+//! Even with issue #18's median coordinate assignment straightening most
+//! edges (see [`crate::graph::sugiyama`]'s doc), a real change set can still
+//! pile more bent edges into one channel than [`CHANNEL_HEIGHT_BUDGET`] rows
+//! -- without a cap, that used to mean a dozen-plus rows of routing
+//! spaghetti (see the issue's own real-use screenshot). Once a channel's
+//! *non-focused* bent edges would need more than the budget's worth of bend
+//! rows, the excess ones degrade: no bend row, no `╮`/`╯`, just a bare `╷`
+//! at the channel's very top row (departing the upper band) and `╵` at its
+//! very bottom row (arriving at the lower band), and [`Channel::dropped`]
+//! counts them so `crate::tui::render` can surface a "+N edges not drawn"
+//! legend hint. The currently focused node's own edges are exempt from the
+//! cap entirely -- they always get a real bend row, however many that
+//! takes -- because "the focused node's edges are followable end to end"
+//! is the one thing this screen must never sacrifice (see the issue's own
+//! acceptance criteria). A degraded edge's stub is only ever painted into
+//! an otherwise-empty cell (see [`route_one_channel`]'s doc on write
+//! ordering), so it can never obscure a real bend, straight line, or the
+//! focused node's own full-fidelity edge -- worst case, in an especially
+//! dense channel, a stub simply doesn't render at all rather than
+//! clobbering something more important.
+//!
 //! # What this deliberately doesn't handle
 //!
 //! Band-wrap (splitting an overflowing band into multiple node rows within
@@ -72,12 +95,31 @@ pub struct CanvasCell {
     pub role: CanvasRole,
 }
 
+/// The channel height budget (issue #18's fix 2): once a channel needs more
+/// than this many bend rows for its *non-focused* edges, additional normal
+/// edges degrade to endpoint stubs (see [`route_one_channel`]) rather than
+/// growing the channel further -- a hairball of a dozen overlapping bent
+/// edges used to mean a dozen rows of routing spaghetti; capping it here is
+/// what actually makes "channels a few rows tall" (the issue's acceptance
+/// criterion) true regardless of how tangled the underlying graph is. The
+/// focused node's own edges are exempt (see [`Channel::dropped`]'s doc) --
+/// they can still push the channel taller than this when they need to.
+pub const CHANNEL_HEIGHT_BUDGET: usize = 5;
+
 /// One inter-band channel's routed cells: `rows[r]` is row `r`'s (sparse)
-/// cell list, `height` rows total.
+/// cell list, `height` rows total. `dropped` is how many *non-focused*
+/// edges in this channel exceeded [`CHANNEL_HEIGHT_BUDGET`] and were
+/// degraded to endpoint stubs (a bare `╷`/`╵` at the channel's top/bottom
+/// row instead of a full bend) rather than growing the channel further --
+/// `crate::tui::render` sums this across every channel to surface a dim
+/// "+N edges not drawn" legend note, mirroring
+/// [`crate::graph::rails::compute`]'s own `dropped_edges` convention for
+/// the rail view's width cap.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Channel {
     pub height: usize,
     pub rows: Vec<Vec<CanvasCell>>,
+    pub dropped: usize,
 }
 
 /// Route every inter-band channel in `layout`: one [`Channel`] per gap
@@ -130,26 +172,40 @@ fn route_one_channel(layout: &Layout, channel: usize, focus: &NodeId) -> Channel
 
     // Greedy interval scheduling of bent segments onto bend rows, keyed by
     // x-range overlap -- the transposed twin of `rails::layout_spans`'s
-    // row-range scheduling.
+    // row-range scheduling. A focused segment (`role != Normal`) always
+    // gets a fresh row when no existing one is free, exactly like the
+    // pre-budget code; a normal segment only gets a fresh row while the
+    // channel is still under `CHANNEL_HEIGHT_BUDGET` -- past that, it has
+    // no row assigned at all (`bend_row_of[idx] == None`), which
+    // [`Self`]'s caller below renders as a degraded endpoint stub instead
+    // of a real bend (see [`Channel::dropped`]'s doc).
     let mut order: Vec<usize> = (0..bent.len()).collect();
     order.sort_by_key(|&i| {
         let s = bent[i];
         (s.from_x.min(s.to_x), s.from_x.max(s.to_x))
     });
     let mut busy_until: Vec<usize> = Vec::new();
-    let mut bend_row_of: Vec<usize> = vec![0; bent.len()];
+    let mut bend_row_of: Vec<Option<usize>> = vec![None; bent.len()];
+    let mut dropped = 0usize;
     for idx in order {
         let s = bent[idx];
         let (lo, hi) = (s.from_x.min(s.to_x), s.from_x.max(s.to_x));
-        let row = busy_until
-            .iter()
-            .position(|&busy| busy <= lo)
-            .unwrap_or_else(|| {
+        let free_row = busy_until.iter().position(|&busy| busy <= lo);
+        let row = match free_row {
+            Some(row) => Some(row),
+            None if s.role != CanvasRole::Normal || busy_until.len() < CHANNEL_HEIGHT_BUDGET => {
                 busy_until.push(0);
-                busy_until.len() - 1
-            });
-        busy_until[row] = hi;
-        bend_row_of[idx] = row;
+                Some(busy_until.len() - 1)
+            }
+            None => None,
+        };
+        match row {
+            Some(row) => {
+                busy_until[row] = hi;
+                bend_row_of[idx] = Some(row);
+            }
+            None => dropped += 1,
+        }
     }
 
     let height = busy_until.len().max(1);
@@ -170,19 +226,39 @@ fn route_one_channel(layout: &Layout, channel: usize, focus: &NodeId) -> Channel
             write(row, s.from_x, '│', s.role);
         }
     }
+    // Full-fidelity bends (straight lines above and any focused/in-budget
+    // bent segment) are drawn before any degraded stub below, and never
+    // afterward -- see the loop below's own comment for why that order
+    // matters: a stub must never be able to clobber a real bend/line, only
+    // ever fill in a genuinely empty cell.
     for (idx, s) in bent.iter().enumerate() {
-        let bend_row = bend_row_of[idx];
-        for row in 0..bend_row {
-            write(row, s.from_x, '│', s.role);
+        if let Some(bend_row) = bend_row_of[idx] {
+            for row in 0..bend_row {
+                write(row, s.from_x, '│', s.role);
+            }
+            let (lo, hi) = (s.from_x.min(s.to_x), s.from_x.max(s.to_x));
+            for col in lo..=hi {
+                write(bend_row, col, '─', s.role);
+            }
+            write(bend_row, s.from_x, '╮', s.role);
+            write(bend_row, s.to_x, '╯', s.role);
+            for row in (bend_row + 1)..height {
+                write(row, s.to_x, '│', s.role);
+            }
         }
-        let (lo, hi) = (s.from_x.min(s.to_x), s.from_x.max(s.to_x));
-        for col in lo..=hi {
-            write(bend_row, col, '─', s.role);
-        }
-        write(bend_row, s.from_x, '╮', s.role);
-        write(bend_row, s.to_x, '╯', s.role);
-        for row in (bend_row + 1)..height {
-            write(row, s.to_x, '│', s.role);
+    }
+    for (idx, s) in bent.iter().enumerate() {
+        if bend_row_of[idx].is_none() {
+            // Degraded: the channel is already at budget, so this normal
+            // edge gets no bend row at all, just a bare departure/arrival
+            // marker at the channel's top and bottom rows -- enough to see
+            // the edge exists without paying for its own row. Drawn last,
+            // and only into a cell nothing else has claimed yet (`or_insert`
+            // with no `and_modify`), so a degraded edge can never overwrite
+            // -- or, by drawing last, be overwritten by -- a real bend, a
+            // straight line, or the focused node's own full-fidelity edge.
+            grid.entry((0, s.from_x)).or_insert(('╷', s.role));
+            grid.entry((height - 1, s.to_x)).or_insert(('╵', s.role));
         }
     }
 
@@ -198,7 +274,11 @@ fn route_one_channel(layout: &Layout, channel: usize, focus: &NodeId) -> Channel
         row.sort_by_key(|c| c.column);
     }
 
-    Channel { height, rows }
+    Channel {
+        height,
+        rows,
+        dropped,
+    }
 }
 
 /// Merge two glyphs landing on the same cell: a `│`/`─` collision is a real
@@ -367,6 +447,138 @@ mod tests {
         let layout = simple_layout(&[&["only"]], &[]);
         let channels = route_channels(&layout, &id("only"));
         assert!(channels.is_empty(), "one band has no channel gap at all");
+    }
+
+    /// A hand-built two-band [`Layout`] with `normal_count` overlapping bent
+    /// "normal" edges (each sharing the same far endpoint, so every one's
+    /// x-range overlaps every other's and greedy scheduling needs a fresh
+    /// bend row per edge -- see [`crossing_segments_render_a_plus_glyph`]'s
+    /// comment for why hand-building beats routing this through
+    /// `sugiyama::layout`), plus one optional focused edge with the same
+    /// overlap shape.
+    fn overlapping_bent_layout(normal_count: usize, with_focused: bool) -> (Layout, NodeId) {
+        use crate::graph::sugiyama::{RoutedEdge, Slot, SlotId};
+        let focus = id("focus");
+        let far_x = 1000.0;
+        let mut top = Vec::new();
+        let mut bottom = Vec::new();
+        let mut edges = Vec::new();
+        if with_focused {
+            let name = id("focused_src");
+            top.push(Slot {
+                id: SlotId::Real(name.clone()),
+                label: "focused_src".to_string(),
+                x: 0,
+                width: 1,
+            });
+            bottom.push(Slot {
+                id: SlotId::Real(focus.clone()),
+                label: "focus".to_string(),
+                x: 1000,
+                width: 1,
+            });
+            edges.push(RoutedEdge {
+                from: name,
+                to: focus.clone(),
+                waypoints: vec![(0, 0.5), (1, far_x)],
+            });
+        }
+        for i in 0..normal_count {
+            let x = (i + 1) * 2;
+            let name = id(&format!("n{i}"));
+            let target = id(&format!("t{i}"));
+            top.push(Slot {
+                id: SlotId::Real(name.clone()),
+                label: name.to_string(),
+                x,
+                width: 1,
+            });
+            bottom.push(Slot {
+                id: SlotId::Real(target.clone()),
+                label: target.to_string(),
+                x: 2000 + x,
+                width: 1,
+            });
+            edges.push(RoutedEdge {
+                from: name,
+                to: target,
+                // Each edge's far endpoint gets a distinct (but still
+                // deep-overlapping) x so a dropped edge's bottom stub
+                // lands in its own column, not stacked on top of every
+                // other dropped edge's stub in the same cell.
+                waypoints: vec![(0, x as f32 + 0.5), (1, far_x + i as f32)],
+            });
+        }
+        (
+            Layout {
+                bands: vec![top, bottom],
+                edges,
+            },
+            focus,
+        )
+    }
+
+    #[test]
+    fn under_budget_channel_is_unchanged() {
+        let (layout, focus) = overlapping_bent_layout(CHANNEL_HEIGHT_BUDGET - 1, false);
+        let channels = route_channels(&layout, &focus);
+        let ch = &channels[0];
+        assert_eq!(ch.dropped, 0);
+        assert_eq!(ch.height, CHANNEL_HEIGHT_BUDGET - 1);
+    }
+
+    #[test]
+    fn over_budget_channel_degrades_normal_edges_and_reports_the_dropped_count() {
+        let extra = 3;
+        let (layout, focus) = overlapping_bent_layout(CHANNEL_HEIGHT_BUDGET + extra, false);
+        let channels = route_channels(&layout, &focus);
+        let ch = &channels[0];
+        assert_eq!(ch.dropped, extra, "exactly the over-budget edges drop");
+        assert_eq!(ch.height, CHANNEL_HEIGHT_BUDGET);
+        // Whichever edge legitimately occupies row 0 necessarily has a
+        // `hi` reaching at least as far as every dropped edge's `lo` --
+        // that's the very reason the drop happened (no row was free) --
+        // so a dropped edge's *top* stub is mathematically guaranteed to
+        // land inside that occupant's own horizontal run and never render
+        // as a separate visible glyph in this fixture shape (a stub never
+        // overwrites real content -- see `route_one_channel`'s doc). The
+        // *bottom* stub's column is each edge's own far endpoint, which
+        // this fixture deliberately spreads out past the in-budget rows'
+        // own far reach, so it isn't subject to the same guarantee -- it
+        // is what actually proves the degrade path renders something.
+        let stub_bottoms = ch.rows[ch.height - 1]
+            .iter()
+            .filter(|c| c.glyph == '╵')
+            .count();
+        assert!(
+            stub_bottoms >= 1,
+            "expected at least one visible bottom stub"
+        );
+    }
+
+    #[test]
+    fn over_budget_channel_keeps_the_focused_edge_at_full_fidelity() {
+        let (layout, focus) = overlapping_bent_layout(CHANNEL_HEIGHT_BUDGET + 3, true);
+        let channels = route_channels(&layout, &focus);
+        let ch = &channels[0];
+        // The focused edge (`focused_src` -> `focus`, so `FocusedIncoming`
+        // from `focus`'s point of view) must still get a real bend row (a
+        // `╮`/`╯` pair), never degraded to a stub, regardless of how many
+        // normal edges also want channel height.
+        let focused_bend = ch.rows.iter().any(|row| {
+            row.iter()
+                .any(|c| c.glyph == '╮' && c.role == CanvasRole::FocusedIncoming)
+        });
+        assert!(
+            focused_bend,
+            "focused edge must keep its bend row even over budget"
+        );
+        let focused_stub = ch.rows.iter().any(|row| {
+            row.iter().any(|c| {
+                c.role == CanvasRole::FocusedIncoming && (c.glyph == '╷' || c.glyph == '╵')
+            })
+        });
+        assert!(!focused_stub, "focused edge must never degrade to a stub");
     }
 
     #[test]

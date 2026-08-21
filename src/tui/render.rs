@@ -132,7 +132,7 @@ pub fn draw(
                         dropped_edges = draw_rail_graph(frame, main_area, app, rail_scroll);
                     }
                     ViewMode::Canvas => {
-                        draw_canvas_graph(frame, main_area, app, canvas_scroll);
+                        dropped_edges = draw_canvas_graph(frame, main_area, app, canvas_scroll);
                     }
                 }
             }
@@ -780,15 +780,22 @@ fn canvas_channel_line(channel: &Channel, row_idx: usize) -> Line<'static> {
 /// scroll-then-slice discipline [`draw_rail_graph`] uses for the rail view
 /// (see [`DisplayLine`]'s doc for why lines, not raw bands, are the unit
 /// scrolling happens in).
-fn draw_canvas_graph(frame: &mut Frame, area: Rect, app: &App, canvas_scroll: usize) {
+/// Returns the total [`Channel::dropped`] count summed across every routed
+/// channel in this frame's view -- [`draw`]'s counterpart to
+/// [`draw_rail_graph`]'s own return, feeding the same `dropped_edges`
+/// parameter into [`draw_legend`] (see that call site) so the canvas's
+/// channel-budget degrade (issue #18) gets the same "+N edges" legend
+/// treatment the rail gutter's width cap already has.
+fn draw_canvas_graph(frame: &mut Frame, area: Rect, app: &App, canvas_scroll: usize) -> usize {
     let view = build_canvas_view(app);
     let lines_index = build_canvas_lines(&view);
+    let dropped_edges: usize = view.channels.iter().map(|c| c.dropped).sum();
     if lines_index.is_empty() {
         frame.render_widget(
             Paragraph::new("(no visible nodes)").alignment(Alignment::Center),
             area,
         );
-        return;
+        return dropped_edges;
     }
 
     let start = canvas_scroll.min(lines_index.len().saturating_sub(1));
@@ -805,6 +812,7 @@ fn draw_canvas_graph(frame: &mut Frame, area: Rect, app: &App, canvas_scroll: us
         }
     }
     frame.render_widget(Paragraph::new(lines), area);
+    dropped_edges
 }
 
 fn draw_file_view(frame: &mut Frame, area: Rect, file_view: &FileViewState) {
@@ -1089,7 +1097,13 @@ fn draw_legend(
                     }
                 };
                 if dropped_edges > 0 {
-                    hint.push_str(&format!("  (+{dropped_edges} edges hidden, gutter capped)"));
+                    match view_mode {
+                        ViewMode::Rail => hint
+                            .push_str(&format!("  (+{dropped_edges} edges hidden, gutter capped)")),
+                        ViewMode::Canvas => {
+                            hint.push_str(&format!("  (+{dropped_edges} edges not drawn)"))
+                        }
+                    }
                 }
                 hint
             }
@@ -1835,6 +1849,42 @@ mod tests {
         }
         assert!(text.contains('`'), "expected the view-toggle hint");
         assert!(text.contains("zc/zo"), "expected the fold-chord hint");
+    }
+
+    #[test]
+    fn canvas_legend_shows_edges_not_drawn_when_a_channel_drops_edges() {
+        let dropped_edges = 3;
+        let app = app_for(diamond_graph_fixture(), "child");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_legend(frame, area, &app, None, dropped_edges, ViewMode::Canvas)
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        // The legend's `Paragraph` wraps at the terminal width, which can
+        // split the hint's own words across lines -- assert on the
+        // fragments the wrap can't separate rather than the exact
+        // contiguous phrase.
+        assert!(
+            text.contains("+3 edges"),
+            "expected the dropped-edge count, got: {text}"
+        );
+        assert!(
+            text.contains("not"),
+            "expected the canvas-specific wording, got: {text}"
+        );
+        assert!(
+            text.contains("drawn"),
+            "expected the canvas-specific wording, got: {text}"
+        );
     }
 
     #[test]
