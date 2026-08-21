@@ -6,4 +6,5 @@ pub mod labels;
 pub mod layers;
 pub mod layout;
 pub mod model;
+pub mod rails;
 pub mod test_modules;
