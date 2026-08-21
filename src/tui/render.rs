@@ -1096,4 +1096,36 @@ mod tests {
         let reserved = LEGEND_HEIGHT + FILE_HEADER_HEIGHT + 2;
         assert_eq!(file_view_visible_rows(30), (30 - reserved) as usize);
     }
+
+    // -- Fix: file-less rows never panic if they do render (review
+    // feedback) ------------------------------------------------------------
+    //
+    // `crate::core::app::open_file`/`open_diff` now no-op on a file-less
+    // node (a collapsed namespace row's own id), so `App::file_view`/
+    // `App::diff` should never actually end up holding a zero-files
+    // `FileViewState`/`DiffPaneState` in practice. These two tests pin down
+    // the belt-and-suspenders case anyway: IF one ever did get through
+    // (a future caller forgetting the guard, a stale state from before this
+    // fix, ...), rendering it must degrade gracefully to the existing
+    // "(no files)" placeholder rather than panicking on an empty
+    // `files`/`current_file()`.
+
+    #[test]
+    fn file_view_screen_with_zero_files_renders_the_no_files_placeholder_without_panicking() {
+        let mut app = app_at("leaf");
+        app.pane = Pane::File;
+        app.file_view = Some(FileViewState::new(NodeId::from("ns"), vec![]));
+        let text = render_to_string(&app);
+        assert!(text.contains("(no files)"));
+    }
+
+    #[test]
+    fn diff_screen_with_zero_files_renders_the_no_files_placeholder_without_panicking() {
+        use crate::core::diff_state::DiffPaneState;
+        let mut app = app_at("leaf");
+        app.screen = Screen::Diff;
+        app.diff = Some(DiffPaneState::new(NodeId::from("ns"), vec![]));
+        let text = render_to_string(&app);
+        assert!(text.contains("(no files)"));
+    }
 }

@@ -145,8 +145,16 @@ pub fn visible_rows_with_layers(
 
 /// The row id `id` actually renders as: `id` itself if no ancestor is
 /// collapsed, or [`collapse_root`]'s result otherwise. Used to translate raw
-/// [`DepEdge`]s onto the visible row set in [`collapse_edges`].
-fn effective_row_id(graph: &ProjectGraph, id: &NodeId, collapsed: &HashSet<NodeId>) -> NodeId {
+/// [`DepEdge`]s onto the visible row set in [`collapse_edges`], and by
+/// `crate::core::app`'s focus-setting handlers (`gd`/`gr`, the edge picker,
+/// `Msg::FocusSet`, `Msg::ToggleTests`'s re-seat) to keep `App::focus`
+/// always pointing at something actually present in [`visible_rows`] --
+/// see that call site's own doc for why this matters (a focus id with no
+/// corresponding visible row soft-locks `j`/`k`/scroll/highlight in the
+/// rail view). Identity (`id` unchanged) whenever `collapsed` is empty, so
+/// this has no effect on the GUI, which never populates
+/// `App::fold_collapsed` at all.
+pub fn effective_row_id(graph: &ProjectGraph, id: &NodeId, collapsed: &HashSet<NodeId>) -> NodeId {
     collapse_root(graph, id, collapsed).unwrap_or_else(|| id.clone())
 }
 

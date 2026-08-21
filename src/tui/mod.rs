@@ -396,11 +396,50 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
     let outcome = map_key(input, ctx);
     state.pending_key = None;
     match outcome {
+        KeyOutcome::Msg(Msg::OpenFile) if !node_has_files(&state.app, &state.app.focus) => {
+            state.notice = Some(FILE_LESS_ROW_NOTICE.to_string());
+        }
+        KeyOutcome::Msg(Msg::OpenDiff) if !node_has_files(&state.app, &diff_target(&state.app)) => {
+            state.notice = Some(FILE_LESS_ROW_NOTICE.to_string());
+        }
         KeyOutcome::Msg(msg) => state.dispatch(msg),
         KeyOutcome::Pending(pending) => state.pending_key = Some(pending),
         KeyOutcome::None => {}
     }
     KeyAction::Continue
+}
+
+/// The notice shown when `Enter`/`d` on a collapsed namespace row is a
+/// no-op (see [`node_has_files`]/[`diff_target`]) -- without this, that key
+/// would look dead rather than explain itself, the same problem
+/// [`TuiState::notice`]'s doc already solves for `Cmd::CommentNode`.
+const FILE_LESS_ROW_NOTICE: &str = "collapsed namespace has no files -- expand with l";
+
+/// Whether `id` has at least one backing file -- mirrors
+/// `crate::core::app`'s own `has_files` guard on `Msg::OpenFile`/
+/// `Msg::OpenDiff` exactly (duplicated rather than exported from `core`,
+/// since `core` is IO/display-glue-free and has no business knowing this
+/// is used to decide whether to show a notice). `handle_key` checks this
+/// *before* dispatching so it can tell the no-op apart from every other
+/// reason `Msg::OpenFile`/`Msg::OpenDiff` might already be a no-op (no
+/// picker-closed/pane guard failure gets a notice -- only this one, which
+/// is otherwise silent from `core`'s side since `Cmd::None` doesn't say
+/// why).
+fn node_has_files(app: &App, id: &crate::graph::model::NodeId) -> bool {
+    app.graph
+        .node(id)
+        .is_some_and(|node| !node.files.is_empty())
+}
+
+/// The node `Msg::OpenDiff` would target, mirroring
+/// `crate::core::app::open_diff`'s own target selection exactly
+/// (`App::file_view`'s node while the file pane is open, `focus`
+/// otherwise) -- duplicated here for the same reason as [`node_has_files`].
+fn diff_target(app: &App) -> crate::graph::model::NodeId {
+    match (&app.file_view, app.pane) {
+        (Some(file_view), Pane::File) => file_view.node.clone(),
+        _ => app.focus.clone(),
+    }
 }
 
 /// Whether `input` should trigger [`KeyAction::EditInNvim`] instead of the
@@ -588,5 +627,94 @@ mod tests {
             handle_key(&mut state, press('q')),
             KeyAction::Continue
         ));
+    }
+
+    // -- Fix: file-less rows get a notice instead of a dead key (review
+    // feedback) -----------------------------------------------------------
+
+    /// `ns` is a synthetic, file-less namespace containing one drawn child
+    /// `leaf` -- a stand-in for a collapsed namespace row's own id
+    /// (`crate::core::rail_view::RailRow::Collapsed::namespace`), without
+    /// needing the fold machinery itself: focusing `ns` directly is enough
+    /// to exercise `open_file`/`open_diff`'s file-less guard.
+    fn state_with_namespace_focus(focus: &str) -> TuiState {
+        use crate::graph::model::{FileRef, GitStatus, ModuleNode};
+        use std::path::PathBuf as StdPathBuf;
+
+        let ns = crate::graph::model::NodeId::from("ns");
+        let leaf_id = crate::graph::model::NodeId::from("leaf");
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            ns.clone(),
+            ModuleNode {
+                id: ns.clone(),
+                display_name: "ns".to_string(),
+                parent: None,
+                children: vec![leaf_id.clone()],
+                status: GitStatus::Unchanged,
+                files: vec![],
+            },
+        );
+        nodes.insert(
+            leaf_id.clone(),
+            ModuleNode {
+                id: leaf_id.clone(),
+                display_name: "leaf".to_string(),
+                parent: Some(ns.clone()),
+                children: vec![],
+                status: GitStatus::Modified,
+                files: vec![FileRef {
+                    path: StdPathBuf::from("leaf.rs"),
+                    base_blob: Some("b".to_string()),
+                    head_blob: Some("h".to_string()),
+                }],
+            },
+        );
+
+        let mut state = state_fixture();
+        state.app.graph = ProjectGraph {
+            roots: vec![ns, leaf_id],
+            nodes,
+            edges: vec![],
+        };
+        state.app.focus = crate::graph::model::NodeId::from(focus);
+        state
+    }
+
+    #[test]
+    fn enter_on_a_file_less_row_sets_a_notice_instead_of_opening_the_file_pane() {
+        let mut state = state_with_namespace_focus("ns");
+        let action = handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(action, KeyAction::Continue));
+        assert_eq!(state.app.pane, Pane::Graph, "pane must not flip");
+        assert!(
+            state.notice.as_deref() == Some(FILE_LESS_ROW_NOTICE),
+            "expected the file-less-row notice, got {:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn d_on_a_file_less_row_sets_a_notice_instead_of_opening_the_diff_screen() {
+        let mut state = state_with_namespace_focus("ns");
+        let action = handle_key(&mut state, press('d'));
+        assert!(matches!(action, KeyAction::Continue));
+        assert_eq!(state.app.screen, Screen::Graph, "screen must not switch");
+        assert!(state.notice.as_deref() == Some(FILE_LESS_ROW_NOTICE));
+    }
+
+    #[test]
+    fn enter_on_an_ordinary_row_opens_the_file_pane_with_no_notice() {
+        let mut state = state_with_namespace_focus("leaf");
+        let action = handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(action, KeyAction::Continue));
+        assert_eq!(state.app.pane, Pane::File);
+        assert!(state.notice.is_none());
     }
 }

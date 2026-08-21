@@ -415,7 +415,44 @@ pub enum Cmd {
 
 /// Advance `app` in response to `msg`, returning the new state and any
 /// command the caller should execute. Pure: performs no I/O.
-pub fn update(mut app: App, msg: Msg) -> (App, Cmd) {
+///
+/// Wraps [`update_inner`] (the actual per-`Msg` reducer) with one final
+/// pass: whenever [`App::fold_collapsed`] is non-empty, `App::focus` is
+/// remapped through [`rail_view::effective_row_id`] so it always names
+/// something [`rail_view::visible_rows`] actually has a row for. This is
+/// the fix for a real bug found in review: `update_inner`'s individual
+/// focus-setting arms (`Msg::FollowDeps`/`FollowDependents`'s direct jump,
+/// `Msg::PickerSelect`, `Msg::FocusSet`, `Msg::ToggleTests`'s re-seat) each
+/// set `App::focus` to a *drawn* node id straight out of `App::layers`,
+/// with no idea whether that node currently sits inside a collapsed
+/// namespace -- `App::layers`/`App::fold_collapsed` are orthogonal, so a
+/// drawn id can be perfectly valid there while having no corresponding row
+/// in the rail view at all. Left unfixed, that desyncs `App::focus` from
+/// the visible row list: the rail view's scroll-into-view math, the
+/// focused-row highlight, and the focused-edge accent coloring (see
+/// `crate::tui::render`) all key off "which row is `App::focus`", and
+/// `Msg::RailFocusMove`'s own `position()` lookup (see that handler) comes
+/// up empty and goes dead -- effectively soft-locking `j`/`k` until enough
+/// `Msg::CollapseFocusedNamespace` calls happen to climb focus back out on
+/// its own. Applying the remap once, centrally, after every single
+/// dispatch is simpler and harder to miss than threading it into each
+/// individual arm by hand, and it's provably a no-op for the GUI: that
+/// frontend never populates `fold_collapsed` (nothing there ever collapses
+/// anything), so [`rail_view::effective_row_id`] short-circuits to identity
+/// on every call it makes.
+pub fn update(app: App, msg: Msg) -> (App, Cmd) {
+    let (mut app, cmd) = update_inner(app, msg);
+    if !app.fold_collapsed.is_empty() {
+        app.focus = rail_view::effective_row_id(&app.graph, &app.focus, &app.fold_collapsed);
+    }
+    (app, cmd)
+}
+
+/// The per-`Msg` reducer [`update`] wraps with the fold-aware focus remap
+/// described on that function's doc. Split out only so that remap is
+/// applied exactly once, in exactly one place, regardless of which arm
+/// below actually changed `focus`.
+fn update_inner(mut app: App, msg: Msg) -> (App, Cmd) {
     match msg {
         Msg::FocusMove(dir) => {
             if !on_graph_with_no_picker_and_graph_pane(&app) {
@@ -787,11 +824,30 @@ fn picker_select(app: &mut App) {
     }
 }
 
+/// Whether `id` has at least one backing file -- the guard [`open_diff`]/
+/// [`open_file`] apply before emitting [`Cmd::LoadDiff`]/[`Cmd::LoadFile`]
+/// for it. Unreachable on the GUI in practice: the GUI never focuses a
+/// file-less node at all (`App::is_drawn`/[`Msg::FocusSet`]'s own guard
+/// only ever accept ids present in `App::layers`, and [`crate::graph::layers::assign_layers`]
+/// excludes every file-less synthetic namespace container from `layers` in
+/// the first place -- see that module's doc). The `--tui` rail view is
+/// what actually needs this: a collapsed namespace row's id (see
+/// [`crate::core::rail_view::RailRow::Collapsed`]) is exactly such a
+/// file-less container, and it *is* focusable there (that's the whole
+/// point of fold-by-namespace), so `Enter`/`d` on one would otherwise emit
+/// a load command for a node with nothing to load.
+fn has_files(graph: &ProjectGraph, id: &NodeId) -> bool {
+    graph.node(id).is_some_and(|node| !node.files.is_empty())
+}
+
 /// Handle [`Msg::OpenDiff`]: only on [`Screen::Graph`] with no picker open,
 /// switch to [`Screen::Diff`] and emit [`Cmd::LoadDiff`] for the node whose
 /// file is actually shown: [`App::file_view`]'s node when [`Pane::File`] is
 /// open (after [`Msg::GoToTest`], that's the test, not `focus`, which stays
-/// on the module -- see [`Msg::GoToTest`]'s doc), `focus` otherwise.
+/// on the module -- see [`Msg::GoToTest`]'s doc), `focus` otherwise. A
+/// no-op (screen/pane untouched) if that target has no files at all -- see
+/// [`has_files`]'s doc for why this guard exists and why it's a no-op on
+/// the GUI path.
 fn open_diff(mut app: App) -> (App, Cmd) {
     if !on_graph_with_no_picker(&app) {
         return (app, Cmd::None);
@@ -800,6 +856,9 @@ fn open_diff(mut app: App) -> (App, Cmd) {
         (Some(file_view), Pane::File) => file_view.node.clone(),
         _ => app.focus.clone(),
     };
+    if !has_files(&app.graph, &target) {
+        return (app, Cmd::None);
+    }
     app.screen = Screen::Diff;
     (app, Cmd::LoadDiff(target))
 }
@@ -820,12 +879,18 @@ fn with_file_view(app: &mut App, f: impl FnOnce(&mut FileViewState)) {
 /// [`Cmd::LoadFile`] for the focused node. `pane` flips before the load
 /// completes (see [`App::file_view`]'s doc) rather than waiting for
 /// [`Msg::FileLoaded`] -- the caller's `Cmd::LoadFile` executor runs
-/// synchronously within the same dispatch, so there's no visible gap.
+/// synchronously within the same dispatch, so there's no visible gap. A
+/// no-op (pane untouched) if the focused node has no files at all -- see
+/// [`has_files`]'s doc for why this guard exists and why it's a no-op on
+/// the GUI path.
 fn open_file(mut app: App) -> (App, Cmd) {
     if !on_graph_with_no_picker_and_graph_pane(&app) {
         return (app, Cmd::None);
     }
     let focus = app.focus.clone();
+    if !has_files(&app.graph, &focus) {
+        return (app, Cmd::None);
+    }
     app.pane = Pane::File;
     (app, Cmd::LoadFile(focus))
 }
@@ -2074,5 +2139,199 @@ mod tests {
         let (app, cmd) = update(app, Msg::RailFocusMove(RailDirection::Down));
         assert_eq!(app.focus, NodeId::from("leaf_a"));
         assert_eq!(cmd, Cmd::None);
+    }
+
+    // -- Fix: focus escaping the visible row set (review feedback) --------
+    //
+    // `effective_row_id` was only ever applied when collapsing edges for
+    // the rail gutter, never when `App::focus` itself was set. So `gd`/
+    // `gr`'s direct jump, the edge picker's selection, and any other
+    // focus-setting path could land `App::focus` on a drawn node whose
+    // ancestor is collapsed -- a raw id with no corresponding row in
+    // `rail_view::visible_rows` at all. `update`'s wrapper now remaps
+    // `App::focus` through `rail_view::effective_row_id` after every
+    // dispatch; these tests pin that down directly, plus confirm the fix
+    // is a no-op with an empty `fold_collapsed` (the GUI's permanent
+    // state).
+
+    /// `ns` is a synthetic namespace containing two drawn children
+    /// (`inner`/`inner2`); a top-level `outer` node depends on both --
+    /// enough to drive `gd` into a picker (two candidates) or, with only
+    /// one edge wired up, a direct jump. See `single_dep` fixtures below
+    /// for the direct-jump shape.
+    fn graph_fixture_with_namespace(edges: Vec<DepEdge>) -> ProjectGraph {
+        let ns = NodeId::from("ns");
+        let inner = NodeId::from("inner");
+        let inner2 = NodeId::from("inner2");
+        let outer = NodeId::from("outer");
+
+        let leaf = |id: &NodeId, name: &str, parent: Option<NodeId>| ModuleNode {
+            id: id.clone(),
+            display_name: name.to_string(),
+            parent,
+            children: vec![],
+            status: GitStatus::Unchanged,
+            files: vec![crate::graph::model::FileRef {
+                path: PathBuf::from(format!("{name}.rs")),
+                base_blob: Some("b".to_string()),
+                head_blob: Some("h".to_string()),
+            }],
+        };
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            ns.clone(),
+            ModuleNode {
+                id: ns.clone(),
+                display_name: "ns".to_string(),
+                parent: None,
+                children: vec![inner.clone(), inner2.clone()],
+                status: GitStatus::Unchanged,
+                files: vec![],
+            },
+        );
+        nodes.insert(inner.clone(), leaf(&inner, "inner", Some(ns.clone())));
+        nodes.insert(inner2.clone(), leaf(&inner2, "inner2", Some(ns.clone())));
+        nodes.insert(outer.clone(), leaf(&outer, "outer", None));
+
+        ProjectGraph {
+            roots: vec![ns, outer],
+            nodes,
+            edges,
+        }
+    }
+
+    fn edge(from: &str, to: &str) -> DepEdge {
+        DepEdge {
+            from: NodeId::from(from),
+            to: NodeId::from(to),
+            kind: DepKind::Use,
+        }
+    }
+
+    fn app_with_graph(graph: ProjectGraph, focus: &str) -> App {
+        let result = crate::graph::layout::layout(&graph);
+        let rows = crate::graph::layout::rows_with_x_centers(&result);
+        App {
+            graph,
+            layers: result.layers,
+            rows,
+            focus: NodeId::from(focus),
+            screen: Screen::Graph,
+            diff: None,
+            picker: None,
+            show_tests: false,
+            file_view: None,
+            pane: Pane::Graph,
+            viewport_rows: 20,
+            reviewed: HashSet::new(),
+            findings: HashMap::new(),
+            comments: HashMap::new(),
+            fold_collapsed: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn follow_deps_direct_jump_into_a_collapsed_namespace_remaps_focus_to_the_namespace_row() {
+        let g = graph_fixture_with_namespace(vec![edge("outer", "inner")]);
+        let mut app = app_with_graph(g, "outer");
+        app.fold_collapsed.insert(NodeId::from("ns"));
+
+        let (app, _) = update(app, Msg::FollowDeps);
+
+        assert_eq!(
+            app.focus,
+            NodeId::from("ns"),
+            "focus must land on the collapsed namespace's row, not the absorbed leaf"
+        );
+    }
+
+    #[test]
+    fn follow_deps_direct_jump_with_no_fold_collapsed_is_unaffected() {
+        let g = graph_fixture_with_namespace(vec![edge("outer", "inner")]);
+        let app = app_with_graph(g, "outer");
+
+        let (app, _) = update(app, Msg::FollowDeps);
+
+        assert_eq!(app.focus, NodeId::from("inner"));
+    }
+
+    #[test]
+    fn picker_select_into_a_collapsed_namespace_remaps_focus_to_the_namespace_row() {
+        let g = graph_fixture_with_namespace(vec![edge("outer", "inner"), edge("outer", "inner2")]);
+        let mut app = app_with_graph(g, "outer");
+        app.fold_collapsed.insert(NodeId::from("ns"));
+
+        let (app, _) = update(app, Msg::FollowDeps);
+        let picker = app
+            .picker
+            .clone()
+            .expect("two candidates should open a picker");
+        assert_eq!(
+            picker.candidates,
+            vec![NodeId::from("inner"), NodeId::from("inner2")]
+        );
+
+        let (app, _) = update(app, Msg::PickerSelect);
+
+        assert_eq!(
+            app.focus,
+            NodeId::from("ns"),
+            "picker selection must remap into the collapsed namespace's row too"
+        );
+    }
+
+    #[test]
+    fn picker_select_with_no_fold_collapsed_is_unaffected() {
+        let g = graph_fixture_with_namespace(vec![edge("outer", "inner"), edge("outer", "inner2")]);
+        let app = app_with_graph(g, "outer");
+
+        let (app, _) = update(app, Msg::FollowDeps);
+        let (app, _) = update(app, Msg::PickerSelect);
+
+        assert_eq!(app.focus, NodeId::from("inner"));
+    }
+
+    // -- Fix: file-less rows (review feedback) -----------------------------
+    //
+    // A collapsed namespace row's id names a synthetic, file-less
+    // container. `Enter`/`d` on such a row used to emit `Cmd::LoadFile`/
+    // `Cmd::LoadDiff` for a node with zero files -- `open_file`/`open_diff`
+    // now no-op instead (see `has_files`'s doc for why this is provably
+    // unreachable on the GUI).
+
+    #[test]
+    fn open_file_noop_on_a_file_less_focused_node() {
+        let g = graph_fixture_with_namespace(vec![]);
+        let mut app = app_with_graph(g, "outer");
+        app.focus = NodeId::from("ns"); // a synthetic, file-less namespace
+
+        let (app, cmd) = update(app, Msg::OpenFile);
+
+        assert_eq!(app.pane, Pane::Graph, "pane must not flip");
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn open_diff_noop_on_a_file_less_focused_node() {
+        let g = graph_fixture_with_namespace(vec![]);
+        let mut app = app_with_graph(g, "outer");
+        app.focus = NodeId::from("ns");
+
+        let (app, cmd) = update(app, Msg::OpenDiff);
+
+        assert_eq!(app.screen, Screen::Graph, "screen must not switch");
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn open_file_still_works_for_an_ordinary_focused_node() {
+        let g = graph_fixture_with_namespace(vec![]);
+        let app = app_with_graph(g, "outer");
+
+        let (app, cmd) = update(app, Msg::OpenFile);
+
+        assert_eq!(app.pane, Pane::File);
+        assert_eq!(cmd, Cmd::LoadFile(NodeId::from("outer")));
     }
 }
