@@ -30,6 +30,18 @@ nix build
 nix develop
 ```
 
+The `gui` Cargo feature (on by default) gates the egui/eframe GUI. A
+`--no-default-features` build is headless: no window ever opens, and
+`--dump`/`--export-comments`/`--publish-comments` are the only usable
+entry points -- any invocation that would otherwise launch the GUI (bare
+`vdiff`, `--smoke`, `--pr` without a headless flag, ...) exits 1 with a
+message naming the missing feature instead.
+
+```sh
+cargo build --release --no-default-features   # headless CLI only, no egui/eframe/syntect in the dependency tree
+cargo check --no-default-features              # verify the headless build stays compiling as CI/local check
+```
+
 ## Quickstart
 
 ```sh
