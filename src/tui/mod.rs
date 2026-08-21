@@ -67,11 +67,27 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::core::app::{update, App, Cmd, Msg, Pane, Screen};
+use crate::core::focus::{move_focus, Direction};
 use crate::core::rail_view::RailDirection;
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome, Pending};
+use crate::review::comments::map_comments;
 use crate::review::review_state::ReviewStore;
 use crate::review::store as review_store;
 use loader::TuiLoader;
+
+/// Which of the two graph screens is showing, per issue #17's maintainer
+/// override: the rail-DAG row renderer (issue #16 phase 2, unchanged) and
+/// the new semantic-zoom Sugiyama canvas both stay, side by side, toggled
+/// with backtick (see [`TuiState::view_mode`]'s doc for why this lives
+/// entirely in the TUI rather than on `core::App`). `Canvas` is the
+/// default -- the canvas is what's being evaluated against real use; the
+/// rail view is kept for comparison, not as the primary experience.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    #[default]
+    Canvas,
+    Rail,
+}
 
 /// How long `--smoke` keeps the terminal open before exiting 0 -- mirrors
 /// the GUI's own `SMOKE_DURATION` (`crate::ui::eframe_app`).
@@ -129,6 +145,37 @@ struct TuiState {
     /// row list, so there's no state here a `core` reducer could get out
     /// of sync with.
     rail_scroll: usize,
+    /// Which graph view is showing (issue #17's maintainer override -- see
+    /// [`ViewMode`]'s doc). TUI-local display state, deliberately *not* on
+    /// `core::App`: like [`Self::rail_scroll`], it's purely which renderer
+    /// paints the same underlying `App::graph`/`App::layers`/
+    /// `App::fold_collapsed` state, never something a `core` reducer needs
+    /// to reason about -- the fold machinery, focus, and navigation
+    /// semantics it drives (`gd`/`gr`, `Enter`, `d`, ...) are identical in
+    /// both modes.
+    view_mode: ViewMode,
+    /// The canvas view's own scroll offset, the [`ViewMode::Canvas`] analog
+    /// of [`Self::rail_scroll`] -- see that field's doc for why this is
+    /// TUI-local. Reclamped every frame in [`event_loop`] the same way.
+    canvas_scroll: usize,
+    /// Whether a `z` chord prefix is in progress for the canvas view's
+    /// fold keys (`zc`/`zo` -- see [`canvas_key_msg`]'s doc for why this
+    /// isn't threaded through `crate::keymap::Pending`, which is shared
+    /// with the GUI and the rail view's own chord handling). Cleared on
+    /// every keypress that isn't itself `z` starting a fresh chord, or the
+    /// `c`/`o` that completes one -- there's no chord that survives an
+    /// unrelated keypress.
+    canvas_fold_pending: bool,
+    /// The `nvim` handoff target [`TuiState::execute`]'s `Cmd::CommentNode`
+    /// arm just computed, if any -- [`handle_key`] reads this back out
+    /// immediately after dispatching `Msg::CommentNode` and turns it into
+    /// `KeyAction::EditInNvim`, since `execute` has no `Terminal` to
+    /// suspend/resume with itself (see [`handle_key`]'s doc, and
+    /// [`should_edit_in_nvim`]'s precedent for `Ctrl-e`, which needs the
+    /// same split for the same reason). Always taken (reset to `None`)
+    /// the moment `handle_key` reads it, so a comment target never lingers
+    /// into some later, unrelated keypress.
+    comment_target: Option<(PathBuf, Option<u32>)>,
 }
 
 impl TuiState {
@@ -156,19 +203,26 @@ impl TuiState {
                 Ok(state) => self.dispatch(Msg::FileLoaded(state)),
                 Err(message) => self.dispatch(Msg::FileLoadFailed(message)),
             },
-            Cmd::CommentNode(_) => {
-                // Comment capture is a compose-UI feature the GUI delegates
-                // to the embedded `vdiff.nvim` plugin (see
-                // `crate::ui::eframe_app::VdiffApp::comment_node`); the TUI
-                // has no embedded nvim session to delegate to at all (see
-                // `nvim_handoff`'s doc on why phase 1 is handoff-only, not
-                // embedded). Deferred rather than half-built here -- surfaced
-                // via `self.notice` (see its doc), not `eprintln!`, since
-                // stderr is invisible while the alternate screen owns the
-                // terminal; without this, pressing `c` would look like a
-                // dead key.
-                self.notice =
-                    Some("comments aren't supported in the --tui frontend yet".to_string());
+            Cmd::CommentNode(node) => {
+                // The TUI has no embedded nvim session/compose-UI to run a
+                // comment prompt through the way the GUI's
+                // `crate::ui::eframe_app::VdiffApp::comment_node` does via
+                // the embedded `vdiff.nvim`. Instead (issue #17's companion
+                // fix): hand off to the user's own real `nvim` at the
+                // node's first backing file, same suspend/resume as
+                // `Ctrl-e` (see `nvim_handoff`), so `:VdiffComment` there
+                // captures the comment through the normal flow. `handle_key`
+                // reads this back out via [`Self::comment_target`] right
+                // after this dispatch returns and turns it into
+                // `KeyAction::EditInNvim` -- `execute` itself has no
+                // `Terminal` to suspend/resume with (see `handle_key`'s own
+                // doc on why that split exists already for `Ctrl-e`).
+                match self.comment_nvim_target(&node) {
+                    Some(target) => self.comment_target = Some(target),
+                    None => {
+                        self.notice = Some(FILE_LESS_ROW_NOTICE.to_string());
+                    }
+                }
             }
             Cmd::PersistReviewState => self.persist_review_state(),
         }
@@ -187,12 +241,60 @@ impl TuiState {
             ));
         }
     }
+
+    /// The `nvim` handoff target for a `Cmd::CommentNode(node)`: `node`'s
+    /// first backing file, joined onto the repo root, at line `1` -- there's
+    /// no established cursor position to resume at the way `Ctrl-e`'s
+    /// [`nvim_edit_target`] has (the file pane's own scroll position), so
+    /// this just opens at the top and lets `:VdiffComment` in the user's
+    /// real `nvim` do the rest. `None` if `node` has no backing files (a
+    /// collapsed namespace row's own id) or isn't in the graph at all --
+    /// [`Self::execute`] falls back to [`FILE_LESS_ROW_NOTICE`] in that
+    /// case, the same notice `handle_key`'s `Enter`/`d` guards already use
+    /// for the same underlying reason.
+    fn comment_nvim_target(
+        &self,
+        node: &crate::graph::model::NodeId,
+    ) -> Option<(PathBuf, Option<u32>)> {
+        let module = self.app.graph.node(node)?;
+        let file = module.files.first()?;
+        Some((self.repo_root.join(&file.path), Some(1)))
+    }
+
+    /// Reload `<git_dir>/vdiff/comments.json` and remap it onto
+    /// `App::comments`, replacing it wholesale -- the TUI's counterpart of
+    /// `crate::ui::eframe_app::VdiffApp::reload_comments`, run on resume
+    /// from *any* `nvim` handoff (`Ctrl-e` or the `c` comment flow, both via
+    /// [`KeyAction::EditInNvim`]) rather than driven by a live RPC
+    /// notification the way the GUI's embedded session can -- the TUI has
+    /// no embedded session to notify it, so reload-on-resume is the
+    /// simplest thing that actually shows a captured comment's badge
+    /// without a restart (see the issue's own note that "the GUI has live
+    /// refresh; reload-on-resume is enough here"). A read/parse failure is
+    /// logged via [`Self::notice`] (not `eprintln!` -- see that field's
+    /// doc) and leaves the previous badges in place rather than clearing
+    /// them, mirroring the GUI's own failure handling.
+    fn reload_comments(&mut self) {
+        let git_dir = self.loader.repo.git_dir();
+        match review_store::load(&git_dir) {
+            Ok(comments) => {
+                self.app.comments = map_comments(&self.app.graph, &comments);
+            }
+            Err(err) => {
+                self.notice = Some(format!(
+                    "warning: failed to reload {}: {err}",
+                    review_store::comments_path(&git_dir).display()
+                ));
+            }
+        }
+    }
 }
 
 /// What [`event_loop`] should do after [`handle_key`] processes one
 /// keypress: keep going, quit, or -- the one case that needs the real
 /// terminal, which [`handle_key`] itself deliberately never touches (see
 /// its doc) -- suspend for a real `nvim` at `path`/`line`.
+#[derive(Debug)]
 enum KeyAction {
     Continue,
     Quit,
@@ -256,6 +358,10 @@ pub fn run(app: App, config: TuiConfig) -> io::Result<()> {
         repo_root: config.repo_root,
         notice: None,
         rail_scroll: 0,
+        view_mode: ViewMode::default(),
+        canvas_scroll: 0,
+        canvas_fold_pending: false,
+        comment_target: None,
     };
 
     let result = event_loop(&mut terminal, &mut state, config.smoke);
@@ -288,23 +394,44 @@ fn event_loop(
         if state.app.screen == Screen::Graph && state.app.pane == Pane::Graph {
             let size = terminal.size()?;
             let viewport_height = render::rail_visible_rows(size.height);
-            // Display-line space, not row-index space: a band separator
-            // consumes a screen line of its own, so `focus_display_line`/
-            // `display_line_count` (not `rows.len()`/a raw row position)
-            // are what must agree with what `render::draw_rail_graph`
-            // actually renders -- see `render::DisplayLine`'s doc for the
-            // bug this avoids (scroll math that only counted rows could
-            // let the focused row scroll off past the bottom edge once
-            // enough separators fell inside the visible window).
-            let rows = crate::core::rail_view::visible_rows_with_layers(
-                &state.app.graph,
-                &state.app.layers,
-                &state.app.fold_collapsed,
-            );
-            let focus_idx = render::focus_display_line(&rows, &state.app.focus).unwrap_or(0);
-            let total_lines = render::display_line_count(&rows);
-            state.rail_scroll =
-                render::clamp_scroll(state.rail_scroll, focus_idx, total_lines, viewport_height);
+            match state.view_mode {
+                ViewMode::Rail => {
+                    // Display-line space, not row-index space: a band
+                    // separator consumes a screen line of its own, so
+                    // `focus_display_line`/`display_line_count` (not
+                    // `rows.len()`/a raw row position) are what must agree
+                    // with what `render::draw_rail_graph` actually renders
+                    // -- see `render::DisplayLine`'s doc for the bug this
+                    // avoids (scroll math that only counted rows could let
+                    // the focused row scroll off past the bottom edge once
+                    // enough separators fell inside the visible window).
+                    let rows = crate::core::rail_view::visible_rows_with_layers(
+                        &state.app.graph,
+                        &state.app.layers,
+                        &state.app.fold_collapsed,
+                    );
+                    let focus_idx =
+                        render::focus_display_line(&rows, &state.app.focus).unwrap_or(0);
+                    let total_lines = render::display_line_count(&rows);
+                    state.rail_scroll = render::clamp_scroll(
+                        state.rail_scroll,
+                        focus_idx,
+                        total_lines,
+                        viewport_height,
+                    );
+                }
+                ViewMode::Canvas => {
+                    let view = render::build_canvas_view(&state.app);
+                    let focus_idx = render::focus_canvas_line(&view, &state.app.focus).unwrap_or(0);
+                    let total_lines = render::canvas_line_count(&view);
+                    state.canvas_scroll = render::clamp_scroll(
+                        state.canvas_scroll,
+                        focus_idx,
+                        total_lines,
+                        viewport_height,
+                    );
+                }
+            }
         }
         terminal.draw(|frame| {
             render::draw(
@@ -312,6 +439,8 @@ fn event_loop(
                 &state.app,
                 state.notice.as_deref(),
                 state.rail_scroll,
+                state.canvas_scroll,
+                state.view_mode,
             )
         })?;
 
@@ -327,15 +456,28 @@ fn event_loop(
                 match handle_key(state, key) {
                     KeyAction::Quit => return Ok(()),
                     KeyAction::EditInNvim { path, line } => {
-                        if let Err(err) = nvim_handoff::suspend_and_run(&path, line) {
-                            // See `TuiState::notice`'s doc: `eprintln!`
-                            // would be invisible/garbled while the
-                            // alternate screen still owns the terminal at
-                            // this point (the handoff already restored and
-                            // re-suspended it around the `nvim` child, but
-                            // this warning fires after that, back under
-                            // our own alternate screen).
-                            state.notice = Some(format!("failed to launch nvim: {err}"));
+                        match nvim_handoff::suspend_and_run(&path, line, &state.repo_root) {
+                            Ok(()) => {
+                                // Issue #17's companion fix: reload
+                                // `comments.json` on resume from *any*
+                                // handoff (`Ctrl-e` or the `c` comment
+                                // flow), so a comment just captured through
+                                // `:VdiffComment` shows up as a badge
+                                // without restarting -- see
+                                // `TuiState::reload_comments`'s doc.
+                                state.reload_comments();
+                            }
+                            Err(err) => {
+                                // See `TuiState::notice`'s doc: `eprintln!`
+                                // would be invisible/garbled while the
+                                // alternate screen still owns the terminal
+                                // at this point (the handoff already
+                                // restored and re-suspended it around the
+                                // `nvim` child, but this warning fires
+                                // after that, back under our own alternate
+                                // screen).
+                                state.notice = Some(format!("failed to launch nvim: {err}"));
+                            }
                         }
                         terminal.clear()?;
                     }
@@ -387,9 +529,28 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
             .unwrap_or(KeyAction::Continue);
     }
 
-    if let Some(msg) = rail_key_msg(state, input) {
-        state.dispatch(msg);
+    if should_toggle_view_mode(state, input) {
+        state.view_mode = match state.view_mode {
+            ViewMode::Canvas => ViewMode::Rail,
+            ViewMode::Rail => ViewMode::Canvas,
+        };
+        state.canvas_fold_pending = false;
         return KeyAction::Continue;
+    }
+
+    match state.view_mode {
+        ViewMode::Rail => {
+            if let Some(msg) = rail_key_msg(state, input) {
+                state.dispatch(msg);
+                return KeyAction::Continue;
+            }
+        }
+        ViewMode::Canvas => {
+            if let Some(msg) = canvas_key_msg(state, input) {
+                state.dispatch(msg);
+                return KeyAction::Continue;
+            }
+        }
     }
 
     let ctx = KeyContext {
@@ -411,6 +572,9 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
         KeyOutcome::Msg(msg) => state.dispatch(msg),
         KeyOutcome::Pending(pending) => state.pending_key = Some(pending),
         KeyOutcome::None => {}
+    }
+    if let Some((path, line)) = state.comment_target.take() {
+        return KeyAction::EditInNvim { path, line };
     }
     KeyAction::Continue
 }
@@ -454,6 +618,73 @@ fn diff_target(app: &App) -> crate::graph::model::NodeId {
 /// one is ever added, isn't shadowed).
 fn should_edit_in_nvim(state: &TuiState, input: KeyInput) -> bool {
     input == KeyInput::Ctrl('e') && state.app.pane == Pane::File && state.pending_key.is_none()
+}
+
+/// Whether `input` is the [`ViewMode`] toggle: backtick, on the graph
+/// screen's graph pane with no picker/chord in progress. Backtick was
+/// picked over the more obvious `v` (already `Msg::ToggleReviewed`) or `z`
+/// (the canvas's own fold-chord prefix -- see [`canvas_key_msg`]) precisely
+/// because it collides with nothing else bound anywhere in this crate's
+/// keymap (GUI or TUI) -- an unshifted, single-tap key that's otherwise
+/// idle in every context this toggle needs to fire in.
+fn should_toggle_view_mode(state: &TuiState, input: KeyInput) -> bool {
+    input == KeyInput::Char('`')
+        && state.app.screen == Screen::Graph
+        && state.app.pane == Pane::Graph
+        && state.app.picker.is_none()
+        && state.pending_key.is_none()
+}
+
+/// The canvas-view message `input` should dispatch directly, bypassing
+/// `map_key`, mirroring [`rail_key_msg`]'s precedent for the rail view but
+/// with entirely different keys/semantics per the maintainer override: in
+/// canvas mode `h`/`j`/`k`/`l` are *spatial* movement (the GUI's own
+/// `crate::core::focus::move_focus`, reused unchanged here over the
+/// canvas's char-space x-centers instead of the GUI's pixel ones -- see
+/// [`render::canvas_focus_grid`]) rather than the rail view's fold-
+/// collapse/row-step meaning, and folding uses a `z`-prefixed chord
+/// (`zc`/`zo`, vim's own `foldclose`/`foldopen` mnemonic) instead of `h`/`l`
+/// directly, since those two keys are already spoken for by movement here.
+/// `None` outside [`Screen::Graph`]/[`Pane::Graph`], with a picker open, or
+/// with an unrelated chord (`crate::keymap::Pending`) already in progress --
+/// same guard [`rail_key_msg`] uses, for the same reason.
+fn canvas_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
+    if state.app.screen != Screen::Graph
+        || state.app.pane != Pane::Graph
+        || state.app.picker.is_some()
+        || state.pending_key.is_some()
+    {
+        state.canvas_fold_pending = false;
+        return None;
+    }
+
+    if state.canvas_fold_pending {
+        state.canvas_fold_pending = false;
+        return match input {
+            KeyInput::Char('c') => Some(Msg::CollapseFocusedNamespace),
+            KeyInput::Char('o') => Some(Msg::ExpandFocusedNamespace),
+            _ => None,
+        };
+    }
+
+    match input {
+        KeyInput::Char('z') => {
+            state.canvas_fold_pending = true;
+            None
+        }
+        KeyInput::Char(c @ ('h' | 'j' | 'k' | 'l')) => {
+            let dir = match c {
+                'h' => Direction::Left,
+                'l' => Direction::Right,
+                'k' => Direction::Up,
+                _ => Direction::Down,
+            };
+            let (layers, rows) = render::canvas_focus_grid(&state.app);
+            let target = move_focus(&layers, &rows, &state.app.focus, dir);
+            Some(Msg::FocusSet(target))
+        }
+        _ => None,
+    }
 }
 
 /// The rail-view message `input` should dispatch directly, bypassing
@@ -503,7 +734,7 @@ fn nvim_edit_target(state: &TuiState) -> Option<(PathBuf, Option<u32>)> {
 mod tests {
     use super::*;
     use crate::core::app::Screen;
-    use crate::graph::model::ProjectGraph;
+    use crate::graph::model::{NodeId, ProjectGraph};
     use crate::pipeline::repo::FakeRepo;
     use crossterm::event::KeyModifiers;
     use std::collections::{HashMap, HashSet};
@@ -547,6 +778,10 @@ mod tests {
             repo_root: PathBuf::from("."),
             notice: None,
             rail_scroll: 0,
+            view_mode: ViewMode::default(),
+            canvas_scroll: 0,
+            canvas_fold_pending: false,
+            comment_target: None,
         }
     }
 
@@ -555,15 +790,28 @@ mod tests {
     }
 
     #[test]
-    fn pressing_c_on_the_graph_pane_sets_a_notice_instead_of_dispatching_silently() {
+    fn pressing_c_on_a_file_less_focus_sets_a_notice_instead_of_a_dead_key() {
+        // `state_fixture`'s focus (`""`) isn't in the (empty) graph at all,
+        // so `Cmd::CommentNode`'s handoff target lookup fails and
+        // `execute` falls back to the same file-less-row notice `Enter`/`d`
+        // already use -- see `TuiState::comment_nvim_target`'s doc.
         let mut state = state_fixture();
         let action = handle_key(&mut state, press('c'));
         assert!(matches!(action, KeyAction::Continue));
-        assert!(
-            state.notice.is_some(),
-            "expected a notice explaining comments aren't supported yet"
-        );
-        assert!(state.notice.as_ref().unwrap().contains("comments"));
+        assert_eq!(state.notice.as_deref(), Some(FILE_LESS_ROW_NOTICE));
+    }
+
+    #[test]
+    fn pressing_c_on_a_node_with_files_requests_an_nvim_handoff() {
+        let mut state = state_with_namespace_focus("leaf");
+        let action = handle_key(&mut state, press('c'));
+        match action {
+            KeyAction::EditInNvim { path, line } => {
+                assert!(path.ends_with("leaf.rs"));
+                assert_eq!(line, Some(1));
+            }
+            other => panic!("expected an nvim handoff, got a different action: {other:?}"),
+        }
     }
 
     #[test]
@@ -584,6 +832,8 @@ mod tests {
                     &state.app,
                     state.notice.as_deref(),
                     state.rail_scroll,
+                    state.canvas_scroll,
+                    state.view_mode,
                 )
             })
             .expect("draw");
@@ -722,5 +972,133 @@ mod tests {
         assert!(matches!(action, KeyAction::Continue));
         assert_eq!(state.app.pane, Pane::File);
         assert!(state.notice.is_none());
+    }
+
+    // -- View-mode toggle and canvas-mode keys (issue #17) -----------------
+
+    /// A two-layer graph (`leaf` depends on `target`) with `App::layers`
+    /// actually populated -- unlike [`state_with_namespace_focus`] (whose
+    /// fixture leaves `layers` empty, fine for its file-less-row tests but
+    /// not for exercising canvas-mode spatial movement, which walks real
+    /// band structure).
+    fn state_with_layered_graph(focus: &str) -> TuiState {
+        use crate::graph::model::{DepEdge, DepKind, FileRef, GitStatus, ModuleNode};
+        use std::path::PathBuf as StdPathBuf;
+
+        let leaf = crate::graph::model::NodeId::from("leaf");
+        let target = crate::graph::model::NodeId::from("target");
+        let node = |id: &crate::graph::model::NodeId, name: &str| ModuleNode {
+            id: id.clone(),
+            display_name: name.to_string(),
+            parent: None,
+            children: vec![],
+            status: GitStatus::Modified,
+            files: vec![FileRef {
+                path: StdPathBuf::from(format!("{name}.rs")),
+                base_blob: Some("b".to_string()),
+                head_blob: Some("h".to_string()),
+            }],
+        };
+        let mut nodes = HashMap::new();
+        nodes.insert(leaf.clone(), node(&leaf, "leaf"));
+        nodes.insert(target.clone(), node(&target, "target"));
+        let graph = ProjectGraph {
+            roots: vec![leaf.clone(), target.clone()],
+            nodes,
+            edges: vec![DepEdge {
+                from: leaf.clone(),
+                to: target.clone(),
+                kind: DepKind::Use,
+            }],
+        };
+        let layers = crate::graph::layers::assign_layers(&graph);
+
+        let mut state = state_fixture();
+        state.app.graph = graph;
+        state.app.layers = layers;
+        state.app.focus = crate::graph::model::NodeId::from(focus);
+        state
+    }
+
+    #[test]
+    fn canvas_mode_is_the_default() {
+        let state = state_fixture();
+        assert_eq!(state.view_mode, ViewMode::Canvas);
+    }
+
+    #[test]
+    fn backtick_toggles_between_canvas_and_rail_and_back() {
+        let mut state = state_fixture();
+        assert_eq!(state.view_mode, ViewMode::Canvas);
+        handle_key(&mut state, press('`'));
+        assert_eq!(state.view_mode, ViewMode::Rail);
+        handle_key(&mut state, press('`'));
+        assert_eq!(state.view_mode, ViewMode::Canvas);
+    }
+
+    #[test]
+    fn in_rail_mode_h_and_l_still_fold_and_unfold_unchanged() {
+        let mut state = state_with_layered_graph("leaf");
+        state.view_mode = ViewMode::Rail;
+        // `leaf` has no parent namespace in this fixture, so `h` is a
+        // documented no-op -- the point of this test is just that rail
+        // mode's `h`/`l` still dispatch `Msg::CollapseFocusedNamespace`/
+        // `Msg::ExpandFocusedNamespace` (via `rail_key_msg`), not canvas
+        // spatial movement, regardless of outcome.
+        let action = handle_key(&mut state, press('h'));
+        assert!(matches!(action, KeyAction::Continue));
+        assert_eq!(
+            state.app.focus,
+            NodeId::from("leaf"),
+            "no parent to fold into"
+        );
+    }
+
+    #[test]
+    fn in_canvas_mode_j_moves_focus_spatially_to_the_dependency_below() {
+        let mut state = state_with_layered_graph("leaf");
+        assert_eq!(state.view_mode, ViewMode::Canvas);
+        handle_key(&mut state, press('j'));
+        assert_eq!(state.app.focus, NodeId::from("target"));
+    }
+
+    #[test]
+    fn in_canvas_mode_h_and_l_do_not_fold_they_move_spatially() {
+        // A single-node band: `h`/`l` have nothing to step to within the
+        // row, so focus stays put -- proving these two keys are *not*
+        // reinterpreted as collapse/expand in canvas mode (they'd have
+        // stayed put here too if they were, but `fold_collapsed` must be
+        // untouched either way).
+        let mut state = state_with_layered_graph("leaf");
+        handle_key(&mut state, press('h'));
+        assert!(state.app.fold_collapsed.is_empty());
+        handle_key(&mut state, press('l'));
+        assert!(state.app.fold_collapsed.is_empty());
+    }
+
+    #[test]
+    fn zc_then_zo_collapses_then_expands_in_canvas_mode() {
+        let mut state = state_with_layered_graph("leaf");
+        handle_key(&mut state, press('z'));
+        assert!(
+            state.canvas_fold_pending,
+            "z alone should arm the chord, not dispatch anything yet"
+        );
+        handle_key(&mut state, press('c'));
+        // `leaf` has no parent namespace, so nothing actually collapses --
+        // this just proves the chord dispatched `Msg::CollapseFocusedNamespace`
+        // rather than falling through to `map_key`'s own `c`
+        // (`Msg::CommentNode`), which would have requested an nvim handoff
+        // instead.
+        assert!(!state.canvas_fold_pending, "chord clears after completing");
+    }
+
+    #[test]
+    fn an_unrelated_key_after_z_clears_the_pending_chord() {
+        let mut state = state_with_layered_graph("leaf");
+        handle_key(&mut state, press('z'));
+        assert!(state.canvas_fold_pending);
+        handle_key(&mut state, press('j'));
+        assert!(!state.canvas_fold_pending);
     }
 }

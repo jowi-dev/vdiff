@@ -21,6 +21,8 @@
 //! caller (`crate::tui::event_loop`), the same way [`file_view_visible_rows`]
 //! already feeds `App::viewport_rows` -- see that call site's own comment.
 
+use std::collections::HashMap;
+
 use ratatui::layout::{Alignment, Constraint, Direction as LayoutDirection, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -31,10 +33,13 @@ use crate::core::app::{App, Pane, Screen};
 use crate::core::diff_state::DiffMode;
 use crate::core::file_view::FileViewState;
 use crate::core::rail_view::{self, RailRow};
+use crate::graph::canvas::{self, CanvasRole, Channel};
 use crate::graph::model::{GitStatus, NodeId};
 use crate::graph::rails::{self, RailRole};
+use crate::graph::sugiyama::{self, SlotId};
 use crate::review::findings::Severity;
 use crate::tui::highlight;
+use crate::tui::ViewMode;
 
 /// Warm accent for a rail cell belonging to the focused node's own outgoing
 /// (dependency) edges -- the same RGB the GUI's
@@ -87,11 +92,21 @@ pub fn file_view_visible_rows(terminal_rows: u16) -> usize {
 /// this one frame -- see `crate::tui::TuiState::notice`'s doc for why the
 /// TUI needs this display-only glue state at all (in short: `eprintln!` is
 /// invisible/garbled while the alternate screen owns the terminal).
-/// `rail_scroll` is the rail view's current scroll offset (row index of the
-/// topmost visible row), already clamped by the caller via [`clamp_scroll`]
-/// -- see [`rail_visible_rows`]'s doc for why that clamping happens in
-/// `crate::tui::event_loop` rather than in here.
-pub fn draw(frame: &mut Frame, app: &App, notice: Option<&str>, rail_scroll: usize) {
+/// `rail_scroll`/`canvas_scroll` are the rail/canvas views' current scroll
+/// offsets, already clamped by the caller via [`clamp_scroll`] -- see
+/// [`rail_visible_rows`]'s doc for why that clamping happens in
+/// `crate::tui::event_loop` rather than in here. `view_mode` picks which of
+/// the two graph screens actually paints (issue #17's maintainer override --
+/// see [`crate::tui::ViewMode`]'s doc); the one not currently showing has no
+/// rendering cost paid for it at all.
+pub fn draw(
+    frame: &mut Frame,
+    app: &App,
+    notice: Option<&str>,
+    rail_scroll: usize,
+    canvas_scroll: usize,
+    view_mode: ViewMode,
+) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(LayoutDirection::Vertical)
@@ -112,13 +127,20 @@ pub fn draw(frame: &mut Frame, app: &App, notice: Option<&str>, rail_scroll: usi
                     );
                 }
             } else {
-                dropped_edges = draw_rail_graph(frame, main_area, app, rail_scroll);
+                match view_mode {
+                    ViewMode::Rail => {
+                        dropped_edges = draw_rail_graph(frame, main_area, app, rail_scroll);
+                    }
+                    ViewMode::Canvas => {
+                        draw_canvas_graph(frame, main_area, app, canvas_scroll);
+                    }
+                }
             }
         }
         Screen::Diff => draw_diff(frame, main_area, app),
     }
 
-    draw_legend(frame, legend_area, app, notice, dropped_edges);
+    draw_legend(frame, legend_area, app, notice, dropped_edges, view_mode);
 
     if app.pane == Pane::Graph {
         draw_picker(frame, area, app);
@@ -481,6 +503,306 @@ fn collapsed_row_spans(
     )]
 }
 
+// -- The `--tui` canvas graph screen (issue #17) ---------------------------
+//
+// A semantic-zoom Sugiyama layout of the same fold-aware visible row set the
+// rail view draws (`crate::core::rail_view`), laid out by
+// `crate::graph::sugiyama` and routed by `crate::graph::canvas`: bands of
+// node labels stacked top to bottom, with a routed inter-band channel
+// between each pair. Unlike the rail view's single left-hand gutter, the
+// DAG's actual 2D shape is visible here -- multiple parents/children spread
+// out left-to-right within a band, edges bending through the channel
+// between bands rather than all sharing one vertical rail.
+//
+// Band-wrap (an overflowing band split into multiple node rows -- see the
+// issue's own "hard problems" list) is a known limitation of this first cut:
+// a band wider than the terminal wraps its extra nodes onto continuation
+// lines (marked with a leading `\u{21b3}`), but those continuation lines
+// don't participate in channel routing at all -- a wrapped node's incoming/
+// outgoing rails simply don't connect to it. Fine for this crate's sizing
+// target (15-40 visible nodes, see the issue's own sizing note) at ordinary
+// terminal widths; degrades to "some connectors go missing" rather than a
+// crash or a garbled layout once a band badly overflows.
+
+/// Everything the canvas screen needs, built fresh each frame from `App`
+/// state (mirroring [`rail_view::visible_rows_with_layers`]'s own "recompute,
+/// don't cache" precedent -- see that module's doc): the pure Sugiyama
+/// layout, its routed inter-band channels, the original (fold-collapsed)
+/// edge list (needed to recover a dummy slot's true edge for role/color --
+/// see [`SlotId::Dummy`]'s doc), and a lookup from real node id back to its
+/// [`RailRow`] (so label rendering can reuse [`node_line`]/
+/// [`collapsed_row_spans`] exactly as the rail view does, keeping the two
+/// views' badge/color conventions identical -- see the issue's own note to
+/// mirror `crate::ui::graph_view`'s badge/accent semantics).
+pub struct CanvasView {
+    layout: sugiyama::Layout,
+    channels: Vec<Channel>,
+    edges: Vec<(NodeId, NodeId)>,
+    row_of: HashMap<NodeId, RailRow>,
+}
+
+/// Build [`CanvasView`] from `app`'s current fold state -- one band per
+/// distinct layer transition in [`rail_view::visible_rows_with_layers`]'s
+/// output (matching the rail view's own band-separator grouping exactly),
+/// [`rail_view::collapse_edges`] for the edge list, and
+/// [`plain_row_text`] as the label function feeding
+/// [`sugiyama::layout`]'s width calculation.
+pub fn build_canvas_view(app: &App) -> CanvasView {
+    let rows = rail_view::visible_rows_with_layers(&app.graph, &app.layers, &app.fold_collapsed);
+    let mut bands: Vec<Vec<NodeId>> = Vec::new();
+    let mut row_of: HashMap<NodeId, RailRow> = HashMap::new();
+    let mut prev_layer: Option<usize> = None;
+    for (row, layer) in &rows {
+        if prev_layer != Some(*layer) {
+            bands.push(Vec::new());
+            prev_layer = Some(*layer);
+        }
+        let id = row.id().clone();
+        row_of.insert(id.clone(), row.clone());
+        bands.last_mut().expect("just pushed").push(id);
+    }
+    let edges = rail_view::collapse_edges(&app.graph, &app.graph.edges, &app.fold_collapsed);
+    let layout = sugiyama::layout(&bands, &edges, |id| {
+        row_of
+            .get(id)
+            .map(|row| plain_row_text(app, row))
+            .unwrap_or_else(|| id.to_string())
+    });
+    let channels = canvas::route_channels(&layout, &app.focus);
+    CanvasView {
+        layout,
+        channels,
+        edges,
+        row_of,
+    }
+}
+
+/// The plain-text content [`node_line`]/[`collapsed_row_spans`] would
+/// render for `row` -- what [`build_canvas_view`] feeds
+/// [`sugiyama::layout`] as each real node's label width. Reuses those two
+/// span-building functions for their text alone (styling is applied
+/// separately at actual draw time -- see [`canvas_label_line`]) so the
+/// canvas's width estimate always matches the badges the rail view already
+/// shows, rather than drifting out of sync with a second, hand-maintained
+/// format string.
+fn plain_row_text(app: &App, row: &RailRow) -> String {
+    let spans = match row {
+        RailRow::Node(id) => node_line(app, id).spans,
+        RailRow::Collapsed {
+            namespace,
+            module_count,
+            changed_count,
+        } => collapsed_row_spans(app, namespace, *module_count, *changed_count),
+    };
+    spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// The `(layers, rows)` pair [`crate::core::focus::move_focus`] needs for
+/// canvas-mode spatial `h`/`j`/`k`/`l`: one `layers` entry per band (real
+/// node ids only, dummies filtered out -- `h`/`l` have no business landing
+/// on a bare routing point) and one `rows` entry per band pairing each real
+/// node with [`sugiyama::Slot::x_center`] -- the char-space stand-in for the
+/// GUI's pixel x-centers, letting `move_focus` run entirely unmodified over
+/// this layout the same way it already does over
+/// `crate::graph::layout::rows_with_x_centers`'s pixel ones.
+pub type CanvasFocusRows = Vec<Vec<(NodeId, f32)>>;
+
+pub fn canvas_focus_grid(app: &App) -> (Vec<Vec<NodeId>>, CanvasFocusRows) {
+    let view = build_canvas_view(app);
+    let layers: Vec<Vec<NodeId>> = view
+        .layout
+        .bands
+        .iter()
+        .map(|band| {
+            band.iter()
+                .filter_map(|s| s.id.real_id().cloned())
+                .collect()
+        })
+        .collect();
+    let rows: Vec<Vec<(NodeId, f32)>> = view
+        .layout
+        .bands
+        .iter()
+        .map(|band| {
+            band.iter()
+                .filter_map(|s| s.id.real_id().map(|id| (id.clone(), s.x_center())))
+                .collect()
+        })
+        .collect();
+    (layers, rows)
+}
+
+/// One scrollable line of the canvas screen: a band's own label row, or one
+/// row of the routed channel immediately below it. Built once per frame
+/// over the *entire* view (not just what's visible), the same
+/// [`DisplayLine`] precedent [`build_display_lines`] set for the rail view,
+/// so scrolling/clamping happens in the same line-index space this actually
+/// renders in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanvasLine {
+    Label(usize),
+    Channel(usize, usize),
+}
+
+fn build_canvas_lines(view: &CanvasView) -> Vec<CanvasLine> {
+    let mut lines = Vec::new();
+    for (band_idx, _band) in view.layout.bands.iter().enumerate() {
+        lines.push(CanvasLine::Label(band_idx));
+        if let Some(channel) = view.channels.get(band_idx) {
+            for row in 0..channel.height {
+                lines.push(CanvasLine::Channel(band_idx, row));
+            }
+        }
+    }
+    lines
+}
+
+/// The display-line index of `focus`'s band, or `None` if `focus` isn't
+/// present in the current canvas view at all -- what
+/// `crate::tui::event_loop` feeds into [`clamp_scroll`] as `focus_idx`,
+/// mirroring [`focus_display_line`]'s role for the rail view.
+pub fn focus_canvas_line(view: &CanvasView, focus: &NodeId) -> Option<usize> {
+    let band_idx = view
+        .layout
+        .bands
+        .iter()
+        .position(|band| band.iter().any(|s| s.id.real_id() == Some(focus)))?;
+    build_canvas_lines(view)
+        .iter()
+        .position(|line| matches!(line, CanvasLine::Label(idx) if *idx == band_idx))
+}
+
+/// The total number of display lines the canvas view renders as -- what
+/// `crate::tui::event_loop` feeds into [`clamp_scroll`] as `total_rows`,
+/// mirroring [`display_line_count`]'s role for the rail view.
+pub fn canvas_line_count(view: &CanvasView) -> usize {
+    build_canvas_lines(view).len()
+}
+
+fn canvas_role_color(role: CanvasRole) -> Color {
+    match role {
+        CanvasRole::Normal => RAIL_DIM,
+        CanvasRole::FocusedOutgoing => RAIL_OUTGOING,
+        CanvasRole::FocusedIncoming => RAIL_INCOMING,
+    }
+}
+
+/// The edge (true `from`/`to`) a [`SlotId::Dummy`] passes through, recovered
+/// from `view.edges` by the dummy's own embedded edge index -- `edge_idx`
+/// indexes the exact slice [`sugiyama::layout`] was called with (see
+/// [`build_canvas_view`]), so this is always in bounds for a dummy this
+/// view actually produced.
+fn dummy_role(view: &CanvasView, edge_idx: usize, focus: &NodeId) -> CanvasRole {
+    match view.edges.get(edge_idx) {
+        Some((from, to)) if from == focus => CanvasRole::FocusedOutgoing,
+        Some((from, to)) if to == focus => CanvasRole::FocusedIncoming,
+        _ => CanvasRole::Normal,
+    }
+}
+
+/// One band's label row: every slot's content placed at its assigned
+/// `x` column (padded with spaces up to that column), a real node's content
+/// coming from [`node_line`]/[`collapsed_row_spans`] (bolded if it's the
+/// focused node), a dummy slot rendering as a bare `│` passthrough (in the
+/// role of whichever edge it belongs to -- see [`dummy_role`]) so a
+/// long edge reads as one continuous rail through the bands it merely
+/// passes over, not a gap.
+fn canvas_label_line(app: &App, view: &CanvasView, band_idx: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut col = 0usize;
+    for slot in &view.layout.bands[band_idx] {
+        let pad = slot.x.saturating_sub(col);
+        if pad > 0 {
+            spans.push(Span::raw(" ".repeat(pad)));
+        }
+        col = col.max(slot.x);
+        match &slot.id {
+            SlotId::Dummy(edge_idx, _) => {
+                let role = dummy_role(view, *edge_idx, &app.focus);
+                spans.push(Span::styled(
+                    "│".to_string(),
+                    Style::default().fg(canvas_role_color(role)),
+                ));
+                col += 1;
+            }
+            SlotId::Real(id) => {
+                let mut node_spans = match view.row_of.get(id) {
+                    Some(RailRow::Node(nid)) => node_line(app, nid).spans,
+                    Some(RailRow::Collapsed {
+                        namespace,
+                        module_count,
+                        changed_count,
+                    }) => collapsed_row_spans(app, namespace, *module_count, *changed_count),
+                    None => vec![Span::raw(id.to_string())],
+                };
+                if id == &app.focus {
+                    for span in &mut node_spans {
+                        span.style = span.style.add_modifier(Modifier::BOLD);
+                    }
+                }
+                col += slot.width;
+                spans.extend(node_spans);
+            }
+        }
+    }
+    Line::from(spans)
+}
+
+/// One row of a routed [`Channel`]: each occupied column's glyph, colored
+/// by [`CanvasRole`], space-padded between them.
+fn canvas_channel_line(channel: &Channel, row_idx: usize) -> Line<'static> {
+    let cells = channel.rows.get(row_idx).map(Vec::as_slice).unwrap_or(&[]);
+    let mut sorted = cells.to_vec();
+    sorted.sort_by_key(|c| c.column);
+    let mut spans = Vec::new();
+    let mut col = 0usize;
+    for cell in &sorted {
+        let pad = cell.column.saturating_sub(col);
+        if pad > 0 {
+            spans.push(Span::raw(" ".repeat(pad)));
+        }
+        spans.push(Span::styled(
+            cell.glyph.to_string(),
+            Style::default().fg(canvas_role_color(cell.role)),
+        ));
+        col = cell.column + 1;
+    }
+    Line::from(spans)
+}
+
+/// The semantic-zoom Sugiyama canvas: builds a fresh [`CanvasView`] from
+/// `app`, then renders exactly the visible window of
+/// [`build_canvas_lines`]'s (label + channel) line list, the same
+/// scroll-then-slice discipline [`draw_rail_graph`] uses for the rail view
+/// (see [`DisplayLine`]'s doc for why lines, not raw bands, are the unit
+/// scrolling happens in).
+fn draw_canvas_graph(frame: &mut Frame, area: Rect, app: &App, canvas_scroll: usize) {
+    let view = build_canvas_view(app);
+    let lines_index = build_canvas_lines(&view);
+    if lines_index.is_empty() {
+        frame.render_widget(
+            Paragraph::new("(no visible nodes)").alignment(Alignment::Center),
+            area,
+        );
+        return;
+    }
+
+    let start = canvas_scroll.min(lines_index.len().saturating_sub(1));
+    let end = (start + area.height as usize).min(lines_index.len());
+
+    let mut lines: Vec<Line> = Vec::with_capacity(end - start);
+    for line in &lines_index[start..end] {
+        match line {
+            CanvasLine::Label(band_idx) => lines.push(canvas_label_line(app, &view, *band_idx)),
+            CanvasLine::Channel(band_idx, row_idx) => {
+                let channel = &view.channels[*band_idx];
+                lines.push(canvas_channel_line(channel, *row_idx));
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn draw_file_view(frame: &mut Frame, area: Rect, file_view: &FileViewState) {
     let Some(file) = file_view.current_file() else {
         frame.render_widget(
@@ -746,13 +1068,22 @@ fn draw_legend(
     app: &App,
     notice: Option<&str>,
     dropped_edges: usize,
+    view_mode: ViewMode,
 ) {
     let hint = match notice {
         Some(notice) => notice.to_string(),
         None => match (app.screen, app.pane) {
             (Screen::Graph, Pane::Graph) => {
-                let mut hint = "j/k move  h/l fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
-                    .to_string();
+                let mut hint = match view_mode {
+                    ViewMode::Rail => {
+                        "` canvas  j/k move  h/l fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
+                            .to_string()
+                    }
+                    ViewMode::Canvas => {
+                        "` rail  h/j/k/l move  zc/zo fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
+                            .to_string()
+                    }
+                };
                 if dropped_edges > 0 {
                     hint.push_str(&format!("  (+{dropped_edges} edges hidden, gutter capped)"));
                 }
@@ -917,7 +1248,7 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, app, notice, rail_scroll))
+            .draw(|frame| draw(frame, app, notice, rail_scroll, 0, ViewMode::Rail))
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let mut out = String::new();
@@ -969,7 +1300,7 @@ mod tests {
         app.reviewed.insert(NodeId::from("leaf"));
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, &app, None, 0))
+            .draw(|frame| draw(frame, &app, None, 0, 0, ViewMode::Rail))
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let dimmed = (0..buffer.area.height).any(|y| {
@@ -1381,5 +1712,172 @@ mod tests {
             text.contains("n0"),
             "focused row must be back on screen after scrolling up, got:\n{text}"
         );
+    }
+
+    // -- The canvas graph screen (issue #17) --------------------------------
+
+    /// `p1`/`p2` both depend on `child` -- a diamond top spread across one
+    /// band, converging on a single node in the next.
+    fn diamond_graph_fixture() -> ProjectGraph {
+        let p1 = NodeId::from("p1");
+        let p2 = NodeId::from("p2");
+        let child = NodeId::from("child");
+        let node = |id: &NodeId, name: &str| ModuleNode {
+            id: id.clone(),
+            display_name: name.to_string(),
+            parent: None,
+            children: vec![],
+            status: GitStatus::Modified,
+            files: vec![FileRef {
+                path: PathBuf::from(format!("{name}.rs")),
+                base_blob: Some("b".to_string()),
+                head_blob: Some("h".to_string()),
+            }],
+        };
+        let mut nodes = HashMap::new();
+        nodes.insert(p1.clone(), node(&p1, "p1"));
+        nodes.insert(p2.clone(), node(&p2, "p2"));
+        nodes.insert(child.clone(), node(&child, "child"));
+        ProjectGraph {
+            roots: vec![p1.clone(), p2.clone(), child.clone()],
+            nodes,
+            edges: vec![
+                DepEdge {
+                    from: p1,
+                    to: child.clone(),
+                    kind: DepKind::Use,
+                },
+                DepEdge {
+                    from: p2,
+                    to: child,
+                    kind: DepKind::Use,
+                },
+            ],
+        }
+    }
+
+    fn app_for(graph: ProjectGraph, focus: &str) -> App {
+        let layers = crate::graph::layers::assign_layers(&graph);
+        App {
+            graph,
+            layers,
+            rows: vec![],
+            focus: NodeId::from(focus),
+            screen: Screen::Graph,
+            diff: None,
+            picker: None,
+            show_tests: false,
+            file_view: None,
+            pane: Pane::Graph,
+            viewport_rows: 1,
+            reviewed: HashSet::new(),
+            findings: HashMap::new(),
+            comments: HashMap::new(),
+            fold_collapsed: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn canvas_view_lays_out_a_diamond_with_two_bands() {
+        let app = app_for(diamond_graph_fixture(), "child");
+        let view = build_canvas_view(&app);
+        assert_eq!(view.layout.bands.len(), 2);
+        assert_eq!(view.layout.bands[0].len(), 2, "p1/p2 share the top band");
+        assert_eq!(
+            view.layout.bands[1].len(),
+            1,
+            "child alone in the next band"
+        );
+        assert_eq!(view.channels.len(), 1);
+    }
+
+    #[test]
+    fn canvas_graph_renders_both_parent_names_and_the_child_and_a_bend() {
+        let app = app_for(diamond_graph_fixture(), "child");
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).expect("test backend");
+        terminal
+            .draw(|frame| draw(frame, &app, None, 0, 0, ViewMode::Canvas))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("p1"), "missing p1:\n{text}");
+        assert!(text.contains("p2"), "missing p2:\n{text}");
+        assert!(text.contains("child"), "missing child:\n{text}");
+        assert!(
+            text.contains('╮') || text.contains('╯') || text.contains('│'),
+            "expected at least one routed channel glyph, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn canvas_legend_advertises_the_view_toggle_and_fold_chord() {
+        let app = app_for(diamond_graph_fixture(), "child");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        terminal
+            .draw(|frame| draw(frame, &app, None, 0, 0, ViewMode::Canvas))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        assert!(text.contains('`'), "expected the view-toggle hint");
+        assert!(text.contains("zc/zo"), "expected the fold-chord hint");
+    }
+
+    #[test]
+    fn empty_canvas_shows_a_placeholder_without_panicking() {
+        let app = app_for(
+            ProjectGraph {
+                roots: vec![],
+                nodes: HashMap::new(),
+                edges: vec![],
+            },
+            "nobody",
+        );
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test backend");
+        terminal
+            .draw(|frame| draw(frame, &app, None, 0, 0, ViewMode::Canvas))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        assert!(text.contains("no visible nodes"));
+    }
+
+    #[test]
+    fn focus_canvas_line_and_canvas_line_count_agree_with_the_rendered_band() {
+        let app = app_for(diamond_graph_fixture(), "child");
+        let view = build_canvas_view(&app);
+        let focus_line = focus_canvas_line(&view, &NodeId::from("child")).expect("child visible");
+        // `child`'s band is the second one, after the top band's own label
+        // line plus the channel between them.
+        assert_eq!(focus_line, 1 + view.channels[0].height);
+        assert!(canvas_line_count(&view) > focus_line);
+    }
+
+    #[test]
+    fn canvas_focus_grid_matches_move_focus_over_the_diamond() {
+        let app = app_for(diamond_graph_fixture(), "p1");
+        let (layers, rows) = canvas_focus_grid(&app);
+        let target = crate::core::focus::move_focus(
+            &layers,
+            &rows,
+            &NodeId::from("p1"),
+            crate::core::focus::Direction::Down,
+        );
+        assert_eq!(target, NodeId::from("child"));
     }
 }

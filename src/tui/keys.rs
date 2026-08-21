@@ -49,7 +49,16 @@ pub fn crossterm_key_to_input(code: KeyCode, modifiers: KeyModifiers) -> Option<
     match code {
         KeyCode::Char(
             c @ ('h' | 'j' | 'k' | 'l' | 'g' | 'G' | 'd' | 'r' | 't' | 's' | 'c' | 'v' | 'f' | '['
-            | ']'),
+            | ']'
+            // `` ` `` and `z` aren't part of `crate::keymap::map_key`'s
+            // shared vocabulary at all -- both are intercepted directly by
+            // `crate::tui::handle_key` before `map_key` ever sees them
+            // (the view-mode toggle and the canvas view's `zc`/`zo` fold
+            // chord, respectively -- see that module's doc). Mapped here
+            // anyway, rather than left as `None`, for the same reason
+            // `Ctrl-e` is: so the interception check happens in the same
+            // `KeyInput`-typed comparison as every other binding.
+            | '`' | 'o' | 'z'),
         ) => Some(KeyInput::Char(c)),
         KeyCode::Enter => Some(KeyInput::Enter),
         KeyCode::Esc => Some(KeyInput::Esc),
@@ -90,6 +99,9 @@ mod tests {
             ('f', KeyInput::Char('f')),
             ('[', KeyInput::Char('[')),
             (']', KeyInput::Char(']')),
+            ('`', KeyInput::Char('`')),
+            ('z', KeyInput::Char('z')),
+            ('o', KeyInput::Char('o')),
         ];
         for (c, expected) in cases {
             assert_eq!(
@@ -140,7 +152,7 @@ mod tests {
     fn unmapped_keys_translate_to_none() {
         for code in [
             KeyCode::Char('a'),
-            KeyCode::Char('z'),
+            KeyCode::Char('q'),
             KeyCode::Char('1'),
             KeyCode::Tab,
             KeyCode::Backspace,

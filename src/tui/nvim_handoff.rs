@@ -11,6 +11,22 @@
 //! restores both -- in that order even if `nvim` fails to spawn at all, so
 //! a missing binary never leaves the terminal in a half-restored state for
 //! the caller to clean up.
+//!
+//! # Working directory (issue #17's comment-flow fix)
+//!
+//! The spawned `nvim` is given `current_dir` = the repo root, not whatever
+//! directory vdiff itself happened to be launched from. Without this, a
+//! user running `vdiff --tui` from somewhere other than the repo root
+//! (a worktree, a subdirectory, ...) would hand off to an `nvim` whose
+//! *own* working directory disagreed with the repo `vdiff.nvim`'s
+//! `:VdiffComment` flow resolves paths/`comments.json` against (see
+//! `crate::review::store::comments_path`, which is keyed off the git dir) --
+//! so a comment captured through this handoff could silently land against
+//! the wrong repo, or `vdiff.nvim` could fail to find the repo at all. This
+//! is exactly the bug the issue's companion fix calls out: the handoff
+//! spawned bare `nvim +line <path>` with no working directory of its own,
+//! inheriting whatever the shell that launched `vdiff` happened to be
+//! sitting in.
 
 use std::io;
 use std::path::Path;
@@ -22,7 +38,8 @@ use crossterm::terminal::{
 use crossterm::ExecutableCommand;
 
 /// Suspend the TUI, run `nvim +<line> <path>` (or just `nvim <path>` if
-/// `line` is `None`) to completion, then resume. Returns an error if
+/// `line` is `None`) to completion with its working directory set to
+/// `repo_root` (see the module doc), then resume. Returns an error if
 /// either terminal-mode transition fails, or if `nvim` itself couldn't be
 /// spawned (e.g. not on `PATH` -- callers should check
 /// [`crate::nvim::session::nvim_available`] before offering this binding at
@@ -30,11 +47,12 @@ use crossterm::ExecutableCommand;
 /// assumed impossible). A nonzero `nvim` exit status is not itself an
 /// error -- the user may have `:cquit`ed or the file may not have existed;
 /// either way there's nothing further for vdiff to do but resume.
-pub fn suspend_and_run(path: &Path, line: Option<u32>) -> io::Result<()> {
+pub fn suspend_and_run(path: &Path, line: Option<u32>, repo_root: &Path) -> io::Result<()> {
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
 
     let mut command = Command::new("nvim");
+    command.current_dir(repo_root);
     if let Some(line) = line {
         command.arg(format!("+{line}"));
     }
