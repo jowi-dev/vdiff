@@ -30,16 +30,20 @@ nix build
 nix develop
 ```
 
-The `gui` Cargo feature (on by default) gates the egui/eframe GUI. A
-`--no-default-features` build is headless: no window ever opens, and
-`--dump`/`--export-comments`/`--publish-comments` are the only usable
-entry points -- any invocation that would otherwise launch the GUI (bare
-`vdiff`, `--smoke`, `--pr` without a headless flag, ...) exits 1 with a
-message naming the missing feature instead.
+Two Cargo features gate the two frontends, both on by default and
+independent of each other: `gui` (the egui/eframe graph-canvas GUI) and
+`tui` (a ratatui/crossterm terminal UI -- `--tui` -- showing one module's
+focused neighborhood, nix-tree style, rather than the full graph canvas). A
+`--no-default-features` build is fully headless: no window or terminal UI
+ever opens, and `--dump`/`--export-comments`/`--publish-comments` are the
+only usable entry points -- any invocation that would otherwise launch a
+frontend (bare `vdiff`, `--tui`, `--smoke`, `--pr` without a headless flag,
+...) exits 1 with a message naming the missing feature instead.
 
 ```sh
-cargo build --release --no-default-features   # headless CLI only, no egui/eframe/syntect in the dependency tree
-cargo check --no-default-features              # verify the headless build stays compiling as CI/local check
+cargo build --release --no-default-features            # headless CLI only, no egui/eframe/ratatui/syntect in the dependency tree
+cargo build --release --no-default-features --features tui  # terminal UI only, no egui/eframe
+cargo check --no-default-features                        # verify the headless build stays compiling as CI/local check
 ```
 
 ## Quickstart
@@ -48,7 +52,16 @@ cargo check --no-default-features              # verify the headless build stays
 vdiff                  # open the graph for the current repo's change set; file panes are a real embedded Neovim
 vdiff --no-nvim        # same, but file panes use the built-in read-only viewer instead
 vdiff --base main      # diff against a specific ref instead of the detected default branch
+vdiff --tui            # terminal UI instead: one module's focused neighborhood at a time
 ```
+
+The terminal UI (`--tui`) reuses the same vim-style navigation and diff/
+file panes as the GUI, but shows a focused module plus its direct
+dependencies/dependents rather than the whole graph canvas at once (no
+terminal UI toolkit has a production nested-DAG widget, so this follows
+the `nix-tree` drill-in/out pattern instead). It has no embedded Neovim
+grid; `Ctrl-e` on the file pane instead suspends the TUI and hands off to
+a real `nvim` process (lazygit-style), resuming when it exits.
 
 `--pr <url>` (reviewing a GitHub PR directly) is on the roadmap, not
 available yet.

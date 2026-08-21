@@ -11,9 +11,7 @@ use std::sync::OnceLock;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{
-    Color as SynColor, FontStyle, Style as SynStyle, Theme, ThemeSet,
-};
+use syntect::highlighting::{Color as SynColor, FontStyle, Style as SynStyle, Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 /// The bundled default syntax/theme sets, loaded once per process --
@@ -59,7 +57,12 @@ pub fn highlight_line(path: &Path, line: &str) -> Vec<Span<'static>> {
 
     ranges
         .into_iter()
-        .map(|(style, text)| Span::styled(text.trim_end_matches('\n').to_string(), to_ratatui_style(style)))
+        .map(|(style, text)| {
+            Span::styled(
+                text.trim_end_matches('\n').to_string(),
+                to_ratatui_style(style),
+            )
+        })
         .collect()
 }
 

@@ -155,7 +155,9 @@ mod tests {
             repo: Box::new(repo),
             base_oid: "base-oid".to_string(),
         };
-        let state = loader.load_diff(&graph, &NodeId::from("rust:demo")).unwrap();
+        let state = loader
+            .load_diff(&graph, &NodeId::from("rust:demo"))
+            .unwrap();
         assert_eq!(state.files.len(), 1);
         assert_eq!(state.files[0].diff.base_lines, vec!["before"]);
         assert_eq!(state.files[0].diff.head_lines, vec!["after"]);

@@ -50,12 +50,15 @@
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
-          # Verifies the headless build (issue #15's `gui` feature, off via
+          # Verifies the fully headless build (issue #15's `gui` feature
+          # *and* issue #16's `tui` feature, both off via
           # `--no-default-features`) keeps compiling and passing its own
-          # tests, with no egui/eframe/syntect in the dependency tree at
-          # all -- a plain `packages.default` build always has `gui` on
-          # (Cargo's default), so it alone would never catch a headless
-          # regression.
+          # tests, with no egui/eframe/ratatui/crossterm/syntect in the
+          # dependency tree at all -- a plain `packages.default` build
+          # always has both on (Cargo's default), so it alone would never
+          # catch a headless regression. Building with just one of the two
+          # off (`--features tui`/`--features gui` alone) is exercised by
+          # `cargo check`/`clippy` in CI, not a separate flake check.
           nativeCheckInputs = [ pkgs.git ];
           buildPhase = "cargo check --no-default-features --offline";
           checkPhase = "cargo test --no-default-features --offline";

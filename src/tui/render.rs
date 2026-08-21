@@ -169,7 +169,9 @@ fn draw_node_list(frame: &mut Frame, area: Rect, title: &str, ids: &[NodeId], ap
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
-        ids.iter().map(|id| ListItem::new(node_line(app, id))).collect()
+        ids.iter()
+            .map(|id| ListItem::new(node_line(app, id)))
+            .collect()
     };
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(list, area);
@@ -285,22 +287,38 @@ fn draw_diff_unified(
             let line = match *pair {
                 LinePair::Unchanged { head, .. } => diff_line(
                     " ",
-                    file.diff.head_lines.get(head as usize).map(String::as_str).unwrap_or(""),
+                    file.diff
+                        .head_lines
+                        .get(head as usize)
+                        .map(String::as_str)
+                        .unwrap_or(""),
                     Color::Gray,
                 ),
                 LinePair::Added { head } => diff_line(
                     "+",
-                    file.diff.head_lines.get(head as usize).map(String::as_str).unwrap_or(""),
+                    file.diff
+                        .head_lines
+                        .get(head as usize)
+                        .map(String::as_str)
+                        .unwrap_or(""),
                     Color::Green,
                 ),
                 LinePair::Removed { base } => diff_line(
                     "-",
-                    file.diff.base_lines.get(base as usize).map(String::as_str).unwrap_or(""),
+                    file.diff
+                        .base_lines
+                        .get(base as usize)
+                        .map(String::as_str)
+                        .unwrap_or(""),
                     Color::Red,
                 ),
                 LinePair::Changed { head, .. } => diff_line(
                     "~",
-                    file.diff.head_lines.get(head as usize).map(String::as_str).unwrap_or(""),
+                    file.diff
+                        .head_lines
+                        .get(head as usize)
+                        .map(String::as_str)
+                        .unwrap_or(""),
                     Color::Yellow,
                 ),
             };
@@ -309,9 +327,13 @@ fn draw_diff_unified(
     }
     let skip = diff.scroll_row.min(lines.len());
     let visible: Vec<Line> = lines.into_iter().skip(skip).collect();
-    let block = Block::default().borders(Borders::ALL).title(title.to_string());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_string());
     frame.render_widget(
-        Paragraph::new(visible).block(block).wrap(Wrap { trim: false }),
+        Paragraph::new(visible)
+            .block(block)
+            .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -339,12 +361,20 @@ fn draw_diff_side_by_side(
                 LinePair::Unchanged { base, head } => {
                     base_lines.push(diff_line(
                         " ",
-                        file.diff.base_lines.get(base as usize).map(String::as_str).unwrap_or(""),
+                        file.diff
+                            .base_lines
+                            .get(base as usize)
+                            .map(String::as_str)
+                            .unwrap_or(""),
                         Color::Gray,
                     ));
                     head_lines.push(diff_line(
                         " ",
-                        file.diff.head_lines.get(head as usize).map(String::as_str).unwrap_or(""),
+                        file.diff
+                            .head_lines
+                            .get(head as usize)
+                            .map(String::as_str)
+                            .unwrap_or(""),
                         Color::Gray,
                     ));
                 }
@@ -352,14 +382,22 @@ fn draw_diff_side_by_side(
                     base_lines.push(Line::from(""));
                     head_lines.push(diff_line(
                         "+",
-                        file.diff.head_lines.get(head as usize).map(String::as_str).unwrap_or(""),
+                        file.diff
+                            .head_lines
+                            .get(head as usize)
+                            .map(String::as_str)
+                            .unwrap_or(""),
                         Color::Green,
                     ));
                 }
                 LinePair::Removed { base } => {
                     base_lines.push(diff_line(
                         "-",
-                        file.diff.base_lines.get(base as usize).map(String::as_str).unwrap_or(""),
+                        file.diff
+                            .base_lines
+                            .get(base as usize)
+                            .map(String::as_str)
+                            .unwrap_or(""),
                         Color::Red,
                     ));
                     head_lines.push(Line::from(""));
@@ -367,12 +405,20 @@ fn draw_diff_side_by_side(
                 LinePair::Changed { base, head } => {
                     base_lines.push(diff_line(
                         "~",
-                        file.diff.base_lines.get(base as usize).map(String::as_str).unwrap_or(""),
+                        file.diff
+                            .base_lines
+                            .get(base as usize)
+                            .map(String::as_str)
+                            .unwrap_or(""),
                         Color::Yellow,
                     ));
                     head_lines.push(diff_line(
                         "~",
-                        file.diff.head_lines.get(head as usize).map(String::as_str).unwrap_or(""),
+                        file.diff
+                            .head_lines
+                            .get(head as usize)
+                            .map(String::as_str)
+                            .unwrap_or(""),
                         Color::Yellow,
                     ));
                 }
@@ -390,11 +436,15 @@ fn draw_diff_side_by_side(
         .borders(Borders::ALL)
         .title(format!("{title} (head)"));
     frame.render_widget(
-        Paragraph::new(base_visible).block(base_block).wrap(Wrap { trim: false }),
+        Paragraph::new(base_visible)
+            .block(base_block)
+            .wrap(Wrap { trim: false }),
         cols[0],
     );
     frame.render_widget(
-        Paragraph::new(head_visible).block(head_block).wrap(Wrap { trim: false }),
+        Paragraph::new(head_visible)
+            .block(head_block)
+            .wrap(Wrap { trim: false }),
         cols[1],
     );
 }
@@ -501,7 +551,10 @@ mod tests {
 
         let mut nodes = HashMap::new();
         nodes.insert(leaf.clone(), node(&leaf, "leaf", GitStatus::Modified));
-        nodes.insert(target.clone(), node(&target, "target", GitStatus::Unchanged));
+        nodes.insert(
+            target.clone(),
+            node(&target, "target", GitStatus::Unchanged),
+        );
 
         ProjectGraph {
             roots: vec![leaf.clone(), target.clone()],
@@ -569,7 +622,10 @@ mod tests {
     fn neighborhood_view_shows_dependents_column() {
         let app = app_at("target");
         let text = render_to_string(&app);
-        assert!(text.contains("Called by"), "dependents column title missing");
+        assert!(
+            text.contains("Called by"),
+            "dependents column title missing"
+        );
         assert!(text.contains("leaf"), "dependent name missing");
     }
 
@@ -621,10 +677,7 @@ mod tests {
                 path: PathBuf::from("leaf.rs"),
                 diff: FileDiff {
                     hunks: vec![DiffHunk {
-                        lines: vec![
-                            LinePair::Removed { base: 0 },
-                            LinePair::Added { head: 0 },
-                        ],
+                        lines: vec![LinePair::Removed { base: 0 }, LinePair::Added { head: 0 }],
                     }],
                     base_lines: vec!["old line".to_string()],
                     head_lines: vec!["new line".to_string()],

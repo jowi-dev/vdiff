@@ -47,8 +47,10 @@ pub fn crossterm_key_to_input(code: KeyCode, modifiers: KeyModifiers) -> Option<
         };
     }
     match code {
-        KeyCode::Char(c @ ('h' | 'j' | 'k' | 'l' | 'g' | 'G' | 'd' | 'r' | 't' | 's' | 'c' | 'v'
-        | 'f' | '[' | ']')) => Some(KeyInput::Char(c)),
+        KeyCode::Char(
+            c @ ('h' | 'j' | 'k' | 'l' | 'g' | 'G' | 'd' | 'r' | 't' | 's' | 'c' | 'v' | 'f' | '['
+            | ']'),
+        ) => Some(KeyInput::Char(c)),
         KeyCode::Enter => Some(KeyInput::Enter),
         KeyCode::Esc => Some(KeyInput::Esc),
         _ => None,

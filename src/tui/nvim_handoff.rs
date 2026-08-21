@@ -16,7 +16,9 @@ use std::io;
 use std::path::Path;
 use std::process::Command;
 
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use crossterm::ExecutableCommand;
 
 /// Suspend the TUI, run `nvim +<line> <path>` (or just `nvim <path>` if
