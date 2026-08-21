@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 pub use crate::core::diff_state::DiffPaneState;
 use crate::core::file_view::FileViewState;
 use crate::core::focus::{dep_targets, dependent_sources, move_focus, Direction};
+use crate::core::rail_view::{self, RailDirection};
 use crate::core::review;
 use crate::graph::layout::{layout, rows_with_x_centers};
 use crate::graph::model::{NodeId, ProjectGraph};
@@ -139,6 +140,16 @@ pub struct App {
     /// reloads the store (e.g. after a `vdiff_comment_saved` notification
     /// from the embedded nvim session).
     pub comments: HashMap<NodeId, Vec<Comment>>,
+    /// The `--tui` rail view's fold-by-namespace state (issue #16 phase 2):
+    /// the set of namespace node ids currently collapsed to a single row.
+    /// Empty by default -- the rail view opens fully expanded, matching its
+    /// "big picture first" design (see `crate::core::rail_view`'s module
+    /// doc for why this lives on `App` rather than as TUI-local state, the
+    /// way [`crate::tui::TuiState::notice`] does). Always empty on the GUI
+    /// path, which never collapses anything -- every
+    /// [`crate::core::rail_view`] function is the identity transform when
+    /// this is empty, so its presence has no GUI-visible effect.
+    pub fold_collapsed: HashSet<NodeId>,
 }
 
 impl App {
@@ -329,6 +340,41 @@ pub enum Msg {
     /// toggle actually did something, so a `v` on an unchanged node (or off
     /// the graph pane) never triggers a save.
     ToggleReviewed,
+    /// `j`/`k` on the `--tui` rail view: move focus up/down the fold-aware
+    /// visible row list (see [`crate::core::rail_view::visible_rows`]),
+    /// rather than the layer/x-center-nearest logic [`Msg::FocusMove`] uses
+    /// for the GUI's neighborhood navigation -- see `crate::tui::mod`'s doc
+    /// for why the rail view needs a distinct message instead of reusing
+    /// `FocusMove` with changed semantics (in short: `map_key`/`FocusMove`
+    /// are shared with the GUI, which must keep its own h/j/k/l behavior
+    /// unchanged). Only acted on on [`Screen::Graph`]/[`Pane::Graph`] with
+    /// no picker open, matching every other graph-pane message. A no-op at
+    /// either end of the row list, or if `focus` isn't currently in
+    /// `visible_rows` at all (shouldn't happen, but defended rather than
+    /// panicking).
+    RailFocusMove(RailDirection),
+    /// `h` on the `--tui` rail view: collapse the namespace immediately
+    /// containing the focused row (see
+    /// [`crate::core::rail_view::RailRow`]'s doc). If `focus` already names
+    /// a *collapsed* namespace row, this collapses that namespace's own
+    /// parent instead -- both cases resolve identically, since collapsing
+    /// works off `App.graph.node(focus).parent` regardless of whether
+    /// `focus` is a plain drawn node or a previously-collapsed namespace
+    /// id, letting repeated `h` zoom out one namespace layer at a time. A
+    /// no-op if the focused row has no parent namespace to collapse into
+    /// (it's already top-level). Only acted on on
+    /// [`Screen::Graph`]/[`Pane::Graph`] with no picker open. Focus re-seats
+    /// onto the resulting collapsed row.
+    CollapseFocusedNamespace,
+    /// `l` on the `--tui` rail view: expand the namespace `focus` currently
+    /// names -- a no-op unless `focus` is actually a collapsed row (i.e.
+    /// present in [`App::fold_collapsed`]). Focus re-seats onto the first
+    /// now-visible row that was inside the expanded namespace (see
+    /// [`crate::core::rail_view::first_visible_descendant`]), mirroring the
+    /// GUI's `toggle_tests` re-seat precedent for a fold operation that can
+    /// drop the currently focused row out of existence. Only acted on on
+    /// [`Screen::Graph`]/[`Pane::Graph`] with no picker open.
+    ExpandFocusedNamespace,
 }
 
 /// I/O the caller should perform as a result of [`update`]. `update` never
@@ -520,7 +566,67 @@ pub fn update(mut app: App, msg: Msg) -> (App, Cmd) {
         }
         Msg::GoToTest => go_to_test(app),
         Msg::ToggleReviewed => toggle_reviewed(app),
+        Msg::RailFocusMove(dir) => rail_focus_move(app, dir),
+        Msg::CollapseFocusedNamespace => collapse_focused_namespace(app),
+        Msg::ExpandFocusedNamespace => expand_focused_namespace(app),
     }
+}
+
+/// Handle [`Msg::RailFocusMove`]: step `focus` to the previous/next entry
+/// in [`rail_view::visible_rows`]'s flattened list. See that message's own
+/// doc for why this doesn't reuse [`move_focus`].
+fn rail_focus_move(mut app: App, dir: RailDirection) -> (App, Cmd) {
+    if !on_graph_with_no_picker_and_graph_pane(&app) {
+        return (app, Cmd::None);
+    }
+    let rows = rail_view::visible_rows(&app.graph, &app.layers, &app.fold_collapsed);
+    let Some(pos) = rows.iter().position(|row| row.id() == &app.focus) else {
+        return (app, Cmd::None);
+    };
+    let new_pos = match dir {
+        RailDirection::Up => pos.checked_sub(1),
+        RailDirection::Down => {
+            let next = pos + 1;
+            (next < rows.len()).then_some(next)
+        }
+    };
+    let Some(new_pos) = new_pos else {
+        return (app, Cmd::None);
+    };
+    let old_focus = app.focus.clone();
+    app.focus = rows[new_pos].id().clone();
+    let cmd = reload_file_on_focus_change(&app, &old_focus);
+    (app, cmd)
+}
+
+/// Handle [`Msg::CollapseFocusedNamespace`]. See that message's own doc.
+fn collapse_focused_namespace(mut app: App) -> (App, Cmd) {
+    if !on_graph_with_no_picker_and_graph_pane(&app) {
+        return (app, Cmd::None);
+    }
+    let Some(parent) = app.graph.node(&app.focus).and_then(|n| n.parent.clone()) else {
+        return (app, Cmd::None);
+    };
+    app.fold_collapsed.insert(parent.clone());
+    app.focus = parent;
+    (app, Cmd::None)
+}
+
+/// Handle [`Msg::ExpandFocusedNamespace`]. See that message's own doc.
+fn expand_focused_namespace(mut app: App) -> (App, Cmd) {
+    if !on_graph_with_no_picker_and_graph_pane(&app) {
+        return (app, Cmd::None);
+    }
+    if !app.fold_collapsed.remove(&app.focus) {
+        return (app, Cmd::None);
+    }
+    let namespace = app.focus.clone();
+    if let Some(reseated) =
+        rail_view::first_visible_descendant(&app.graph, &namespace, &app.fold_collapsed)
+    {
+        app.focus = reseated;
+    }
+    (app, Cmd::None)
 }
 
 /// Handle [`Msg::ToggleReviewed`]: only on [`Screen::Graph`]/[`Pane::Graph`]
@@ -848,6 +954,7 @@ mod tests {
             reviewed: HashSet::new(),
             findings: HashMap::new(),
             comments: HashMap::new(),
+            fold_collapsed: HashSet::new(),
         }
     }
 
@@ -1382,6 +1489,7 @@ mod tests {
             reviewed: HashSet::new(),
             findings: HashMap::new(),
             comments: HashMap::new(),
+            fold_collapsed: HashSet::new(),
         };
         assert!(!app
             .layers
@@ -1423,6 +1531,7 @@ mod tests {
             reviewed: HashSet::new(),
             findings: HashMap::new(),
             comments: HashMap::new(),
+            fold_collapsed: HashSet::new(),
         };
 
         let (app, cmd) = update(app, Msg::ToggleTests);
@@ -1601,6 +1710,7 @@ mod tests {
             reviewed: HashSet::new(),
             findings: HashMap::new(),
             comments: HashMap::new(),
+            fold_collapsed: HashSet::new(),
         }
     }
 
@@ -1843,5 +1953,126 @@ mod tests {
         let (app, cmd) = update(app, Msg::PickerSelect);
         assert_eq!(app.focus, NodeId::from("target_y"));
         assert_eq!(cmd, Cmd::LoadFile(NodeId::from("target_y")));
+    }
+
+    /// `leaf_a`/`leaf_b` share a synthetic namespace parent (`root`),
+    /// `target_x/y/z` are top-level (no namespace to collapse into) --
+    /// enough to exercise `CollapseFocusedNamespace`/`ExpandFocusedNamespace`
+    /// against both a node with a collapsible parent and one without.
+    fn app_for_fold() -> App {
+        app_at("leaf_a")
+    }
+
+    #[test]
+    fn collapse_focused_namespace_collapses_the_parent_and_reseats_focus() {
+        let app = app_for_fold();
+        let (app, cmd) = update(app, Msg::CollapseFocusedNamespace);
+        assert_eq!(app.focus, NodeId::from("root"));
+        assert!(app.fold_collapsed.contains(&NodeId::from("root")));
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn collapse_focused_namespace_noop_with_no_parent_to_collapse_into() {
+        let app = app_at("target_x");
+        let (app, _) = update(app, Msg::CollapseFocusedNamespace);
+        assert_eq!(app.focus, NodeId::from("target_x"));
+        assert!(app.fold_collapsed.is_empty());
+    }
+
+    #[test]
+    fn collapse_focused_namespace_noop_when_picker_open() {
+        let mut app = app_for_fold();
+        app.picker = Some(EdgePicker {
+            candidates: vec![NodeId::from("target_x")],
+            selected: 0,
+        });
+        let (app, _) = update(app, Msg::CollapseFocusedNamespace);
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
+        assert!(app.fold_collapsed.is_empty());
+    }
+
+    #[test]
+    fn collapse_focused_namespace_on_an_already_collapsed_row_climbs_one_level_further() {
+        // `root` itself has no parent (it's top-level), so collapsing again
+        // while focus already names the collapsed namespace is a no-op --
+        // there's nothing further out to fold into.
+        let mut app = app_for_fold();
+        app.fold_collapsed.insert(NodeId::from("root"));
+        app.focus = NodeId::from("root");
+        let (app, _) = update(app, Msg::CollapseFocusedNamespace);
+        assert_eq!(app.focus, NodeId::from("root"));
+    }
+
+    #[test]
+    fn expand_focused_namespace_reseats_onto_the_first_visible_descendant() {
+        let mut app = app_for_fold();
+        app.fold_collapsed.insert(NodeId::from("root"));
+        app.focus = NodeId::from("root");
+
+        let (app, cmd) = update(app, Msg::ExpandFocusedNamespace);
+
+        assert!(!app.fold_collapsed.contains(&NodeId::from("root")));
+        assert_eq!(app.focus, NodeId::from("leaf_a"), "name-first child");
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn expand_focused_namespace_noop_when_focus_is_not_collapsed() {
+        let app = app_for_fold();
+        let (app, _) = update(app, Msg::ExpandFocusedNamespace);
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
+        assert!(app.fold_collapsed.is_empty());
+    }
+
+    #[test]
+    fn rail_focus_move_steps_down_the_visible_row_list() {
+        // `layers_fixture`'s visible rows (fully expanded) are exactly
+        // `app.layers` flattened: [leaf_a, leaf_b, target_x, target_y,
+        // target_z].
+        let app = app_for_fold();
+        let (app, _) = update(app, Msg::RailFocusMove(RailDirection::Down));
+        assert_eq!(app.focus, NodeId::from("leaf_b"));
+    }
+
+    #[test]
+    fn rail_focus_move_up_from_the_first_row_is_a_noop() {
+        let app = app_for_fold();
+        let (app, _) = update(app, Msg::RailFocusMove(RailDirection::Up));
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
+    }
+
+    #[test]
+    fn rail_focus_move_down_from_the_last_row_is_a_noop() {
+        let app = app_at("target_z");
+        let (app, _) = update(app, Msg::RailFocusMove(RailDirection::Down));
+        assert_eq!(app.focus, NodeId::from("target_z"));
+    }
+
+    #[test]
+    fn rail_focus_move_skips_over_a_collapsed_namespace_as_one_step() {
+        let mut app = app_for_fold();
+        app.fold_collapsed.insert(NodeId::from("root"));
+        app.focus = NodeId::from("root");
+        let (app, _) = update(app, Msg::RailFocusMove(RailDirection::Down));
+        assert_eq!(app.focus, NodeId::from("target_x"));
+    }
+
+    #[test]
+    fn rail_focus_move_reloads_file_when_file_view_open() {
+        let mut app = app_for_fold();
+        app.file_view = Some(empty_file_view("leaf_a"));
+        let (app, cmd) = update(app, Msg::RailFocusMove(RailDirection::Down));
+        assert_eq!(app.focus, NodeId::from("leaf_b"));
+        assert_eq!(cmd, Cmd::LoadFile(NodeId::from("leaf_b")));
+    }
+
+    #[test]
+    fn rail_focus_move_noop_off_graph_pane() {
+        let mut app = app_for_fold();
+        app.pane = Pane::File;
+        let (app, cmd) = update(app, Msg::RailFocusMove(RailDirection::Down));
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
+        assert_eq!(cmd, Cmd::None);
     }
 }

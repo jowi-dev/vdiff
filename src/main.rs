@@ -671,6 +671,7 @@ fn build_initial_app(
         reviewed,
         findings,
         comments,
+        fold_collapsed: std::collections::HashSet::new(),
     };
     (app, review_store, layout_result)
 }

@@ -411,6 +411,7 @@ mod tests {
             reviewed: std::collections::HashSet::new(),
             findings: std::collections::HashMap::new(),
             comments: std::collections::HashMap::new(),
+            fold_collapsed: std::collections::HashSet::new(),
         }
     }
 

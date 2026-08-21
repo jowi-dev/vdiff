@@ -396,6 +396,7 @@ mod tests {
             reviewed: HashSet::new(),
             findings: HashMap::new(),
             comments: HashMap::new(),
+            fold_collapsed: HashSet::new(),
         };
         TuiState {
             app,

@@ -202,7 +202,12 @@ fn layout_spans(spans: &[Span], row_count: usize, focus: &NodeId) -> RailLayout 
         } else {
             RailRole::Normal
         };
-        for row in span.from_row..=span.to_row {
+        for (row, cells) in rows
+            .iter_mut()
+            .enumerate()
+            .take(span.to_row + 1)
+            .skip(span.from_row)
+        {
             let glyph = if row == span.from_row {
                 '╮'
             } else if row == span.to_row {
@@ -210,7 +215,7 @@ fn layout_spans(spans: &[Span], row_count: usize, focus: &NodeId) -> RailLayout 
             } else {
                 '│'
             };
-            rows[row].push(RailCell {
+            cells.push(RailCell {
                 column: a.column,
                 glyph,
                 role,
@@ -240,7 +245,7 @@ mod tests {
         (NodeId::from(from), NodeId::from(to))
     }
 
-    fn cell_at<'a>(rows: &'a [Vec<RailCell>], row: usize, column: usize) -> Option<&'a RailCell> {
+    fn cell_at(rows: &[Vec<RailCell>], row: usize, column: usize) -> Option<&RailCell> {
         rows[row].iter().find(|c| c.column == column)
     }
 
