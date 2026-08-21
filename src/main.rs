@@ -192,12 +192,24 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
                 cli.smoke,
                 cli.nvim,
                 cli.nvim_cmd.clone(),
-                repo,
-                base_oid,
+                DiffSource { repo, base_oid },
                 review_setup,
             )
         }
     }
+}
+
+/// [`launch_gui`]'s `repo`/`base_oid` pair, bundled so `launch_gui` stays
+/// at clippy's 7-argument limit -- the same reason [`ReviewSetup`] exists.
+/// Named for what it is to `launch_gui`'s headless (`not(feature = "gui")`)
+/// twin, which never touches either field: on the `gui` build this is
+/// exactly [`DiffLoader`]'s two fields before they're wrapped in that type
+/// (which only exists behind the `gui` feature, so can't be built at this
+/// call site in a headless build).
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+struct DiffSource {
+    repo: Box<dyn GitRepo>,
+    base_oid: String,
 }
 
 /// The `--dump`/`--export-comments`/`--publish-comments`-less default
@@ -205,8 +217,8 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
 /// `#[cfg]`-ing `run_gui`'s body in place) so the `--no-default-features`
 /// headless build -- which has no `egui`/`eframe`/[`vdiff::ui`] at all --
 /// still compiles this call site: [`DiffLoader`] only exists behind the
-/// `gui` feature, so `repo`/`base_oid` are threaded through here instead of
-/// being bundled into it before the call.
+/// `gui` feature, so `diff_source` is threaded through here instead of
+/// being turned into one before the call.
 #[cfg(feature = "gui")]
 fn launch_gui(
     graph: ProjectGraph,
@@ -214,8 +226,7 @@ fn launch_gui(
     smoke: bool,
     want_nvim: bool,
     nvim_cmd: Vec<String>,
-    repo: Box<dyn GitRepo>,
-    base_oid: String,
+    diff_source: DiffSource,
     review_setup: ReviewSetup,
 ) -> ExitCode {
     run_gui(
@@ -224,7 +235,10 @@ fn launch_gui(
         smoke,
         want_nvim,
         nvim_cmd,
-        DiffLoader { repo, base_oid },
+        DiffLoader {
+            repo: diff_source.repo,
+            base_oid: diff_source.base_oid,
+        },
         review_setup,
     )
 }
@@ -242,8 +256,7 @@ fn launch_gui(
     _smoke: bool,
     _want_nvim: bool,
     _nvim_cmd: Vec<String>,
-    _repo: Box<dyn GitRepo>,
-    _base_oid: String,
+    _diff_source: DiffSource,
     _review_setup: ReviewSetup,
 ) -> ExitCode {
     eprintln!(
