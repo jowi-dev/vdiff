@@ -503,9 +503,9 @@ fn event_loop(
 /// happens to overwrite it.
 ///
 /// `q` quits (unless the edge-picker overlay is open, so `Esc` has first
-/// say over closing that instead); `Ctrl-e` on the file pane requests
-/// [`KeyAction::EditInNvim`] instead of dispatching through `map_key` (see
-/// [`should_edit_in_nvim`]); `h`/`j`/`k`/`l` on the rail view (see
+/// say over closing that instead); `Ctrl-e` *or* `c` on the file pane
+/// requests [`KeyAction::EditInNvim`] instead of dispatching through
+/// `map_key` (see [`should_edit_in_nvim`]); `h`/`j`/`k`/`l` on the rail view (see
 /// [`rail_key_msg`]) dispatch the rail-specific messages directly, bypassing
 /// `map_key` entirely -- see this module's own doc for why (in short:
 /// `map_key` is shared with the GUI, whose `h`/`j`/`k`/`l` must keep their
@@ -613,11 +613,32 @@ fn diff_target(app: &App) -> crate::graph::model::NodeId {
 }
 
 /// Whether `input` should trigger [`KeyAction::EditInNvim`] instead of the
-/// normal `map_key` pipeline: `Ctrl-e` on the file pane, with no chord in
-/// progress (so a chord that happens to end in some future `e` binding, if
-/// one is ever added, isn't shadowed).
+/// normal `map_key` pipeline: `Ctrl-e` *or* `c` on the file pane, with no
+/// chord in progress (so `]c`/`[c`, which also end in a `c`, aren't
+/// shadowed -- see [`crate::keymap::map_key`]'s `Pending::Char(']')`/
+/// `Pending::Char('[')` arms for [`Pane::File`]).
+///
+/// `c` here is issue #17's companion fix: the issue asks for a handoff "on
+/// a node with files, or in the file pane" -- the graph pane's `c` already
+/// goes through `Msg::CommentNode`/`Cmd::CommentNode` (see
+/// [`TuiState::execute`]'s arm and [`TuiState::comment_nvim_target`]), but
+/// `crate::keymap::map_key`'s own `Pane::File` arm has no `c` binding at
+/// all (deliberately left unbound there rather than added to shared
+/// `map_key`, which the GUI also uses and must stay untouched -- see this
+/// module's own doc on why TUI-only meanings for a key are intercepted
+/// here instead of grown into `map_key` as a context flag). Without this
+/// check `c` on the file pane would be a silent dead key. Handled by the
+/// same [`nvim_edit_target`] as `Ctrl-e` -- the file pane's own established
+/// cursor position (`FileViewState::scroll_row`) is strictly better than
+/// the graph-pane path's first-file/line-1 fallback, so there's no reason
+/// for the two to differ. Both share the same reload-on-resume path (see
+/// [`TuiState::reload_comments`]) once `event_loop` returns from the
+/// handoff -- from `map_key`/`update`'s point of view they're two
+/// different routes to the exact same `KeyAction::EditInNvim`.
 fn should_edit_in_nvim(state: &TuiState, input: KeyInput) -> bool {
-    input == KeyInput::Ctrl('e') && state.app.pane == Pane::File && state.pending_key.is_none()
+    (input == KeyInput::Ctrl('e') || input == KeyInput::Char('c'))
+        && state.app.pane == Pane::File
+        && state.pending_key.is_none()
 }
 
 /// Whether `input` is the [`ViewMode`] toggle: backtick, on the graph
@@ -812,6 +833,70 @@ mod tests {
             }
             other => panic!("expected an nvim handoff, got a different action: {other:?}"),
         }
+    }
+
+    /// Issue #17's companion fix: `c` on the file pane (not just the graph
+    /// pane) hands off to nvim, mirroring `Ctrl-e`'s own file-pane handoff
+    /// exactly (same [`nvim_edit_target`]) -- see [`should_edit_in_nvim`]'s
+    /// doc. Before this fix, `crate::keymap::map_key`'s `Pane::File` arm had
+    /// no `c` binding at all, so this was a silent dead key.
+    #[test]
+    fn pressing_c_on_the_file_pane_requests_an_nvim_handoff_at_the_current_scroll_position() {
+        use crate::core::file_view::{FileViewEntry, FileViewState};
+
+        let mut state = state_with_namespace_focus("leaf");
+        state.app.pane = Pane::File;
+        let mut file_view = FileViewState::new(
+            NodeId::from("leaf"),
+            vec![FileViewEntry {
+                path: PathBuf::from("leaf.rs"),
+                lines: vec!["one".to_string(), "two".to_string(), "three".to_string()],
+                changed_ranges: vec![],
+                deleted: false,
+            }],
+        );
+        file_view.scroll_row = 2;
+        state.app.file_view = Some(file_view);
+
+        let action = handle_key(&mut state, press('c'));
+        match action {
+            KeyAction::EditInNvim { path, line } => {
+                assert!(path.ends_with("leaf.rs"));
+                // `Ctrl-e`'s own target math: `scroll_row + 1`.
+                assert_eq!(line, Some(3));
+            }
+            other => panic!("expected an nvim handoff, got a different action: {other:?}"),
+        }
+    }
+
+    /// `]c` (jump to next changed range) must still work on the file pane
+    /// -- `c` completing that pending `]` chord, not `should_edit_in_nvim`'s
+    /// new bare-`c` interception, since a chord is in progress.
+    #[test]
+    fn bracket_c_chord_on_the_file_pane_still_jumps_to_the_next_change_not_an_nvim_handoff() {
+        use crate::core::file_view::{FileViewEntry, FileViewState};
+        use crate::keymap::Pending;
+
+        let mut state = state_with_namespace_focus("leaf");
+        state.app.pane = Pane::File;
+        state.app.file_view = Some(FileViewState::new(
+            NodeId::from("leaf"),
+            vec![FileViewEntry {
+                path: PathBuf::from("leaf.rs"),
+                lines: vec!["one".to_string(), "two".to_string(), "three".to_string()],
+                changed_ranges: vec![(2, 2)],
+                deleted: false,
+            }],
+        ));
+        state.pending_key = Some(Pending::Char(']'));
+
+        let action = handle_key(&mut state, press('c'));
+        assert!(matches!(action, KeyAction::Continue));
+        assert_eq!(
+            state.app.file_view.as_ref().unwrap().scroll_row,
+            2,
+            "]c should have jumped to the changed range, not been swallowed by the nvim handoff"
+        );
     }
 
     #[test]

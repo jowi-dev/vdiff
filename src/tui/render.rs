@@ -515,14 +515,18 @@ fn collapsed_row_spans(
 // between bands rather than all sharing one vertical rail.
 //
 // Band-wrap (an overflowing band split into multiple node rows -- see the
-// issue's own "hard problems" list) is a known limitation of this first cut:
-// a band wider than the terminal wraps its extra nodes onto continuation
-// lines (marked with a leading `\u{21b3}`), but those continuation lines
-// don't participate in channel routing at all -- a wrapped node's incoming/
-// outgoing rails simply don't connect to it. Fine for this crate's sizing
-// target (15-40 visible nodes, see the issue's own sizing note) at ordinary
-// terminal widths; degrades to "some connectors go missing" rather than a
-// crash or a garbled layout once a band badly overflows.
+// issue's own "hard problems" list) is NOT implemented: `sugiyama::layout`
+// assigns each band's x-coordinates in an unbounded char space with no idea
+// what the terminal width even is (see that module's own doc), and
+// `draw_canvas_graph` below renders each band as exactly one `Line` with no
+// `.wrap()` on its `Paragraph` -- so a band wider than the terminal simply
+// clips at the right edge; nodes past the edge are entirely invisible (not
+// wrapped onto a continuation row, and not reachable via horizontal
+// panning either). Fine for this crate's sizing target (15-40 visible
+// nodes, see the issue's own sizing note) at ordinary terminal widths;
+// degrades to "the graph runs off the right edge" rather than a crash once
+// a band badly overflows. A real wrap policy is future work, not shipped
+// here.
 
 /// Everything the canvas screen needs, built fresh each frame from `App`
 /// state (mirroring [`rail_view::visible_rows_with_layers`]'s own "recompute,
