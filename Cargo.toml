@@ -15,21 +15,33 @@ name = "vdiff"
 path = "src/main.rs"
 
 [features]
-default = ["gui"]
+default = ["gui", "tui"]
 # The egui/eframe GUI. On by default; `--no-default-features` builds the
 # headless CLI only (`--dump`, `--export-comments`, `--publish-comments`),
 # with no egui/eframe/syntect in the dependency tree at all. See
 # `src/main.rs`'s `launch_gui` for the headless-build error path.
 gui = ["egui", "eframe", "egui_extras"]
+# The ratatui/crossterm terminal UI (issue #16): a focused-neighborhood view
+# of one module at a time -- nix-tree style -- rather than a full graph
+# canvas (no TUI ecosystem has a production nested-DAG widget). On by
+# default, independent of `gui`; either, both, or neither can be built. See
+# `src/tui`'s module doc and `src/main.rs`'s `launch_tui` for the
+# headless-build error path.
+tui = ["ratatui", "crossterm", "syntect"]
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
 eframe = { version = "0.36.1", optional = true }
 egui = { version = "0.36.1", optional = true }
-# `syntect` (source highlighting) is reachable only through this crate's
-# `syntax_highlighting` module, gated behind `gui` -- not a direct
-# dependency of vdiff. Issue #16 will add it directly for the TUI.
+# `syntect` also reaches this crate transitively through `egui_extras`'s own
+# `syntect` feature (gated behind `gui`) via its `syntax_highlighting`
+# module; this is a *separate*, direct dependency for the `tui` feature,
+# which has no egui/`egui_extras` to route through and does its own
+# syntect-to-`ratatui::style::Style` mapping (see `src/tui/highlight.rs`).
 egui_extras = { version = "0.36.1", features = ["syntect"], optional = true }
+crossterm = { version = "0.29", optional = true }
+ratatui = { version = "0.30", optional = true }
+syntect = { version = "5.3", optional = true }
 git2 = "0.21.0"
 imara-diff = "0.2.0"
 rmpv = "1.3"
