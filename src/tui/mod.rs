@@ -158,6 +158,15 @@ struct TuiState {
     /// of [`Self::rail_scroll`] -- see that field's doc for why this is
     /// TUI-local. Reclamped every frame in [`event_loop`] the same way.
     canvas_scroll: usize,
+    /// The canvas view's horizontal pan offset (leftmost visible column,
+    /// issue #18) -- the horizontal counterpart of [`Self::canvas_scroll`],
+    /// for the same TUI-local reason that field is TUI-local. Auto-panned
+    /// every frame in [`event_loop`] via [`render::clamp_scroll_x`] to keep
+    /// the focused node's own column range inside the viewport, mirroring
+    /// [`Self::canvas_scroll`]'s vertical auto-scroll exactly -- replaces
+    /// the pre-#18 behavior of simply clipping a band wider than the
+    /// terminal at its right edge with no way to reach what fell off it.
+    canvas_scroll_x: usize,
     /// Whether a `z` chord prefix is in progress for the canvas view's
     /// fold keys (`zc`/`zo` -- see [`canvas_key_msg`]'s doc for why this
     /// isn't threaded through `crate::keymap::Pending`, which is shared
@@ -360,6 +369,7 @@ pub fn run(app: App, config: TuiConfig) -> io::Result<()> {
         rail_scroll: 0,
         view_mode: ViewMode::default(),
         canvas_scroll: 0,
+        canvas_scroll_x: 0,
         canvas_fold_pending: false,
         comment_target: None,
     };
@@ -430,6 +440,22 @@ fn event_loop(
                         total_lines,
                         viewport_height,
                     );
+                    // Horizontal auto-pan (issue #18): keep the focused
+                    // node's own `[x, x+width)` range inside the viewport
+                    // the same way `clamp_scroll` already does vertically
+                    // -- see `render::clamp_scroll_x`'s doc. A focus with
+                    // no slot at all (nothing visible yet) leaves the pan
+                    // wherever it already was rather than snapping to 0.
+                    if let Some((focus_x, focus_width)) =
+                        render::focused_slot_range(&view, &state.app.focus)
+                    {
+                        state.canvas_scroll_x = render::clamp_scroll_x(
+                            state.canvas_scroll_x,
+                            focus_x,
+                            focus_width,
+                            size.width as usize,
+                        );
+                    }
                 }
             }
         }
@@ -440,6 +466,7 @@ fn event_loop(
                 state.notice.as_deref(),
                 state.rail_scroll,
                 state.canvas_scroll,
+                state.canvas_scroll_x,
                 state.view_mode,
             )
         })?;
@@ -801,6 +828,7 @@ mod tests {
             rail_scroll: 0,
             view_mode: ViewMode::default(),
             canvas_scroll: 0,
+            canvas_scroll_x: 0,
             canvas_fold_pending: false,
             comment_target: None,
         }
@@ -918,6 +946,7 @@ mod tests {
                     state.notice.as_deref(),
                     state.rail_scroll,
                     state.canvas_scroll,
+                    state.canvas_scroll_x,
                     state.view_mode,
                 )
             })

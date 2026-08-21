@@ -92,19 +92,23 @@ pub fn file_view_visible_rows(terminal_rows: u16) -> usize {
 /// this one frame -- see `crate::tui::TuiState::notice`'s doc for why the
 /// TUI needs this display-only glue state at all (in short: `eprintln!` is
 /// invisible/garbled while the alternate screen owns the terminal).
-/// `rail_scroll`/`canvas_scroll` are the rail/canvas views' current scroll
-/// offsets, already clamped by the caller via [`clamp_scroll`] -- see
-/// [`rail_visible_rows`]'s doc for why that clamping happens in
-/// `crate::tui::event_loop` rather than in here. `view_mode` picks which of
-/// the two graph screens actually paints (issue #17's maintainer override --
-/// see [`crate::tui::ViewMode`]'s doc); the one not currently showing has no
-/// rendering cost paid for it at all.
+/// `rail_scroll`/`canvas_scroll` are the rail/canvas views' current
+/// vertical scroll offsets, already clamped by the caller via
+/// [`clamp_scroll`] -- see [`rail_visible_rows`]'s doc for why that
+/// clamping happens in `crate::tui::event_loop` rather than in here.
+/// `canvas_scroll_x` is the canvas view's own horizontal counterpart (issue
+/// #18's auto-pan -- see [`clamp_scroll_x`]'s doc), unused by the rail view
+/// entirely (it has no horizontal scroll at all). `view_mode` picks which
+/// of the two graph screens actually paints (issue #17's maintainer
+/// override -- see [`crate::tui::ViewMode`]'s doc); the one not currently
+/// showing has no rendering cost paid for it at all.
 pub fn draw(
     frame: &mut Frame,
     app: &App,
     notice: Option<&str>,
     rail_scroll: usize,
     canvas_scroll: usize,
+    canvas_scroll_x: usize,
     view_mode: ViewMode,
 ) {
     let area = frame.area();
@@ -132,7 +136,13 @@ pub fn draw(
                         dropped_edges = draw_rail_graph(frame, main_area, app, rail_scroll);
                     }
                     ViewMode::Canvas => {
-                        dropped_edges = draw_canvas_graph(frame, main_area, app, canvas_scroll);
+                        dropped_edges = draw_canvas_graph(
+                            frame,
+                            main_area,
+                            app,
+                            canvas_scroll,
+                            canvas_scroll_x,
+                        );
                     }
                 }
             }
@@ -207,6 +217,88 @@ pub fn clamp_scroll(
         scroll
     };
     adjusted.min(max_scroll)
+}
+
+/// How many columns of margin [`clamp_scroll_x`] tries to keep between the
+/// focused node's own `[x, x+width)` range and the viewport's left/right
+/// edge -- the horizontal analog of [`SCROLL_MARGIN`], for the canvas
+/// screen's issue #18 auto-pan (see that fix's own doc note in
+/// `crate::graph::sugiyama` on why the canvas needed 2D scrolling at all:
+/// `sugiyama::layout` lays bands out in unbounded char space, so any band
+/// wider than the terminal used to just clip at the right edge with no way
+/// to reach what fell off it).
+const COLUMN_MARGIN: usize = 4;
+
+/// The horizontal counterpart to [`clamp_scroll`]: adjust `scroll_x` (the
+/// previous frame's leftmost visible column) by as little as possible so
+/// the focused node's entire `[focus_x, focus_x + focus_width)` range stays
+/// within [`COLUMN_MARGIN`] columns of the viewport's left/right edge.
+/// Unlike [`clamp_scroll`], there is no fixed `total_columns` to clamp
+/// against from above -- `crate::graph::sugiyama`'s layout is unbounded
+/// char space, so scrolling arbitrarily far right to reach a node that's
+/// genuinely out there is exactly the point -- but `scroll_x` can never go
+/// negative, so `0` is always the effective floor (enforced by the
+/// `usize` arithmetic itself, via `saturating_sub`).
+pub fn clamp_scroll_x(
+    scroll_x: usize,
+    focus_x: usize,
+    focus_width: usize,
+    viewport_width: usize,
+) -> usize {
+    if viewport_width == 0 {
+        return 0;
+    }
+    let margin = COLUMN_MARGIN.min(viewport_width.saturating_sub(1) / 2);
+    let focus_end = focus_x + focus_width;
+
+    let min_visible = scroll_x + margin;
+    let max_visible = scroll_x + viewport_width.saturating_sub(margin);
+
+    if focus_x < min_visible {
+        focus_x.saturating_sub(margin)
+    } else if focus_end > max_visible {
+        focus_end + margin - viewport_width
+    } else {
+        scroll_x
+    }
+}
+
+/// Slice `line`'s spans down to the half-open column window
+/// `[start, start + width)`, in character units (not bytes -- see the
+/// `chars()`/`char_indices` use throughout), preserving each retained
+/// span's own style. The fiddly part [`crate::tui::mod`]'s auto-pan (issue
+/// #18) needed: a band or channel line built from several differently-
+/// styled spans (badges, status colors, bolded focus) must still cut
+/// cleanly mid-span at either edge of the window without losing style
+/// information or panicking on multi-byte characters -- see the module's
+/// own tests for the shapes this handles (a cut landing inside a single
+/// span, a window spanning several spans, and non-ASCII content).
+pub fn slice_line_columns(line: &Line<'static>, start: usize, width: usize) -> Line<'static> {
+    let end = start.saturating_add(width);
+    let mut spans = Vec::new();
+    let mut col = 0usize;
+    for span in &line.spans {
+        let char_count = span.content.chars().count();
+        let span_start = col;
+        let span_end = col + char_count;
+        col = span_end;
+        if span_end <= start || span_start >= end {
+            continue;
+        }
+        let take_start = start.saturating_sub(span_start).min(char_count);
+        let take_end = end.saturating_sub(span_start).min(char_count);
+        if take_start >= take_end {
+            continue;
+        }
+        let sliced: String = span
+            .content
+            .chars()
+            .skip(take_start)
+            .take(take_end - take_start)
+            .collect();
+        spans.push(Span::styled(sliced, span.style));
+    }
+    Line::from(spans)
 }
 
 /// One screen line the rail view's viewport scrolls over: either a band
@@ -515,18 +607,22 @@ fn collapsed_row_spans(
 // between bands rather than all sharing one vertical rail.
 //
 // Band-wrap (an overflowing band split into multiple node rows -- see the
-// issue's own "hard problems" list) is NOT implemented: `sugiyama::layout`
-// assigns each band's x-coordinates in an unbounded char space with no idea
-// what the terminal width even is (see that module's own doc), and
+// issue's own "hard problems" list) is still NOT implemented: `sugiyama::
+// layout` assigns each band's x-coordinates in an unbounded char space with
+// no idea what the terminal width even is (see that module's own doc), and
 // `draw_canvas_graph` below renders each band as exactly one `Line` with no
-// `.wrap()` on its `Paragraph` -- so a band wider than the terminal simply
-// clips at the right edge; nodes past the edge are entirely invisible (not
-// wrapped onto a continuation row, and not reachable via horizontal
-// panning either). Fine for this crate's sizing target (15-40 visible
-// nodes, see the issue's own sizing note) at ordinary terminal widths;
-// degrades to "the graph runs off the right edge" rather than a crash once
-// a band badly overflows. A real wrap policy is future work, not shipped
-// here.
+// `.wrap()` on its `Paragraph`. What issue #18 replaced is what used to
+// happen next: a band wider than the terminal no longer clips at the right
+// edge with the rest permanently invisible -- `canvas_scroll_x`
+// (`crate::tui::TuiState`) is a real horizontal pan offset, auto-following
+// the focused node via `clamp_scroll_x` exactly the way `canvas_scroll`
+// already auto-follows it vertically, and every rendered line is sliced to
+// the current `[canvas_scroll_x, canvas_scroll_x + width)` window via
+// `slice_line_columns` before painting. `h`/`l` (already spatial focus
+// movement in this mode) pan the viewport as a side effect of moving focus
+// past the visible edge -- there's no separate pan key. A real wrap policy
+// (splitting one overflowing band into several node rows) is still future
+// work; panning only solves "reach it," not "see the whole band at once."
 
 /// Everything the canvas screen needs, built fresh each frame from `App`
 /// state (mirroring [`rail_view::visible_rows_with_layers`]'s own "recompute,
@@ -683,6 +779,20 @@ pub fn canvas_line_count(view: &CanvasView) -> usize {
     build_canvas_lines(view).len()
 }
 
+/// `focus`'s own `(x, width)` in `view`'s char-space layout, or `None` if
+/// `focus` isn't present as a real slot in any band -- what
+/// `crate::tui::event_loop` feeds into [`clamp_scroll_x`] every frame so
+/// the horizontal auto-pan (issue #18) follows focus exactly the way
+/// [`focus_canvas_line`] already does for the vertical scroll.
+pub fn focused_slot_range(view: &CanvasView, focus: &NodeId) -> Option<(usize, usize)> {
+    view.layout
+        .bands
+        .iter()
+        .flat_map(|band| band.iter())
+        .find(|slot| slot.id.real_id() == Some(focus))
+        .map(|slot| (slot.x, slot.width))
+}
+
 fn canvas_role_color(role: CanvasRole) -> Color {
     match role {
         CanvasRole::Normal => RAIL_DIM,
@@ -785,8 +895,20 @@ fn canvas_channel_line(channel: &Channel, row_idx: usize) -> Line<'static> {
 /// [`draw_rail_graph`]'s own return, feeding the same `dropped_edges`
 /// parameter into [`draw_legend`] (see that call site) so the canvas's
 /// channel-budget degrade (issue #18) gets the same "+N edges" legend
-/// treatment the rail gutter's width cap already has.
-fn draw_canvas_graph(frame: &mut Frame, area: Rect, app: &App, canvas_scroll: usize) -> usize {
+/// treatment the rail gutter's width cap already has. `canvas_scroll_x` is
+/// the horizontal pan offset (issue #18) -- every rendered line is sliced
+/// down to `[canvas_scroll_x, canvas_scroll_x + area.width)` via
+/// [`slice_line_columns`] before being handed to the `Paragraph`, replacing
+/// the old right-edge clip (a band/channel wider than the terminal used to
+/// just cut off past the visible width with no way to reach what fell off
+/// it) with actual horizontal scrolling.
+fn draw_canvas_graph(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    canvas_scroll: usize,
+    canvas_scroll_x: usize,
+) -> usize {
     let view = build_canvas_view(app);
     let lines_index = build_canvas_lines(&view);
     let dropped_edges: usize = view.channels.iter().map(|c| c.dropped).sum();
@@ -803,13 +925,18 @@ fn draw_canvas_graph(frame: &mut Frame, area: Rect, app: &App, canvas_scroll: us
 
     let mut lines: Vec<Line> = Vec::with_capacity(end - start);
     for line in &lines_index[start..end] {
-        match line {
-            CanvasLine::Label(band_idx) => lines.push(canvas_label_line(app, &view, *band_idx)),
+        let full_line = match line {
+            CanvasLine::Label(band_idx) => canvas_label_line(app, &view, *band_idx),
             CanvasLine::Channel(band_idx, row_idx) => {
                 let channel = &view.channels[*band_idx];
-                lines.push(canvas_channel_line(channel, *row_idx));
+                canvas_channel_line(channel, *row_idx)
             }
-        }
+        };
+        lines.push(slice_line_columns(
+            &full_line,
+            canvas_scroll_x,
+            area.width as usize,
+        ));
     }
     frame.render_widget(Paragraph::new(lines), area);
     dropped_edges
@@ -1266,7 +1393,7 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, app, notice, rail_scroll, 0, ViewMode::Rail))
+            .draw(|frame| draw(frame, app, notice, rail_scroll, 0, 0, ViewMode::Rail))
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let mut out = String::new();
@@ -1318,7 +1445,7 @@ mod tests {
         app.reviewed.insert(NodeId::from("leaf"));
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, &app, None, 0, 0, ViewMode::Rail))
+            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Rail))
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let dimmed = (0..buffer.area.height).any(|y| {
@@ -1442,6 +1569,89 @@ mod tests {
     fn clamp_scroll_never_scrolls_past_the_last_page() {
         let scroll = clamp_scroll(0, 19, 20, 10);
         assert_eq!(scroll, 10, "max_scroll = total_rows - viewport_height");
+    }
+
+    #[test]
+    fn clamp_scroll_x_pans_right_to_reach_a_node_past_the_edge() {
+        // A node at column 100 (width 8) with a 40-column viewport
+        // scrolled to 0 must pan right so the node's whole width is
+        // visible with margin.
+        let scroll_x = clamp_scroll_x(0, 100, 8, 40);
+        assert!(scroll_x > 0);
+        assert!(100 >= scroll_x && 100 + 8 <= scroll_x + 40);
+    }
+
+    #[test]
+    fn clamp_scroll_x_is_a_noop_when_the_focused_node_is_already_visible() {
+        let scroll_x = clamp_scroll_x(10, 20, 5, 40);
+        assert_eq!(scroll_x, 10);
+    }
+
+    #[test]
+    fn clamp_scroll_x_pans_left_when_focus_moves_before_the_window() {
+        let scroll_x = clamp_scroll_x(50, 10, 4, 40);
+        assert!(scroll_x <= 10);
+    }
+
+    #[test]
+    fn clamp_scroll_x_never_goes_negative() {
+        let scroll_x = clamp_scroll_x(0, 0, 3, 40);
+        assert_eq!(scroll_x, 0);
+    }
+
+    #[test]
+    fn slice_line_columns_cuts_a_single_span_mid_content() {
+        let line = Line::from(vec![Span::raw("hello world")]);
+        let sliced = slice_line_columns(&line, 2, 5);
+        let text: String = sliced.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "llo w");
+    }
+
+    #[test]
+    fn slice_line_columns_preserves_style_across_multiple_spans() {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let plain = Style::default();
+        let line = Line::from(vec![
+            Span::styled("abc".to_string(), bold),
+            Span::styled("defgh".to_string(), plain),
+        ]);
+        // Window [2, 7): "c" from the bold span, "defg" from the plain one.
+        let sliced = slice_line_columns(&line, 2, 5);
+        assert_eq!(sliced.spans.len(), 2);
+        assert_eq!(sliced.spans[0].content.as_ref(), "c");
+        assert_eq!(sliced.spans[0].style, bold);
+        assert_eq!(sliced.spans[1].content.as_ref(), "defg");
+        assert_eq!(sliced.spans[1].style, plain);
+    }
+
+    #[test]
+    fn slice_line_columns_drops_spans_entirely_outside_the_window() {
+        let line = Line::from(vec![
+            Span::raw("aaaa"),
+            Span::raw("bbbb"),
+            Span::raw("cccc"),
+        ]);
+        // Window [4, 8) is exactly the middle span.
+        let sliced = slice_line_columns(&line, 4, 4);
+        let text: String = sliced.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "bbbb");
+    }
+
+    #[test]
+    fn slice_line_columns_is_unicode_safe_by_char_count() {
+        // Each of these is one *character* but more than one byte --
+        // slicing by byte offset would panic or cut mid-codepoint.
+        let line = Line::from(vec![Span::raw("é€文abc")]);
+        let sliced = slice_line_columns(&line, 1, 3);
+        let text: String = sliced.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "€文a");
+    }
+
+    #[test]
+    fn slice_line_columns_past_the_end_yields_an_empty_line() {
+        let line = Line::from(vec![Span::raw("short")]);
+        let sliced = slice_line_columns(&line, 100, 10);
+        assert!(sliced.spans.is_empty());
     }
 
     #[test]
@@ -1814,7 +2024,7 @@ mod tests {
         let app = app_for(diamond_graph_fixture(), "child");
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, &app, None, 0, 0, ViewMode::Canvas))
+            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Canvas))
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let mut text = String::new();
@@ -1834,11 +2044,56 @@ mod tests {
     }
 
     #[test]
+    fn canvas_scroll_x_pans_the_rendered_content_instead_of_only_clipping_it() {
+        // A narrow viewport: at `canvas_scroll_x = 0`, the leftmost label
+        // ("p1", column 0 in the diamond fixture) is visible and a label
+        // further right ("child") is clipped off. Panning right should
+        // flip that -- "p1" scrolls out of view and "child" becomes
+        // reachable, proving this is real horizontal scrolling and not
+        // just a wider unconditional clip.
+        let app = app_for(diamond_graph_fixture(), "child");
+        let width = 6u16;
+        let height = 20u16;
+
+        let mut terminal_at_zero = Terminal::new(TestBackend::new(width, height)).expect("test");
+        terminal_at_zero
+            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Canvas))
+            .expect("draw");
+        let text_at_zero = buffer_text(terminal_at_zero.backend().buffer());
+        assert!(text_at_zero.contains("p1"), "p1 should be visible unpanned");
+
+        let mut terminal_panned = Terminal::new(TestBackend::new(width, height)).expect("test");
+        terminal_panned
+            .draw(|frame| draw(frame, &app, None, 0, 0, 20, ViewMode::Canvas))
+            .expect("draw");
+        let text_panned = buffer_text(terminal_panned.backend().buffer());
+        assert!(
+            !text_panned.contains("p1"),
+            "p1 should have panned out of view:\n{text_panned}"
+        );
+        assert_ne!(
+            text_at_zero, text_panned,
+            "panning must actually change what's rendered"
+        );
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
     fn canvas_legend_advertises_the_view_toggle_and_fold_chord() {
         let app = app_for(diamond_graph_fixture(), "child");
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, &app, None, 0, 0, ViewMode::Canvas))
+            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Canvas))
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let mut text = String::new();
@@ -1899,7 +2154,7 @@ mod tests {
         );
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, &app, None, 0, 0, ViewMode::Canvas))
+            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Canvas))
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let mut text = String::new();
