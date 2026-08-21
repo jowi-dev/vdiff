@@ -303,8 +303,14 @@ fn launch_tui(
     // folded into `app` -- so the returned `LayoutResult` is dropped here
     // unlike `run_gui`, which threads it into `VdiffApp::new` for its
     // pixel geometry.
-    let (app, review_store, _layout_result) =
+    let (mut app, review_store, _layout_result) =
         build_initial_app(graph, &git_dir, &branch, findings, comments);
+    // Issue #18's fix 4: a dense enough change set is unusable fully
+    // expanded on first paint (see `vdiff::tui::seed_fold_collapsed_if_dense`'s
+    // doc) -- this only ever touches this TUI-local `App`, never the GUI's
+    // (see that function's own doc for why it can't just live in the
+    // shared `build_initial_app` above).
+    vdiff::tui::seed_fold_collapsed_if_dense(&mut app);
 
     let config = vdiff::tui::TuiConfig {
         loader: vdiff::tui::loader::TuiLoader {

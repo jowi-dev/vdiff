@@ -339,6 +339,69 @@ fn install_panic_hook() {
     }));
 }
 
+/// Above how many visible modules (issue #18's fix 4) a fresh `--tui`
+/// session pre-folds every top-level namespace by default, rather than
+/// opening fully expanded -- see [`should_fold_by_default`]'s doc for the
+/// second trigger this threshold works alongside.
+const FOLD_DEFAULT_NODE_THRESHOLD: usize = 40;
+
+/// How many dependency edges per visible node counts as "disproportionate"
+/// for [`should_fold_by_default`]'s second trigger: a graph can be tangled
+/// enough to need folding well under [`FOLD_DEFAULT_NODE_THRESHOLD`] nodes
+/// if the edge count relative to node count is this high.
+const FOLD_DEFAULT_EDGE_RATIO: usize = 3;
+
+/// Whether a fresh `--tui` session should start with every top-level
+/// namespace folded (see [`default_fold_seed`]) rather than fully
+/// expanded, given `visible_node_count` (the fold-aware, already
+/// `hide_test_modules`-filtered node count -- `App::layers`' own shape) and
+/// `edge_count` (`App::graph.edges.len()`). Either the node count alone
+/// crossing [`FOLD_DEFAULT_NODE_THRESHOLD`], or the edge-to-node ratio
+/// crossing [`FOLD_DEFAULT_EDGE_RATIO`] (a graph can be a hairball at a
+/// moderate node count too), triggers it -- real use on the un-fixed #17
+/// canvas found even a ~12-node/~30-edge change set unusable on first
+/// paint (see the issue's own real-use notes), so this is deliberately not
+/// a node-count-only check.
+fn should_fold_by_default(visible_node_count: usize, edge_count: usize) -> bool {
+    visible_node_count > FOLD_DEFAULT_NODE_THRESHOLD
+        || edge_count > visible_node_count.saturating_mul(FOLD_DEFAULT_EDGE_RATIO)
+}
+
+/// The fold seed [`seed_fold_collapsed_if_dense`] installs when
+/// [`should_fold_by_default`] says yes: every top-level root that actually
+/// has children -- a leaf root (no children at all, e.g. a lone top-level
+/// file) has nothing to collapse into one row, so seeding it would be a
+/// no-op that just wastes a `HashSet` entry. This is exactly the same
+/// `App::fold_collapsed` a `zc`/`h` keypress would produce by hand; the
+/// user expands with `zo`/`l` exactly like any other fold, per the issue's
+/// own "reuse the existing fold machinery" instruction.
+fn default_fold_seed(
+    graph: &crate::graph::model::ProjectGraph,
+) -> std::collections::HashSet<crate::graph::model::NodeId> {
+    graph
+        .roots
+        .iter()
+        .filter(|id| graph.node(id).is_some_and(|node| !node.children.is_empty()))
+        .cloned()
+        .collect()
+}
+
+/// Pre-seed `app.fold_collapsed` (see [`default_fold_seed`]) if the graph
+/// is dense enough to need it (see [`should_fold_by_default`]) -- called
+/// once by `main`'s `launch_tui`, right after building the initial `App`
+/// and before handing it to [`run`]. Deliberately lives here rather than
+/// in the shared `build_initial_app` the GUI also calls: `App::
+/// fold_collapsed` starting non-empty is a TUI-only possibility (the GUI
+/// frontend never populates it at all -- see `core::app::update`'s own doc
+/// on that), so this must not run on the GUI's copy of the same `App`.
+pub fn seed_fold_collapsed_if_dense(app: &mut App) {
+    let visible_node_count: usize = app.layers.iter().map(Vec::len).sum();
+    let edge_count = app.graph.edges.len();
+    if should_fold_by_default(visible_node_count, edge_count) {
+        app.fold_collapsed = default_fold_seed(&app.graph);
+    }
+}
+
 /// Run the TUI to completion: install the panic hook, enter raw mode/the
 /// alternate screen, drive [`event_loop`] until it quits (`q`, or
 /// `--smoke`'s timer), then restore the terminal unconditionally -- even if
@@ -1214,5 +1277,108 @@ mod tests {
         assert!(state.canvas_fold_pending);
         handle_key(&mut state, press('j'));
         assert!(!state.canvas_fold_pending);
+    }
+
+    #[test]
+    fn should_fold_by_default_is_false_under_both_thresholds() {
+        assert!(!should_fold_by_default(10, 15));
+    }
+
+    #[test]
+    fn should_fold_by_default_trips_on_node_count_alone() {
+        assert!(should_fold_by_default(FOLD_DEFAULT_NODE_THRESHOLD + 1, 0));
+    }
+
+    #[test]
+    fn should_fold_by_default_trips_on_a_disproportionate_edge_count() {
+        // 12 nodes is well under the node threshold, but 40 edges is more
+        // than `FOLD_DEFAULT_EDGE_RATIO` per node -- mirrors the issue's
+        // own real-use report of a small-but-tangled change set.
+        assert!(should_fold_by_default(12, 40));
+    }
+
+    #[test]
+    fn should_fold_by_default_is_false_right_at_the_node_threshold() {
+        assert!(!should_fold_by_default(FOLD_DEFAULT_NODE_THRESHOLD, 0));
+    }
+
+    /// A graph with two top-level roots: `parent` has one child (`leaf`),
+    /// `lonely` has none -- exercises [`default_fold_seed`]'s "only seed
+    /// roots that actually have children" filter.
+    fn graph_with_one_childful_root() -> ProjectGraph {
+        use crate::graph::model::{GitStatus, ModuleNode};
+
+        let parent = NodeId::from("parent");
+        let leaf = NodeId::from("leaf");
+        let lonely = NodeId::from("lonely");
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            parent.clone(),
+            ModuleNode {
+                id: parent.clone(),
+                display_name: "parent".to_string(),
+                parent: None,
+                children: vec![leaf.clone()],
+                status: GitStatus::Unchanged,
+                files: vec![],
+            },
+        );
+        nodes.insert(
+            leaf.clone(),
+            ModuleNode {
+                id: leaf.clone(),
+                display_name: "leaf".to_string(),
+                parent: Some(parent.clone()),
+                children: vec![],
+                status: GitStatus::Modified,
+                files: vec![],
+            },
+        );
+        nodes.insert(
+            lonely.clone(),
+            ModuleNode {
+                id: lonely.clone(),
+                display_name: "lonely".to_string(),
+                parent: None,
+                children: vec![],
+                status: GitStatus::Modified,
+                files: vec![],
+            },
+        );
+        ProjectGraph {
+            roots: vec![parent, lonely],
+            nodes,
+            edges: vec![],
+        }
+    }
+
+    #[test]
+    fn default_fold_seed_only_includes_roots_with_children() {
+        let graph = graph_with_one_childful_root();
+        let seed = default_fold_seed(&graph);
+        assert_eq!(seed, HashSet::from([NodeId::from("parent")]));
+    }
+
+    #[test]
+    fn seed_fold_collapsed_if_dense_is_a_noop_under_threshold() {
+        let graph = graph_with_one_childful_root();
+        let mut app = state_fixture().app;
+        app.graph = graph;
+        app.layers = vec![vec![NodeId::from("parent"), NodeId::from("lonely")]];
+        seed_fold_collapsed_if_dense(&mut app);
+        assert!(app.fold_collapsed.is_empty());
+    }
+
+    #[test]
+    fn seed_fold_collapsed_if_dense_seeds_top_level_namespaces_when_dense() {
+        let graph = graph_with_one_childful_root();
+        let mut app = state_fixture().app;
+        app.graph = graph;
+        // One layer with more nodes than the threshold -- doesn't need to
+        // be a realistic layering, `seed_fold_collapsed_if_dense` only
+        // sums layer lengths for the node count.
+        app.layers = vec![vec![NodeId::from("x"); FOLD_DEFAULT_NODE_THRESHOLD + 1]];
+        seed_fold_collapsed_if_dense(&mut app);
+        assert_eq!(app.fold_collapsed, HashSet::from([NodeId::from("parent")]));
     }
 }
