@@ -1,26 +1,46 @@
-//! `--tui`: the ratatui/crossterm terminal frontend (issue #16), phase 1 --
-//! a focused-neighborhood view of one module at a time (the module plus
-//! its direct dependencies/dependents), not a ported graph canvas. See the
-//! issue for the full design rationale (no TUI ecosystem has a production
-//! nested-DAG widget; this instead follows the `nix-tree` pattern, which
-//! matches vdiff's own "one frame of the call-stack story at a time"
-//! framing).
+//! `--tui`: the ratatui/crossterm terminal frontend (issue #16). Phase 1
+//! shipped a focused-neighborhood view of one module at a time; real use
+//! found it "less helpful than just looking at the directory directly" --
+//! no big picture, no zoom. Phase 2 (this version) replaces the graph
+//! screen with a `git log --graph`-style vertical rail DAG instead: every
+//! visible module as one row, a rail gutter drawing dependency edges
+//! between them (see [`crate::graph::rails`]), and fold-by-namespace as the
+//! zoom mechanic (see [`crate::core::rail_view`]). See [`render`]'s module
+//! doc for the rendering side of that redesign.
 //!
 //! This module is glue only, the same discipline `crate::ui` follows for
 //! the GUI: all state and transition logic lives in
-//! [`crate::core::app::App`]/[`crate::core::app::update`], reused entirely
-//! unchanged -- `h`/`j`/`k`/`l` navigation, `gd`/`gr` edge-following (with
-//! the same picker-when-ambiguous overlay), the diff/file panes, review
-//! toggling, all of it. What's genuinely new here is: terminal setup/
-//! teardown ([`run`]), the crossterm event loop ([`event_loop`]), the
-//! crossterm-to-[`crate::keymap::KeyInput`] mapping ([`keys`]), a
-//! `ratatui`-only [`Cmd::LoadDiff`]/[`Cmd::LoadFile`] IO glue
-//! ([`loader`]) parallel to (but independent of) the GUI's
-//! `crate::ui::eframe_app::DiffLoader`, the rendering itself ([`render`]),
-//! a direct `syntect` -> `ratatui::style::Style` mapping ([`highlight`])
-//! since there's no `egui_extras` to route through here, and the lazygit-
-//! style real-`nvim` alternate-screen handoff ([`nvim_handoff`]) -- no
-//! embedded `nvim --embed`/`ext_linegrid` grid; that stays GUI-only.
+//! [`crate::core::app::App`]/[`crate::core::app::update`]. `gd`/`gr` edge-
+//! following (with the same picker-when-ambiguous overlay), the diff/file
+//! panes, review toggling, `t`/`gt`/`c` -- all reused entirely unchanged
+//! from the GUI's own reducer, still routed through the shared
+//! [`crate::keymap::map_key`]. `h`/`j`/`k`/`l` are the one exception: the
+//! rail view's `j`/`k` (move down/up the fold-aware visible row list) and
+//! `h`/`l` (collapse/expand a namespace) are semantically nothing like the
+//! GUI's layer-grid `h`/`j`/`k`/`l` (which `map_key` still serves
+//! unchanged, since `map_key`/`KeyContext` are shared with the GUI and
+//! must keep working there) -- so [`handle_key`] intercepts these four keys
+//! directly, before they ever reach `map_key`, dispatching
+//! [`crate::core::app::Msg::RailFocusMove`]/
+//! [`crate::core::app::Msg::CollapseFocusedNamespace`]/
+//! [`crate::core::app::Msg::ExpandFocusedNamespace`] instead. This mirrors
+//! the existing precedent for `Ctrl-e` (see [`should_edit_in_nvim`]):
+//! anything that means something different in the TUI than in the GUI
+//! bypasses the shared reducer's shared keymap entirely rather than
+//! growing `map_key` a context flag to disambiguate. Every other binding
+//! (`gd`/`gr`, `gt`, `t`, `v`, `c`, `Enter`, `d`, `q`, `Esc`, the file/diff
+//! panes' own chords) is untouched and still flows through `map_key`.
+//!
+//! What's genuinely new in this module: terminal setup/teardown ([`run`]),
+//! the crossterm event loop ([`event_loop`]), the crossterm-to-
+//! [`crate::keymap::KeyInput`] mapping ([`keys`]), a `ratatui`-only
+//! [`Cmd::LoadDiff`]/[`Cmd::LoadFile`] IO glue ([`loader`]) parallel to (but
+//! independent of) the GUI's `crate::ui::eframe_app::DiffLoader`, the
+//! rendering itself ([`render`]), a direct `syntect` ->
+//! `ratatui::style::Style` mapping ([`highlight`]) since there's no
+//! `egui_extras` to route through here, and the lazygit-style real-`nvim`
+//! alternate-screen handoff ([`nvim_handoff`]) -- no embedded `nvim --embed`/
+//! `ext_linegrid` grid; that stays GUI-only.
 //!
 //! Event-driven, not per-frame polled: [`event_loop`] blocks on
 //! `crossterm::event::poll` and only redraws on an actual state change (a
@@ -46,7 +66,8 @@ use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::core::app::{update, App, Cmd, Msg, Pane};
+use crate::core::app::{update, App, Cmd, Msg, Pane, Screen};
+use crate::core::rail_view::RailDirection;
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome, Pending};
 use crate::review::review_state::ReviewStore;
 use crate::review::store as review_store;
@@ -97,6 +118,17 @@ struct TuiState {
     /// -- its `eprintln!`s land in whatever terminal launched it, which
     /// isn't captured by the GUI window at all.
     notice: Option<String>,
+    /// The rail view's current scroll offset (row index of the topmost
+    /// visible row), reclamped every frame in [`event_loop`] via
+    /// [`render::clamp_scroll`] before [`render::draw`] runs -- the same
+    /// pattern already used for [`App::viewport_rows`]/
+    /// [`render::file_view_visible_rows`]. Deliberately *not* on
+    /// `core::App`: like [`Self::notice`], it's display-only bookkeeping a
+    /// fold/focus change never needs to reason about directly -- every
+    /// frame recomputes it fresh from `App::focus` and the current visible
+    /// row list, so there's no state here a `core` reducer could get out
+    /// of sync with.
+    rail_scroll: usize,
 }
 
 impl TuiState {
@@ -109,10 +141,10 @@ impl TuiState {
     /// Execute a [`Cmd`]. `Cmd::Relayout` is a no-op here: unlike the GUI
     /// (which recomputes pixel geometry for the graph canvas),
     /// `core::app::toggle_tests` already updates `App::layers`/`App::rows`
-    /// itself before returning it -- the neighborhood view never consults
-    /// layout rects at all, only `App::graph`/`App::layers` directly (see
-    /// `render::draw_neighborhood`), so there's nothing left for this glue
-    /// to rebuild.
+    /// itself before returning it -- the rail view never consults layout
+    /// rects at all, only `App::graph`/`App::layers` (by way of
+    /// `crate::core::rail_view::visible_rows`, see `render::draw_rail_graph`),
+    /// so there's nothing left for this glue to rebuild.
     fn execute(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::None | Cmd::Relayout => {}
@@ -223,6 +255,7 @@ pub fn run(app: App, config: TuiConfig) -> io::Result<()> {
         review_branch: config.review_branch,
         repo_root: config.repo_root,
         notice: None,
+        rail_scroll: 0,
     };
 
     let result = event_loop(&mut terminal, &mut state, config.smoke);
@@ -252,7 +285,29 @@ fn event_loop(
             let size = terminal.size()?;
             state.app.viewport_rows = render::file_view_visible_rows(size.height);
         }
-        terminal.draw(|frame| render::draw(frame, &state.app, state.notice.as_deref()))?;
+        if state.app.screen == Screen::Graph && state.app.pane == Pane::Graph {
+            let size = terminal.size()?;
+            let viewport_height = render::rail_visible_rows(size.height);
+            let rows = crate::core::rail_view::visible_rows(
+                &state.app.graph,
+                &state.app.layers,
+                &state.app.fold_collapsed,
+            );
+            let focus_idx = rows
+                .iter()
+                .position(|row| row.id() == &state.app.focus)
+                .unwrap_or(0);
+            state.rail_scroll =
+                render::clamp_scroll(state.rail_scroll, focus_idx, rows.len(), viewport_height);
+        }
+        terminal.draw(|frame| {
+            render::draw(
+                frame,
+                &state.app,
+                state.notice.as_deref(),
+                state.rail_scroll,
+            )
+        })?;
 
         if smoke && started_at.elapsed() > SMOKE_DURATION {
             return Ok(());
@@ -302,7 +357,11 @@ fn event_loop(
 /// `q` quits (unless the edge-picker overlay is open, so `Esc` has first
 /// say over closing that instead); `Ctrl-e` on the file pane requests
 /// [`KeyAction::EditInNvim`] instead of dispatching through `map_key` (see
-/// [`should_edit_in_nvim`]); everything else is translated via
+/// [`should_edit_in_nvim`]); `h`/`j`/`k`/`l` on the rail view (see
+/// [`rail_key_msg`]) dispatch the rail-specific messages directly, bypassing
+/// `map_key` entirely -- see this module's own doc for why (in short:
+/// `map_key` is shared with the GUI, whose `h`/`j`/`k`/`l` must keep their
+/// existing layer-grid meaning); everything else is translated via
 /// [`keys::crossterm_key_to_input`] and routed through [`map_key`]/the
 /// reducer exactly like the GUI's own `handle_keys`.
 fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
@@ -320,6 +379,11 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
         return nvim_edit_target(state)
             .map(|(path, line)| KeyAction::EditInNvim { path, line })
             .unwrap_or(KeyAction::Continue);
+    }
+
+    if let Some(msg) = rail_key_msg(state, input) {
+        state.dispatch(msg);
+        return KeyAction::Continue;
     }
 
     let ctx = KeyContext {
@@ -345,6 +409,34 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
 /// one is ever added, isn't shadowed).
 fn should_edit_in_nvim(state: &TuiState, input: KeyInput) -> bool {
     input == KeyInput::Ctrl('e') && state.app.pane == Pane::File && state.pending_key.is_none()
+}
+
+/// The rail-view message `input` should dispatch directly, bypassing
+/// `map_key`, or `None` if it isn't one of the four rail-specific keys, or
+/// the context isn't right for them: [`Screen::Graph`]/[`Pane::Graph`] with
+/// no picker open (the picker's own `j`/`k` selection-move must win instead
+/// -- see `map_key`'s picker-open precedence) and no chord in progress
+/// (`h`/`j`/`k`/`l` aren't chord characters themselves, but if some other
+/// chord -- e.g. `g`+? -- is already pending, this key should complete or
+/// clear *that* chord via the normal `map_key` path, not be hijacked here).
+/// `j`/`k` map to [`Msg::RailFocusMove`] (down/up the visible row list);
+/// `h`/`l` map to [`Msg::CollapseFocusedNamespace`]/
+/// [`Msg::ExpandFocusedNamespace`].
+fn rail_key_msg(state: &TuiState, input: KeyInput) -> Option<Msg> {
+    if state.app.screen != Screen::Graph
+        || state.app.pane != Pane::Graph
+        || state.app.picker.is_some()
+        || state.pending_key.is_some()
+    {
+        return None;
+    }
+    match input {
+        KeyInput::Char('j') => Some(Msg::RailFocusMove(RailDirection::Down)),
+        KeyInput::Char('k') => Some(Msg::RailFocusMove(RailDirection::Up)),
+        KeyInput::Char('h') => Some(Msg::CollapseFocusedNamespace),
+        KeyInput::Char('l') => Some(Msg::ExpandFocusedNamespace),
+        _ => None,
+    }
 }
 
 /// `Ctrl-e`'s target: the file pane's current file, joined onto the repo
@@ -409,6 +501,7 @@ mod tests {
             review_branch: "main".to_string(),
             repo_root: PathBuf::from("."),
             notice: None,
+            rail_scroll: 0,
         }
     }
 
@@ -440,7 +533,14 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test backend");
         terminal
-            .draw(|frame| render::draw(frame, &state.app, state.notice.as_deref()))
+            .draw(|frame| {
+                render::draw(
+                    frame,
+                    &state.app,
+                    state.notice.as_deref(),
+                    state.rail_scroll,
+                )
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let mut text = String::new();

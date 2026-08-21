@@ -298,7 +298,7 @@ fn launch_tui(
         findings,
         comments,
     } = review_setup;
-    // The TUI's neighborhood view never consults layout rects (see
+    // The TUI's rail view never consults layout rects (see
     // `vdiff::tui`'s module doc) -- only `layers`/`rows`, both already
     // folded into `app` -- so the returned `LayoutResult` is dropped here
     // unlike `run_gui`, which threads it into `VdiffApp::new` for its

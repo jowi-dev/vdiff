@@ -343,7 +343,7 @@ pub enum Msg {
     /// `j`/`k` on the `--tui` rail view: move focus up/down the fold-aware
     /// visible row list (see [`crate::core::rail_view::visible_rows`]),
     /// rather than the layer/x-center-nearest logic [`Msg::FocusMove`] uses
-    /// for the GUI's neighborhood navigation -- see `crate::tui::mod`'s doc
+    /// for the GUI's layer-grid navigation -- see `crate::tui::mod`'s doc
     /// for why the rail view needs a distinct message instead of reusing
     /// `FocusMove` with changed semantics (in short: `map_key`/`FocusMove`
     /// are shared with the GUI, which must keep its own h/j/k/l behavior

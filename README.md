@@ -32,8 +32,9 @@ nix develop
 
 Two Cargo features gate the two frontends, both on by default and
 independent of each other: `gui` (the egui/eframe graph-canvas GUI) and
-`tui` (a ratatui/crossterm terminal UI -- `--tui` -- showing one module's
-focused neighborhood, nix-tree style, rather than the full graph canvas). A
+`tui` (a ratatui/crossterm terminal UI -- `--tui` -- showing a `git log
+--graph`-style vertical rail DAG of every visible module, rather than the
+2D graph canvas). A
 `--no-default-features` build is fully headless: no window or terminal UI
 ever opens, and `--dump`/`--export-comments`/`--publish-comments` are the
 only usable entry points -- any invocation that would otherwise launch a
@@ -52,21 +53,30 @@ cargo check --no-default-features                        # verify the headless b
 vdiff                  # open the graph for the current repo's change set; file panes are a real embedded Neovim
 vdiff --no-nvim        # same, but file panes use the built-in read-only viewer instead
 vdiff --base main      # diff against a specific ref instead of the detected default branch
-vdiff --tui            # terminal UI instead: one module's focused neighborhood at a time
+vdiff --tui            # terminal UI instead: a vertical rail DAG of the whole change set
 ```
 
-The terminal UI (`--tui`) reuses the same vim-style navigation and diff/
-file panes as the GUI, but shows a focused module plus its direct
-dependencies/dependents rather than the whole graph canvas at once (no
-terminal UI toolkit has a production nested-DAG widget, so this follows
-the `nix-tree` drill-in/out pattern instead). It has no embedded Neovim
-grid; `Ctrl-e` on the file pane instead suspends the TUI and hands off to
-a real `nvim` process (lazygit-style), resuming when it exits.
+The terminal UI (`--tui`) reuses the same diff/file panes as the GUI, but
+its graph screen is a `git log --graph`/`jj log`-style vertical scroll
+instead of a 2D canvas: one row per visible module, top to bottom in
+dependency-layer order, with a rail gutter on the left drawing the
+dependency edges between rows. `j`/`k` move down/up that row list; `h`/`l`
+collapse/expand the focused row's namespace into a single summary row
+("zoom out" to the big picture, then back in), which is why the graph
+opens fully expanded by default -- vdiff's change sets are usually small
+enough (15-40 visible modules) that the big picture fits without folding
+anything. Every other binding (`gd`/`gr`, `gt`, `t`, `v`, `c`, `Enter`,
+`d`, `q`, `Esc`) matches the GUI. It has no embedded Neovim grid; `Ctrl-e`
+on the file pane instead suspends the TUI and hands off to a real `nvim`
+process (lazygit-style), resuming when it exits.
 
 `--pr <url>` (reviewing a GitHub PR directly) is on the roadmap, not
 available yet.
 
 ## Keys
+
+GUI (`h`/`j`/`k`/`l` move within/between the graph's dependency layers;
+zoom is a 2D-canvas-only concept):
 
 | Key(s)              | Does                                                        |
 |---------------------|--------------------------------------------------------------|
@@ -79,6 +89,16 @@ available yet.
 | `+` / `-` / `=`      | Zoom in / out / reset                                          |
 | `Esc`                | Back out (close file pane, close diff, ...)                    |
 | `Ctrl-w h` / `Ctrl-w l` | Move focus between the graph and file panes                |
+
+`--tui`'s rail DAG screen differs on `h`/`j`/`k`/`l` only (everything else
+above still applies, `Enter`/`d`/`t`/`c`/`gd`/`gr`/`Esc`/`Ctrl-w h/l`
+included):
+
+| Key(s)  | Does                                              |
+|---------|----------------------------------------------------|
+| `j` `k` | Move focus down/up the visible row list             |
+| `h`     | Collapse the focused row's namespace into one row   |
+| `l`     | Expand the focused (collapsed) namespace row        |
 
 ## Review comments
 

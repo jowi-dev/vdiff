@@ -1,11 +1,25 @@
-//! Pure(-ish) `ratatui` rendering for the focused-neighborhood view (issue
-//! #16): the focused module plus its direct dependencies and dependents,
-//! one frame of the call-stack story at a time -- the nix-tree pattern,
-//! not a ported graph canvas (see the module's own top-level doc for why).
+//! Pure(-ish) `ratatui` rendering for the `--tui` graph screen: a git-log-
+//! style vertical rail DAG (issue #16 phase 2), replacing the phase-1
+//! focused-neighborhood view (three columns of dependents/focused/
+//! dependencies) after real use found that view "less helpful than just
+//! looking at the directory directly" -- it couldn't show the big picture
+//! or zoom in on it. This screen instead shows every visible module as one
+//! row, top to bottom in the graph's existing layer order (see
+//! [`crate::graph::layers`]), with a left-hand rail gutter drawing the
+//! dependency edges between rows the way `git log --graph`/`jj log` draw
+//! commit ancestry -- see [`crate::graph::rails`] for the pure column-
+//! layout algorithm this paints, and [`crate::core::rail_view`] for the
+//! fold-by-namespace "zoom out" mechanic that can collapse a whole
+//! namespace's rows into one.
+//!
 //! Every function here takes `&core::App`/a `&mut Frame` and paints;
 //! nothing here mutates `App` or performs IO, so this is exercised entirely
 //! through `ratatui::backend::TestBackend` in this module's tests, with no
-//! real terminal involved.
+//! real terminal involved. The one exception to "no mutation" is scroll
+//! bookkeeping: [`clamp_scroll`] is a pure function of its inputs, but the
+//! *value* it returns is threaded through [`crate::tui::TuiState`] by the
+//! caller (`crate::tui::event_loop`), the same way [`file_view_visible_rows`]
+//! already feeds `App::viewport_rows` -- see that call site's own comment.
 
 use ratatui::layout::{Alignment, Constraint, Direction as LayoutDirection, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -16,10 +30,29 @@ use ratatui::Frame;
 use crate::core::app::{App, Pane, Screen};
 use crate::core::diff_state::DiffMode;
 use crate::core::file_view::FileViewState;
-use crate::core::focus::{dep_targets, dependent_sources};
+use crate::core::rail_view::{self, RailRow};
 use crate::graph::model::{GitStatus, NodeId};
+use crate::graph::rails::{self, RailRole};
 use crate::review::findings::Severity;
 use crate::tui::highlight;
+
+/// Warm accent for a rail cell belonging to the focused node's own outgoing
+/// (dependency) edges -- the same RGB the GUI's
+/// `crate::ui::theme::EDGE_OUTGOING` paints, duplicated here rather than
+/// imported since `crate::ui` sits behind the `gui` feature and this module
+/// must build under `--no-default-features --features tui` alone.
+const RAIL_OUTGOING: Color = Color::Rgb(0xe0, 0x8a, 0x3d);
+/// Cool accent for a rail cell belonging to the focused node's own incoming
+/// (dependent) edges -- mirrors `crate::ui::theme::EDGE_INCOMING`.
+const RAIL_INCOMING: Color = Color::Rgb(0x4d, 0xc8, 0xe8);
+/// Dim color for every rail cell not touching the focused node -- keeps a
+/// dense gutter readable (see the module doc/task brief's "visual
+/// hierarchy" requirement).
+const RAIL_DIM: Color = Color::DarkGray;
+/// How many rows of buffer [`clamp_scroll`] tries to keep between the
+/// focused row and the viewport's top/bottom edge, when the viewport is
+/// tall enough to afford it.
+const SCROLL_MARGIN: usize = 2;
 
 /// Height in rows of the bottom legend/status strip, constant across every
 /// screen so [`file_view_visible_rows`] (which needs to agree with what
@@ -47,15 +80,18 @@ pub fn file_view_visible_rows(terminal_rows: u16) -> usize {
         .max(1) as usize
 }
 
-/// Paint one frame for the current `app` state: the graph screen (focused
-/// neighborhood or file pane, per [`App::pane`]) or the full-screen diff
-/// pane, per [`App::screen`], plus the bottom legend strip and any open
-/// edge-picker overlay. `notice`, when set, takes over the legend strip's
-/// hint line for this one frame -- see `crate::tui::TuiState::notice`'s doc
-/// for why the TUI needs this display-only glue state at all (in short:
-/// `eprintln!` is invisible/garbled while the alternate screen owns the
-/// terminal).
-pub fn draw(frame: &mut Frame, app: &App, notice: Option<&str>) {
+/// Paint one frame for the current `app` state: the graph screen (the rail
+/// DAG or file pane, per [`App::pane`]) or the full-screen diff pane, per
+/// [`App::screen`], plus the bottom legend strip and any open edge-picker
+/// overlay. `notice`, when set, takes over the legend strip's hint line for
+/// this one frame -- see `crate::tui::TuiState::notice`'s doc for why the
+/// TUI needs this display-only glue state at all (in short: `eprintln!` is
+/// invisible/garbled while the alternate screen owns the terminal).
+/// `rail_scroll` is the rail view's current scroll offset (row index of the
+/// topmost visible row), already clamped by the caller via [`clamp_scroll`]
+/// -- see [`rail_visible_rows`]'s doc for why that clamping happens in
+/// `crate::tui::event_loop` rather than in here.
+pub fn draw(frame: &mut Frame, app: &App, notice: Option<&str>, rail_scroll: usize) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(LayoutDirection::Vertical)
@@ -63,6 +99,7 @@ pub fn draw(frame: &mut Frame, app: &App, notice: Option<&str>) {
         .split(area);
     let (main_area, legend_area) = (chunks[0], chunks[1]);
 
+    let mut dropped_edges = 0;
     match app.screen {
         Screen::Graph => {
             if app.pane == Pane::File {
@@ -75,23 +112,80 @@ pub fn draw(frame: &mut Frame, app: &App, notice: Option<&str>) {
                     );
                 }
             } else {
-                draw_neighborhood(frame, main_area, app);
+                dropped_edges = draw_rail_graph(frame, main_area, app, rail_scroll);
             }
         }
         Screen::Diff => draw_diff(frame, main_area, app),
     }
 
-    draw_legend(frame, legend_area, app, notice);
+    draw_legend(frame, legend_area, app, notice, dropped_edges);
 
     if app.pane == Pane::Graph {
         draw_picker(frame, area, app);
     }
 }
 
+/// How many rail-view data rows fit in a terminal of `terminal_rows` total
+/// rows -- the rail area fills everything above the legend strip, with no
+/// border/header of its own (unlike [`file_view_visible_rows`]'s file pane,
+/// the rail view has no per-pane chrome eating into it, so this is just
+/// [`LEGEND_HEIGHT`] subtracted). Shared between [`draw`] (which must
+/// actually render that many rows) and `crate::tui::event_loop` (which
+/// feeds this into [`clamp_scroll`] every frame, mirroring exactly how
+/// `event_loop` already threads [`file_view_visible_rows`] into
+/// `App::viewport_rows` before each `terminal.draw` call).
+pub fn rail_visible_rows(terminal_rows: u16) -> usize {
+    terminal_rows.saturating_sub(LEGEND_HEIGHT).max(1) as usize
+}
+
+/// Adjust `scroll` (the previous frame's topmost visible row index) by as
+/// little as possible so `focus_idx` stays within [`SCROLL_MARGIN`] rows of
+/// the viewport's top/bottom edge -- a scroll-margin policy (like `vim`'s
+/// `scrolloff`), not a center-on-jump one: a `gd`/`gr` jump to a far row
+/// still lands inside the margin rather than dead-center, but since this
+/// runs fresh every frame from the current `scroll`/`focus_idx` regardless
+/// of *why* focus moved, a far jump is still guaranteed visible -- no
+/// special-casing needed for `gd`/`gr` versus plain `j`/`k`. Degrades
+/// gracefully when `viewport_height` is too short to afford a full margin
+/// on both ends (halves the margin rather than refusing to scroll at all).
+/// Always returns a value in `0..=total_rows.saturating_sub(viewport_height)`.
+pub fn clamp_scroll(
+    scroll: usize,
+    focus_idx: usize,
+    total_rows: usize,
+    viewport_height: usize,
+) -> usize {
+    if viewport_height == 0 {
+        return 0;
+    }
+    let max_scroll = total_rows.saturating_sub(viewport_height);
+    let margin = SCROLL_MARGIN.min(viewport_height.saturating_sub(1) / 2);
+    let scroll = scroll.min(max_scroll);
+
+    let min_visible = scroll + margin;
+    let max_visible = scroll + viewport_height - 1 - margin;
+
+    let adjusted = if focus_idx < min_visible {
+        focus_idx.saturating_sub(margin)
+    } else if focus_idx > max_visible {
+        focus_idx + margin + 1 - viewport_height
+    } else {
+        scroll
+    };
+    adjusted.min(max_scroll)
+}
+
 /// One node's rendered line: a status-colored bullet, its display name, and
 /// trailing badges -- changed-test checkmark, findings count/severity,
-/// comment count, reviewed mark. Shared by every column in
-/// [`draw_neighborhood`] so the badge set never drifts between them.
+/// comment count, reviewed mark. Shared by every row [`row_line`] builds
+/// for a [`RailRow::Node`], so the badge set stays exactly what the GUI's
+/// own `crate::ui::graph_view::paint_node`/badge functions paint. A
+/// reviewed node's entire line gets [`Modifier::DIM`] on top of its normal
+/// colors -- the terminal analogue of the GUI's
+/// `crate::ui::theme::dim_reviewed` (which blends a box's fill 1/3 toward
+/// gray): a true partial color blend isn't expressible per-glyph in a
+/// 16/256-color terminal palette, so `DIM` is the closest "still legible,
+/// visibly muted" terminal equivalent.
 fn node_line(app: &App, id: &NodeId) -> Line<'static> {
     let Some(node) = app.graph.node(id) else {
         return Line::from(id.to_string());
@@ -122,6 +216,11 @@ fn node_line(app: &App, id: &NodeId) -> Line<'static> {
     if app.reviewed.contains(id) {
         spans.push(Span::styled(" ✔", Style::default().fg(Color::Cyan)));
     }
+    if app.reviewed.contains(id) {
+        for span in &mut spans {
+            span.style = span.style.add_modifier(Modifier::DIM);
+        }
+    }
     Line::from(spans)
 }
 
@@ -142,65 +241,158 @@ fn severity_color(severity: Severity) -> Color {
     }
 }
 
-/// The nix-tree-style neighborhood view: dependents (things that call into
-/// the focused node) above, the focused node itself in the middle, direct
-/// dependencies (what the focused node calls into) below -- one frame of
-/// the call-stack story at a time, not the whole graph. A layer breadcrumb
-/// ("Layer i/n") sits in the focused block's title.
-fn draw_neighborhood(frame: &mut Frame, area: Rect, app: &App) {
-    let rows = Layout::default()
-        .direction(LayoutDirection::Vertical)
-        .constraints([
-            Constraint::Percentage(35),
-            Constraint::Length(5),
-            Constraint::Percentage(35),
-        ])
-        .split(area);
-    let (dependents_area, focus_area, deps_area) = (rows[0], rows[1], rows[2]);
-
-    let dependents = dependent_sources(&app.graph, &app.focus);
-    let deps = dep_targets(&app.graph, &app.focus);
-
-    draw_node_list(frame, dependents_area, "Called by", &dependents, app);
-    draw_focused_block(frame, focus_area, app);
-    draw_node_list(frame, deps_area, "Calls", &deps, app);
-}
-
-fn draw_node_list(frame: &mut Frame, area: Rect, title: &str, ids: &[NodeId], app: &App) {
-    let items: Vec<ListItem> = if ids.is_empty() {
-        vec![ListItem::new(Span::styled(
-            "(none)",
-            Style::default().fg(Color::DarkGray),
-        ))]
-    } else {
-        ids.iter()
-            .map(|id| ListItem::new(node_line(app, id)))
-            .collect()
-    };
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
-    frame.render_widget(list, area);
-}
-
-fn draw_focused_block(frame: &mut Frame, area: Rect, app: &App) {
-    let breadcrumb = layer_breadcrumb(&app.layers, &app.focus);
-    let title = format!(" Focused -- {breadcrumb} ");
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(Style::default().add_modifier(Modifier::BOLD));
-    let line = node_line(app, &app.focus);
-    frame.render_widget(Paragraph::new(line).block(block), area);
-}
-
-/// `"Layer i/n"`, 1-based, for whichever layer of `layers` contains
-/// `focus`, or `"Layer ?"` if it isn't in any (shouldn't happen for a
-/// focusable node, but this is render-time display, not a navigation
-/// invariant, so it degrades gracefully rather than panicking).
-fn layer_breadcrumb(layers: &[Vec<NodeId>], focus: &NodeId) -> String {
-    match layers.iter().position(|layer| layer.contains(focus)) {
-        Some(idx) => format!("Layer {}/{}", idx + 1, layers.len()),
-        None => "Layer ?".to_string(),
+/// The git-log-style rail DAG: one row per visible module (see
+/// [`crate::core::rail_view::visible_rows`]), in the graph's existing layer
+/// order, with a left-hand rail gutter (see [`crate::graph::rails`]) drawing
+/// the dependency edges between rows -- big picture by default (issue #16
+/// phase 2's whole point), zoomed in via fold-by-namespace (`h`/`l`) and
+/// scrolled via `j`/`k`/`gd`/`gr`. Only `rail_scroll..rail_scroll +
+/// area.height` rows are ever built into [`Line`]s -- the caller
+/// (`crate::tui::event_loop`) has already clamped `rail_scroll` (see
+/// [`clamp_scroll`]) so the focused row is guaranteed inside that window.
+/// Returns the rail layout's `dropped_edges` count (`0` unless the gutter's
+/// width cap kicked in -- see [`crate::graph::rails::compute`]'s doc) so
+/// [`draw`] can pass it on to [`draw_legend`]'s `+N edges` hint.
+fn draw_rail_graph(frame: &mut Frame, area: Rect, app: &App, rail_scroll: usize) -> usize {
+    let rows = rail_view::visible_rows_with_layers(&app.graph, &app.layers, &app.fold_collapsed);
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new("(no visible nodes)").alignment(Alignment::Center),
+            area,
+        );
+        return 0;
     }
+
+    let row_ids: Vec<NodeId> = rows.iter().map(|(row, _)| row.id().clone()).collect();
+    let edges = rail_view::collapse_edges(&app.graph, &app.graph.edges, &app.fold_collapsed);
+    let rail_layout = rails::compute(&row_ids, &edges, &app.focus, area.width as usize);
+
+    let start = rail_scroll.min(rows.len().saturating_sub(1));
+    let end = (start + area.height as usize).min(rows.len());
+    // The layer of the row just above the viewport (if any), so a band
+    // separator isn't spuriously repainted at the very top of the viewport
+    // for a layer that actually started further up, already scrolled past.
+    let mut prev_layer = start.checked_sub(1).map(|i| rows[i].1);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(end - start);
+    for (idx, (row, layer)) in rows.iter().enumerate().take(end).skip(start) {
+        if prev_layer != Some(*layer) {
+            lines.push(band_separator_line(*layer, area.width));
+        }
+        prev_layer = Some(*layer);
+
+        let focused = row.id() == &app.focus;
+        lines.push(row_line(app, row, &rail_layout, idx, focused));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+    rail_layout.dropped_edges
+}
+
+/// A dim `── layer N ──` rule spanning `width` columns, matching the GUI's
+/// band-separator convention (a faint horizontal line between layers -- see
+/// `crate::ui::graph_view::paint_band_separators`) in spirit, as plain text
+/// since there's no line-painting primitive worth reaching for here.
+fn band_separator_line(layer: usize, width: u16) -> Line<'static> {
+    let label = format!(" layer {} ", layer + 1);
+    let dashes = (width as usize).saturating_sub(label.len()) / 2;
+    let text = format!(
+        "{}{}{}",
+        "─".repeat(dashes),
+        label,
+        "─".repeat((width as usize).saturating_sub(dashes + label.len()))
+    );
+    Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+}
+
+/// One rendered row: the rail gutter (see [`gutter_spans`]), a focus marker,
+/// then the row's own content -- [`node_line`] for a [`RailRow::Node`], or
+/// a `"name/ (N modules, M changed)"` summary for a [`RailRow::Collapsed`]
+/// namespace (see the task brief's fold-by-namespace summary format).
+fn row_line(
+    app: &App,
+    row: &RailRow,
+    rail_layout: &rails::RailLayout,
+    row_idx: usize,
+    focused: bool,
+) -> Line<'static> {
+    let mut spans = gutter_spans(rail_layout, row_idx);
+    spans.push(Span::raw(if focused { "▸ " } else { "  " }));
+    match row {
+        RailRow::Node(id) => spans.extend(node_line(app, id).spans),
+        RailRow::Collapsed {
+            namespace,
+            module_count,
+            changed_count,
+        } => spans.extend(collapsed_row_spans(
+            app,
+            namespace,
+            *module_count,
+            *changed_count,
+        )),
+    }
+    if focused {
+        for span in &mut spans {
+            span.style = span.style.add_modifier(Modifier::BOLD);
+        }
+    }
+    Line::from(spans)
+}
+
+/// The gutter portion of one row: one styled space/glyph per rail column
+/// (`0..rail_layout.columns`), colored per [`RailRole`] -- dim for
+/// [`RailRole::Normal`], the two accent colors for the focused node's own
+/// edges (see the module doc's `RAIL_*` constants).
+fn gutter_spans(rail_layout: &rails::RailLayout, row_idx: usize) -> Vec<Span<'static>> {
+    let cells = rail_layout
+        .rows
+        .get(row_idx)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    (0..rail_layout.columns)
+        .map(|column| match cells.iter().find(|c| c.column == column) {
+            Some(cell) => Span::styled(
+                cell.glyph.to_string(),
+                Style::default().fg(role_color(cell.role)),
+            ),
+            None => Span::raw(" "),
+        })
+        .collect()
+}
+
+fn role_color(role: RailRole) -> Color {
+    match role {
+        RailRole::Normal => RAIL_DIM,
+        RailRole::FocusedOutgoing => RAIL_OUTGOING,
+        RailRole::FocusedIncoming => RAIL_INCOMING,
+    }
+}
+
+/// `"<name>/ (N modules, M changed)"` for a collapsed namespace row -- the
+/// task brief's fold summary format.
+fn collapsed_row_spans(
+    app: &App,
+    namespace: &NodeId,
+    module_count: usize,
+    changed_count: usize,
+) -> Vec<Span<'static>> {
+    let name = app
+        .graph
+        .node(namespace)
+        .map(|n| n.display_name.clone())
+        .unwrap_or_else(|| namespace.to_string());
+    let modules_word = if module_count == 1 {
+        "module"
+    } else {
+        "modules"
+    };
+    let text = format!("{name}/ ({module_count} {modules_word}, {changed_count} changed)");
+    vec![Span::styled(
+        text,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )]
 }
 
 fn draw_file_view(frame: &mut Frame, area: Rect, file_view: &FileViewState) {
@@ -459,13 +651,26 @@ fn draw_diff_side_by_side(
 /// terminal grid. `notice`, when `Some`, replaces the hint line for this
 /// frame rather than appending a third line -- see [`draw`]'s doc for why
 /// the TUI needs a notice mechanism at all in place of `eprintln!`.
-fn draw_legend(frame: &mut Frame, area: Rect, app: &App, notice: Option<&str>) {
+/// `dropped_edges` (from [`draw_rail_graph`]'s return) appends a `+N edges`
+/// hint when the rail gutter's width cap dropped some -- see
+/// [`crate::graph::rails::compute`]'s doc.
+fn draw_legend(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    notice: Option<&str>,
+    dropped_edges: usize,
+) {
     let hint = match notice {
         Some(notice) => notice.to_string(),
         None => match (app.screen, app.pane) {
             (Screen::Graph, Pane::Graph) => {
-                "h/j/k/l move  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
-                    .to_string()
+                let mut hint = "j/k move  h/l fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
+                    .to_string();
+                if dropped_edges > 0 {
+                    hint.push_str(&format!("  (+{dropped_edges} edges hidden, gutter capped)"));
+                }
+                hint
             }
             (Screen::Graph, Pane::File) => {
                 "j/k scroll  Ctrl-d/u half-page  gg/G top/bottom  ]c/[c change  ]f/[f file  Ctrl-e edit  d diff  Esc back"
@@ -541,8 +746,8 @@ mod tests {
     use std::path::PathBuf;
 
     /// `leaf` depends on `target`; both are drawn (real, non-synthetic)
-    /// nodes -- enough to exercise the neighborhood view's "called by"/
-    /// "calls" columns in both directions.
+    /// nodes -- enough to exercise the rail graph's edge rendering in both
+    /// directions.
     fn graph_fixture() -> ProjectGraph {
         let leaf = NodeId::from("leaf");
         let target = NodeId::from("target");
@@ -601,22 +806,32 @@ mod tests {
         }
     }
 
-    /// Render `app` to an 80x24 [`TestBackend`] and flatten the resulting
-    /// buffer to a single string (row-major, no separators) for substring
-    /// assertions -- headless, no real terminal involved.
+    /// Render `app` to an 80x24 [`TestBackend`] at `rail_scroll` and
+    /// flatten the resulting buffer to a single string (row-major, no
+    /// separators) for substring assertions -- headless, no real terminal
+    /// involved.
     fn render_to_string(app: &App) -> String {
-        render_to_string_with_notice(app, None)
+        render_to_string_at(app, 80, 24, 0)
     }
 
-    /// Like [`render_to_string`], but with a legend-strip notice (see
-    /// [`draw`]'s `notice` parameter) -- used by tests exercising
-    /// `crate::tui::TuiState::notice`'s render side without needing the
-    /// glue that sets it.
-    pub(crate) fn render_to_string_with_notice(app: &App, notice: Option<&str>) -> String {
-        let backend = TestBackend::new(80, 24);
+    /// Like [`render_to_string`], but at an arbitrary terminal size and
+    /// scroll offset -- used by tests exercising the rail view at both the
+    /// 80x24 and 200x50 sizes the task brief calls out, and by scroll tests.
+    fn render_to_string_at(app: &App, width: u16, height: u16, rail_scroll: usize) -> String {
+        render_impl(app, width, height, None, rail_scroll)
+    }
+
+    fn render_impl(
+        app: &App,
+        width: u16,
+        height: u16,
+        notice: Option<&str>,
+        rail_scroll: usize,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, app, notice))
+            .draw(|frame| draw(frame, app, notice, rail_scroll))
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let mut out = String::new();
@@ -630,32 +845,129 @@ mod tests {
     }
 
     #[test]
-    fn neighborhood_view_shows_focused_node_and_its_dependency() {
+    fn rail_graph_shows_every_visible_row() {
         let app = app_at("leaf");
         let text = render_to_string(&app);
-        assert!(text.contains("Focused"), "focused block title missing");
         assert!(text.contains("leaf"), "focused node name missing");
-        assert!(text.contains("Calls"), "deps column title missing");
         assert!(text.contains("target"), "dependency name missing");
-        assert!(text.contains("Layer 1/"), "layer breadcrumb missing");
     }
 
     #[test]
-    fn neighborhood_view_shows_dependents_column() {
-        let app = app_at("target");
+    fn rail_graph_draws_a_rail_between_dependent_rows() {
+        let app = app_at("leaf");
         let text = render_to_string(&app);
         assert!(
-            text.contains("Called by"),
-            "dependents column title missing"
+            text.contains('╮') || text.contains('╯'),
+            "expected a rail connector glyph somewhere in the gutter, got: {text}"
         );
-        assert!(text.contains("leaf"), "dependent name missing");
     }
 
     #[test]
-    fn neighborhood_view_shows_none_placeholder_with_no_edges() {
-        let app = app_at("target");
+    fn rail_graph_renders_at_a_wide_terminal_size_too() {
+        let app = app_at("leaf");
+        let text = render_to_string_at(&app, 200, 50, 0);
+        assert!(text.contains("leaf"));
+        assert!(text.contains("target"));
+    }
+
+    #[test]
+    fn focused_row_gets_a_marker() {
+        let app = app_at("leaf");
         let text = render_to_string(&app);
-        assert!(text.contains("(none)"), "target has no outgoing deps");
+        assert!(text.contains('▸'), "expected the focus marker glyph");
+    }
+
+    #[test]
+    fn reviewed_node_line_is_dimmed() {
+        let mut app = app_at("leaf");
+        app.reviewed.insert(NodeId::from("leaf"));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        terminal
+            .draw(|frame| draw(frame, &app, None, 0))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let dimmed = (0..buffer.area.height).any(|y| {
+            (0..buffer.area.width).any(|x| {
+                let cell = &buffer[(x, y)];
+                cell.symbol() == "l"
+                    && cell
+                        .style()
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::DIM)
+            })
+        });
+        assert!(dimmed, "expected the reviewed node's line to carry DIM");
+    }
+
+    #[test]
+    fn fold_collapsed_namespace_renders_a_summary_row() {
+        let (graph, ns_id) = namespaced_graph_fixture();
+        let layers = crate::graph::layers::assign_layers(&graph);
+        let result = layout(&graph);
+        let rows = crate::graph::layout::rows_with_x_centers(&result);
+        let mut collapsed = HashSet::new();
+        collapsed.insert(ns_id.clone());
+        let app = App {
+            graph,
+            layers,
+            rows,
+            focus: ns_id,
+            screen: Screen::Graph,
+            diff: None,
+            picker: None,
+            show_tests: false,
+            file_view: None,
+            pane: Pane::Graph,
+            viewport_rows: 1,
+            reviewed: HashSet::new(),
+            findings: HashMap::new(),
+            comments: HashMap::new(),
+            fold_collapsed: collapsed,
+        };
+        let text = render_to_string(&app);
+        assert!(text.contains("modules"), "expected the fold summary text");
+    }
+
+    /// A namespace `ns` with two drawn children `a`/`b` (no edges) -- for
+    /// fold-rendering tests. Returns the graph plus the namespace's id.
+    fn namespaced_graph_fixture() -> (ProjectGraph, NodeId) {
+        let ns_id = NodeId::from("ns");
+        let a_id = NodeId::from("a");
+        let b_id = NodeId::from("b");
+        let leaf = |id: &NodeId, name: &str| ModuleNode {
+            id: id.clone(),
+            display_name: name.to_string(),
+            parent: Some(ns_id.clone()),
+            children: vec![],
+            status: GitStatus::Modified,
+            files: vec![FileRef {
+                path: PathBuf::from(format!("{name}.rs")),
+                base_blob: Some("b".to_string()),
+                head_blob: Some("h".to_string()),
+            }],
+        };
+        let mut nodes = HashMap::new();
+        nodes.insert(a_id.clone(), leaf(&a_id, "a"));
+        nodes.insert(b_id.clone(), leaf(&b_id, "b"));
+        nodes.insert(
+            ns_id.clone(),
+            ModuleNode {
+                id: ns_id.clone(),
+                display_name: "ns".to_string(),
+                parent: None,
+                children: vec![a_id, b_id],
+                status: GitStatus::Unchanged,
+                files: vec![],
+            },
+        );
+        (
+            ProjectGraph {
+                roots: vec![ns_id.clone()],
+                nodes,
+                edges: vec![],
+            },
+            ns_id,
+        )
     }
 
     #[test]
@@ -664,6 +976,53 @@ mod tests {
         let text = render_to_string(&app);
         assert!(text.contains("reviewed"));
         assert!(text.contains("q quit"));
+        assert!(text.contains("h/l fold/unfold"));
+    }
+
+    #[test]
+    fn clamp_scroll_keeps_focus_within_margin() {
+        // 20 rows, a 5-row viewport: focusing row 10 while scrolled to 0
+        // must scroll forward so row 10 is visible with margin.
+        let scroll = clamp_scroll(0, 10, 20, 5);
+        assert!(scroll > 0);
+        assert!(10 >= scroll && 10 < scroll + 5);
+    }
+
+    #[test]
+    fn clamp_scroll_is_a_noop_when_focus_already_comfortably_visible() {
+        let scroll = clamp_scroll(3, 6, 20, 10);
+        assert_eq!(scroll, 3, "row 6 sits well inside [3+margin, 3+9-margin]");
+    }
+
+    #[test]
+    fn clamp_scroll_adjusts_minimally_when_focus_sits_inside_the_margin() {
+        // Margin is 2 here; focus at row 4 with scroll 3 is within the
+        // top margin (rows 3/4 are the two margin rows), so scroll must
+        // pull back just enough to restore the margin, not jump further.
+        let scroll = clamp_scroll(3, 4, 20, 10);
+        assert_eq!(scroll, 2);
+    }
+
+    #[test]
+    fn clamp_scroll_never_scrolls_past_the_last_page() {
+        let scroll = clamp_scroll(0, 19, 20, 10);
+        assert_eq!(scroll, 10, "max_scroll = total_rows - viewport_height");
+    }
+
+    #[test]
+    fn clamp_scroll_is_zero_when_everything_fits() {
+        let scroll = clamp_scroll(5, 3, 8, 20);
+        assert_eq!(scroll, 0);
+    }
+
+    #[test]
+    fn rail_visible_rows_matches_terminal_rows_minus_legend_height() {
+        assert_eq!(rail_visible_rows(30), (30 - LEGEND_HEIGHT) as usize);
+    }
+
+    #[test]
+    fn rail_visible_rows_never_zero_on_a_tiny_terminal() {
+        assert_eq!(rail_visible_rows(0), 1);
     }
 
     #[test]

@@ -100,22 +100,43 @@ pub fn visible_rows(
     layers: &[Vec<NodeId>],
     collapsed: &HashSet<NodeId>,
 ) -> Vec<RailRow> {
+    visible_rows_with_layers(graph, layers, collapsed)
+        .into_iter()
+        .map(|(row, _layer)| row)
+        .collect()
+}
+
+/// Like [`visible_rows`], but each row is paired with the original
+/// (pre-fold) layer index it was first encountered at while walking
+/// `layers` -- what `crate::tui::render`'s band-separator hint needs to
+/// know where one layer's rows end and the next begin, even once folding
+/// has interleaved/dropped some of them. A collapsed row reports the layer
+/// of its *shallowest* absorbed member (the first one `visible_rows`
+/// happens to walk into, per the module doc's derivation order).
+pub fn visible_rows_with_layers(
+    graph: &ProjectGraph,
+    layers: &[Vec<NodeId>],
+    collapsed: &HashSet<NodeId>,
+) -> Vec<(RailRow, usize)> {
     let mut rows = Vec::new();
     let mut emitted: HashSet<NodeId> = HashSet::new();
-    for layer in layers {
+    for (layer_idx, layer) in layers.iter().enumerate() {
         for id in layer {
             match collapse_root(graph, id, collapsed) {
                 Some(namespace) => {
                     if emitted.insert(namespace.clone()) {
                         let (module_count, changed_count) = namespace_stats(graph, &namespace);
-                        rows.push(RailRow::Collapsed {
-                            namespace,
-                            module_count,
-                            changed_count,
-                        });
+                        rows.push((
+                            RailRow::Collapsed {
+                                namespace,
+                                module_count,
+                                changed_count,
+                            },
+                            layer_idx,
+                        ));
                     }
                 }
-                None => rows.push(RailRow::Node(id.clone())),
+                None => rows.push((RailRow::Node(id.clone()), layer_idx)),
             }
         }
     }
@@ -259,7 +280,12 @@ mod tests {
         )
     }
 
-    fn namespace(id: &str, name: &str, parent: Option<&str>, children: &[&str]) -> (NodeId, ModuleNode) {
+    fn namespace(
+        id: &str,
+        name: &str,
+        parent: Option<&str>,
+        children: &[&str],
+    ) -> (NodeId, ModuleNode) {
         let node_id = NodeId::from(id);
         (
             node_id.clone(),
@@ -312,7 +338,10 @@ mod tests {
     }
 
     fn layers_fixture() -> Vec<Vec<NodeId>> {
-        vec![vec![NodeId::from("a1"), NodeId::from("a2")], vec![NodeId::from("b1")]]
+        vec![
+            vec![NodeId::from("a1"), NodeId::from("a2")],
+            vec![NodeId::from("b1")],
+        ]
     }
 
     #[test]
@@ -381,7 +410,11 @@ mod tests {
         // the same (ns_a, ns_b) pair.
         let (a3_id, a3) = leaf("a3", "a3", Some("ns_a"), GitStatus::Unchanged);
         g.nodes.insert(a3_id.clone(), a3);
-        g.nodes.get_mut(&NodeId::from("ns_a")).unwrap().children.push(a3_id.clone());
+        g.nodes
+            .get_mut(&NodeId::from("ns_a"))
+            .unwrap()
+            .children
+            .push(a3_id.clone());
         g.edges.push(DepEdge {
             from: a3_id,
             to: NodeId::from("b1"),
@@ -439,6 +472,9 @@ mod tests {
             nodes,
             edges: vec![],
         };
-        assert_eq!(first_visible_descendant(&g, &empty_id, &HashSet::new()), None);
+        assert_eq!(
+            first_visible_descendant(&g, &empty_id, &HashSet::new()),
+            None
+        );
     }
 }
