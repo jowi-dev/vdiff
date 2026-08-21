@@ -320,13 +320,39 @@ mod tests {
 
     #[test]
     fn crossing_segments_render_a_plus_glyph() {
-        // A straight vertical at column x, plus a bent segment whose
-        // horizontal run passes directly through that same column at its
-        // own bend row -- forces a real geometric crossing.
-        let layout = simple_layout(
-            &[&["a", "b", "c"], &["a2", "b2", "c2"]],
-            &[("b", "b2"), ("a", "c2")],
-        );
+        // A straight vertical at column 5, plus a bent segment whose
+        // horizontal run spans columns 0..=10 (crossing column 5 at its own
+        // bend row) -- forces a real geometric crossing. Built by hand
+        // (rather than through `sugiyama::layout`) so this exercises only
+        // `route_channels`'s own crossing-glyph logic: issue #18's median
+        // coordinate assignment deliberately straightens most edges that
+        // would otherwise cross, so a fixture routed through the real
+        // layout algorithm can no longer be relied on to still cross.
+        use crate::graph::sugiyama::{RoutedEdge, Slot, SlotId};
+        let slot = |name: &str, x: usize, width: usize| Slot {
+            id: SlotId::Real(id(name)),
+            label: name.to_string(),
+            x,
+            width,
+        };
+        let layout = Layout {
+            bands: vec![
+                vec![slot("straight_top", 5, 1), slot("bent_top", 0, 1)],
+                vec![slot("straight_bottom", 5, 1), slot("bent_bottom", 10, 1)],
+            ],
+            edges: vec![
+                RoutedEdge {
+                    from: id("straight_top"),
+                    to: id("straight_bottom"),
+                    waypoints: vec![(0, 5.5), (1, 5.5)],
+                },
+                RoutedEdge {
+                    from: id("bent_top"),
+                    to: id("bent_bottom"),
+                    waypoints: vec![(0, 0.5), (1, 10.5)],
+                },
+            ],
+        };
         let channels = route_channels(&layout, &id("nobody"));
         let ch = &channels[0];
         let has_crossing = ch.rows.iter().any(|row| row.iter().any(|c| c.glyph == '┼'));
