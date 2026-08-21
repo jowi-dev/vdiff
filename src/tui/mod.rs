@@ -399,6 +399,13 @@ pub fn seed_fold_collapsed_if_dense(app: &mut App) {
     let edge_count = app.graph.edges.len();
     if should_fold_by_default(visible_node_count, edge_count) {
         app.fold_collapsed = default_fold_seed(&app.graph);
+        // `core::app::update`'s central focus remap only runs on dispatch,
+        // so seeding folds before the event loop must remap the initial
+        // focus itself -- otherwise the first paint can have focus pointing
+        // at a node hidden inside a collapsed namespace (no visible focus,
+        // and Enter/`d` acting on a node the user can't see).
+        app.focus =
+            crate::core::rail_view::effective_row_id(&app.graph, &app.focus, &app.fold_collapsed);
     }
 }
 
@@ -1380,5 +1387,21 @@ mod tests {
         app.layers = vec![vec![NodeId::from("x"); FOLD_DEFAULT_NODE_THRESHOLD + 1]];
         seed_fold_collapsed_if_dense(&mut app);
         assert_eq!(app.fold_collapsed, HashSet::from([NodeId::from("parent")]));
+    }
+
+    #[test]
+    fn seed_fold_collapsed_if_dense_remaps_a_focus_inside_a_seeded_fold() {
+        // The central focus remap in `core::app::update` only runs on
+        // dispatch -- seeding folds *before* the event loop must remap the
+        // initial focus itself, or the first paint has a focus pointing at
+        // a node hidden inside a collapsed namespace (invisible focus, and
+        // Enter/`d` acting on a node the user can't see).
+        let graph = graph_with_one_childful_root();
+        let mut app = state_fixture().app;
+        app.graph = graph;
+        app.focus = NodeId::from("leaf");
+        app.layers = vec![vec![NodeId::from("x"); FOLD_DEFAULT_NODE_THRESHOLD + 1]];
+        seed_fold_collapsed_if_dense(&mut app);
+        assert_eq!(app.focus, NodeId::from("parent"));
     }
 }
