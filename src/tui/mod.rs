@@ -288,17 +288,23 @@ fn event_loop(
         if state.app.screen == Screen::Graph && state.app.pane == Pane::Graph {
             let size = terminal.size()?;
             let viewport_height = render::rail_visible_rows(size.height);
-            let rows = crate::core::rail_view::visible_rows(
+            // Display-line space, not row-index space: a band separator
+            // consumes a screen line of its own, so `focus_display_line`/
+            // `display_line_count` (not `rows.len()`/a raw row position)
+            // are what must agree with what `render::draw_rail_graph`
+            // actually renders -- see `render::DisplayLine`'s doc for the
+            // bug this avoids (scroll math that only counted rows could
+            // let the focused row scroll off past the bottom edge once
+            // enough separators fell inside the visible window).
+            let rows = crate::core::rail_view::visible_rows_with_layers(
                 &state.app.graph,
                 &state.app.layers,
                 &state.app.fold_collapsed,
             );
-            let focus_idx = rows
-                .iter()
-                .position(|row| row.id() == &state.app.focus)
-                .unwrap_or(0);
+            let focus_idx = render::focus_display_line(&rows, &state.app.focus).unwrap_or(0);
+            let total_lines = render::display_line_count(&rows);
             state.rail_scroll =
-                render::clamp_scroll(state.rail_scroll, focus_idx, rows.len(), viewport_height);
+                render::clamp_scroll(state.rail_scroll, focus_idx, total_lines, viewport_height);
         }
         terminal.draw(|frame| {
             render::draw(

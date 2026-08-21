@@ -125,21 +125,24 @@ pub fn draw(frame: &mut Frame, app: &App, notice: Option<&str>, rail_scroll: usi
     }
 }
 
-/// How many rail-view data rows fit in a terminal of `terminal_rows` total
-/// rows -- the rail area fills everything above the legend strip, with no
-/// border/header of its own (unlike [`file_view_visible_rows`]'s file pane,
-/// the rail view has no per-pane chrome eating into it, so this is just
+/// How many screen lines fit in a terminal of `terminal_rows` total rows --
+/// the rail area fills everything above the legend strip, with no border/
+/// header of its own (unlike [`file_view_visible_rows`]'s file pane, the
+/// rail view has no per-pane chrome eating into it, so this is just
 /// [`LEGEND_HEIGHT`] subtracted). Shared between [`draw`] (which must
-/// actually render that many rows) and `crate::tui::event_loop` (which
+/// actually render that many lines) and `crate::tui::event_loop` (which
 /// feeds this into [`clamp_scroll`] every frame, mirroring exactly how
 /// `event_loop` already threads [`file_view_visible_rows`] into
-/// `App::viewport_rows` before each `terminal.draw` call).
+/// `App::viewport_rows` before each `terminal.draw` call). Named
+/// `rail_visible_rows` for historical continuity with that pattern, but
+/// note the unit is *screen lines*, not module rows -- see
+/// [`DisplayLine`]'s doc for why those two counts can differ.
 pub fn rail_visible_rows(terminal_rows: u16) -> usize {
     terminal_rows.saturating_sub(LEGEND_HEIGHT).max(1) as usize
 }
 
-/// Adjust `scroll` (the previous frame's topmost visible row index) by as
-/// little as possible so `focus_idx` stays within [`SCROLL_MARGIN`] rows of
+/// Adjust `scroll` (the previous frame's topmost visible line index) by as
+/// little as possible so `focus_idx` stays within [`SCROLL_MARGIN`] lines of
 /// the viewport's top/bottom edge -- a scroll-margin policy (like `vim`'s
 /// `scrolloff`), not a center-on-jump one: a `gd`/`gr` jump to a far row
 /// still lands inside the margin rather than dead-center, but since this
@@ -149,6 +152,15 @@ pub fn rail_visible_rows(terminal_rows: u16) -> usize {
 /// gracefully when `viewport_height` is too short to afford a full margin
 /// on both ends (halves the margin rather than refusing to scroll at all).
 /// Always returns a value in `0..=total_rows.saturating_sub(viewport_height)`.
+///
+/// Generic over what `focus_idx`/`total_rows` count: `crate::tui::event_loop`
+/// calls this with *display-line* indices (see [`DisplayLine`]/
+/// [`focus_display_line`]/[`display_line_count`]), not raw module-row
+/// indices, so that a band separator's extra screen line is accounted for
+/// in the same units [`draw_rail_graph`] actually renders in -- see that
+/// function's doc for the bug this fixes (scroll math that only counted
+/// rows undercounted how tall the rendered content actually was, letting
+/// the focused row scroll off past the bottom edge).
 pub fn clamp_scroll(
     scroll: usize,
     focus_idx: usize,
@@ -173,6 +185,75 @@ pub fn clamp_scroll(
         scroll
     };
     adjusted.min(max_scroll)
+}
+
+/// One screen line the rail view's viewport scrolls over: either a band
+/// separator (see [`band_separator_line`]) or an actual module/namespace
+/// row (an index into whatever `Vec<(RailRow, usize)>` [`build_display_lines`]
+/// was built from). A separator consumes a screen line of its own, just
+/// like a row does -- [`draw_rail_graph`] used to slice its *row* list by
+/// `rail_scroll..rail_scroll + area.height` and insert a separator line
+/// wherever the layer changed within that window, which could push the
+/// total rendered line count past `area.height` whenever more than one
+/// layer transition fell inside the visible window; `ratatui::Paragraph`
+/// then silently clipped the overflow off the bottom, which could push the
+/// focused row itself off-screen despite `clamp_scroll`'s margin -- because
+/// that margin was computed in row-index space, one unit per row, with no
+/// idea separators existed at all. Building this list once up front and
+/// scrolling/clamping in *its* index space (one unit per screen line,
+/// separators included) fixes both sides of that mismatch at the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayLine {
+    /// A layer-band separator, carrying that layer's index.
+    Separator(usize),
+    /// A module/namespace row, carrying its index into the `rows` slice
+    /// [`build_display_lines`] was built from.
+    Row(usize),
+}
+
+/// Build the full (unscrolled) display-line list for `rows` (as returned by
+/// [`rail_view::visible_rows_with_layers`]): a [`DisplayLine::Separator`] is
+/// inserted immediately before the first row of every layer -- including
+/// the very first layer in the list, so the top of a *never-scrolled* rail
+/// view still opens with a band label -- and nowhere else. Building this
+/// once, up front, over the *entire* row list (rather than re-deriving it
+/// per visible window, the way the old per-frame `prev_layer` peek in
+/// `draw_rail_graph` did) means a scrolled-to slice of it never needs to
+/// guess whether a separator belongs at its top: the separator is already
+/// at its one fixed position in this canonical list, so slicing either
+/// includes it (if the slice starts at or before it) or doesn't (if the
+/// slice starts after it) -- never duplicated, never missing.
+fn build_display_lines(rows: &[(RailRow, usize)]) -> Vec<DisplayLine> {
+    let mut lines = Vec::with_capacity(rows.len() + rows.len().min(1));
+    let mut prev_layer: Option<usize> = None;
+    for (idx, (_, layer)) in rows.iter().enumerate() {
+        if prev_layer != Some(*layer) {
+            lines.push(DisplayLine::Separator(*layer));
+        }
+        prev_layer = Some(*layer);
+        lines.push(DisplayLine::Row(idx));
+    }
+    lines
+}
+
+/// The index of `focus`'s row within `rows`' display-line list (see
+/// [`build_display_lines`]), or `None` if `focus` isn't present in `rows`
+/// at all. What `crate::tui::event_loop` feeds into [`clamp_scroll`] as
+/// `focus_idx` every frame, so the scroll margin is computed in the same
+/// display-line space [`draw_rail_graph`] actually renders in -- see
+/// [`DisplayLine`]'s doc for why row-index space alone isn't enough.
+pub fn focus_display_line(rows: &[(RailRow, usize)], focus: &NodeId) -> Option<usize> {
+    build_display_lines(rows)
+        .iter()
+        .position(|line| matches!(line, DisplayLine::Row(idx) if rows[*idx].0.id() == focus))
+}
+
+/// The total number of display lines (rows *and* separators) `rows` renders
+/// as -- what `crate::tui::event_loop` feeds into [`clamp_scroll`] as
+/// `total_rows` instead of `rows.len()`, which would undercount by exactly
+/// the separator count. See [`DisplayLine`]'s doc.
+pub fn display_line_count(rows: &[(RailRow, usize)]) -> usize {
+    build_display_lines(rows).len()
 }
 
 /// One node's rendered line: a status-colored bullet, its display name, and
@@ -246,13 +327,20 @@ fn severity_color(severity: Severity) -> Color {
 /// order, with a left-hand rail gutter (see [`crate::graph::rails`]) drawing
 /// the dependency edges between rows -- big picture by default (issue #16
 /// phase 2's whole point), zoomed in via fold-by-namespace (`h`/`l`) and
-/// scrolled via `j`/`k`/`gd`/`gr`. Only `rail_scroll..rail_scroll +
-/// area.height` rows are ever built into [`Line`]s -- the caller
-/// (`crate::tui::event_loop`) has already clamped `rail_scroll` (see
-/// [`clamp_scroll`]) so the focused row is guaranteed inside that window.
-/// Returns the rail layout's `dropped_edges` count (`0` unless the gutter's
-/// width cap kicked in -- see [`crate::graph::rails::compute`]'s doc) so
-/// [`draw`] can pass it on to [`draw_legend`]'s `+N edges` hint.
+/// scrolled via `j`/`k`/`gd`/`gr`. Slices [`build_display_lines`]'s
+/// canonical (row + separator) line list by
+/// `rail_scroll..rail_scroll + area.height`, so exactly as many screen
+/// lines as fit are ever built into [`Line`]s regardless of how many band
+/// separators happen to fall inside that window -- see [`DisplayLine`]'s
+/// doc for the bug this fixes (the previous version sliced the *row* list
+/// and inserted separators as it went, which could push the actual
+/// rendered line count past `area.height`). The caller
+/// (`crate::tui::event_loop`) has already clamped `rail_scroll` in this
+/// same display-line space (see [`clamp_scroll`]/[`focus_display_line`])
+/// so the focused row is guaranteed inside the window. Returns the rail
+/// layout's `dropped_edges` count (`0` unless the gutter's width cap kicked
+/// in -- see [`crate::graph::rails::compute`]'s doc) so [`draw`] can pass it
+/// on to [`draw_legend`]'s `+N edges` hint.
 fn draw_rail_graph(frame: &mut Frame, area: Rect, app: &App, rail_scroll: usize) -> usize {
     let rows = rail_view::visible_rows_with_layers(&app.graph, &app.layers, &app.fold_collapsed);
     if rows.is_empty() {
@@ -267,22 +355,20 @@ fn draw_rail_graph(frame: &mut Frame, area: Rect, app: &App, rail_scroll: usize)
     let edges = rail_view::collapse_edges(&app.graph, &app.graph.edges, &app.fold_collapsed);
     let rail_layout = rails::compute(&row_ids, &edges, &app.focus, area.width as usize);
 
-    let start = rail_scroll.min(rows.len().saturating_sub(1));
-    let end = (start + area.height as usize).min(rows.len());
-    // The layer of the row just above the viewport (if any), so a band
-    // separator isn't spuriously repainted at the very top of the viewport
-    // for a layer that actually started further up, already scrolled past.
-    let mut prev_layer = start.checked_sub(1).map(|i| rows[i].1);
+    let display_lines = build_display_lines(&rows);
+    let start = rail_scroll.min(display_lines.len().saturating_sub(1));
+    let end = (start + area.height as usize).min(display_lines.len());
 
     let mut lines: Vec<Line> = Vec::with_capacity(end - start);
-    for (idx, (row, layer)) in rows.iter().enumerate().take(end).skip(start) {
-        if prev_layer != Some(*layer) {
-            lines.push(band_separator_line(*layer, area.width));
+    for display_line in &display_lines[start..end] {
+        match display_line {
+            DisplayLine::Separator(layer) => lines.push(band_separator_line(*layer, area.width)),
+            DisplayLine::Row(idx) => {
+                let (row, _layer) = &rows[*idx];
+                let focused = row.id() == &app.focus;
+                lines.push(row_line(app, row, &rail_layout, *idx, focused));
+            }
         }
-        prev_layer = Some(*layer);
-
-        let focused = row.id() == &app.focus;
-        lines.push(row_line(app, row, &rail_layout, idx, focused));
     }
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -1127,5 +1213,173 @@ mod tests {
         app.diff = Some(DiffPaneState::new(NodeId::from("ns"), vec![]));
         let text = render_to_string(&app);
         assert!(text.contains("(no files)"));
+    }
+
+    // -- Fix: band separators break the scroll math (review feedback) -----
+    //
+    // `draw_rail_graph` used to slice its *row* list by
+    // `rail_scroll..rail_scroll + area.height` and insert a band separator
+    // line wherever the layer changed within that window -- so the
+    // rendered line count could exceed `area.height` whenever more than
+    // one layer transition fell inside the visible window, and
+    // `ratatui::Paragraph` silently clipped the overflow off the bottom.
+    // `build_display_lines`/`focus_display_line`/`display_line_count` fix
+    // this by scrolling/clamping in the same (row + separator) line space
+    // `draw_rail_graph` actually renders in.
+
+    /// A strict chain `n0 -> n1 -> ... -> n{count-1}`, each node its own
+    /// layer (longest-path layering puts a linear chain one node per layer
+    /// -- see `crate::graph::layers`' own tests) -- enough layer
+    /// transitions packed into a small viewport to reproduce the clipping
+    /// bug: with a 4-line viewport, a naive row-based slice can need up to
+    /// 4 separators *plus* 4 rows (8 lines) to render 4 rows' worth of
+    /// content.
+    fn chain_graph(count: usize) -> ProjectGraph {
+        let names: Vec<String> = (0..count).map(|i| format!("n{i}")).collect();
+        let mut nodes = HashMap::new();
+        for name in &names {
+            nodes.insert(
+                NodeId::from(name.as_str()),
+                ModuleNode {
+                    id: NodeId::from(name.as_str()),
+                    display_name: name.clone(),
+                    parent: None,
+                    children: vec![],
+                    status: GitStatus::Unchanged,
+                    files: vec![FileRef {
+                        path: PathBuf::from(format!("{name}.rs")),
+                        base_blob: Some("b".to_string()),
+                        head_blob: Some("h".to_string()),
+                    }],
+                },
+            );
+        }
+        let edges: Vec<DepEdge> = names
+            .windows(2)
+            .map(|pair| DepEdge {
+                from: NodeId::from(pair[0].as_str()),
+                to: NodeId::from(pair[1].as_str()),
+                kind: DepKind::Use,
+            })
+            .collect();
+        ProjectGraph {
+            roots: names.iter().map(|n| NodeId::from(n.as_str())).collect(),
+            nodes,
+            edges,
+        }
+    }
+
+    fn app_for_chain(graph: ProjectGraph, focus: &str) -> App {
+        let result = layout(&graph);
+        let rows = crate::graph::layout::rows_with_x_centers(&result);
+        App {
+            graph,
+            layers: result.layers,
+            rows,
+            focus: NodeId::from(focus),
+            screen: Screen::Graph,
+            diff: None,
+            picker: None,
+            show_tests: false,
+            file_view: None,
+            pane: Pane::Graph,
+            viewport_rows: 1,
+            reviewed: HashSet::new(),
+            findings: HashMap::new(),
+            comments: HashMap::new(),
+            fold_collapsed: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn build_display_lines_inserts_one_separator_per_layer_transition() {
+        let graph = chain_graph(3);
+        let rows = crate::core::rail_view::visible_rows_with_layers(
+            &graph,
+            &layout(&graph).layers,
+            &HashSet::new(),
+        );
+        // 3 layers, each with one row: separator, row, separator, row,
+        // separator, row = 6 display lines.
+        assert_eq!(display_line_count(&rows), 6);
+    }
+
+    #[test]
+    fn focus_display_line_counts_separators_ahead_of_the_focused_row() {
+        let graph = chain_graph(3);
+        let layers = layout(&graph).layers;
+        let rows =
+            crate::core::rail_view::visible_rows_with_layers(&graph, &layers, &HashSet::new());
+        // n0 is display-line index 1 (after its own layer's separator);
+        // n2 is display-line index 5 (three separators + two earlier rows
+        // ahead of it).
+        assert_eq!(focus_display_line(&rows, &NodeId::from("n0")), Some(1));
+        assert_eq!(focus_display_line(&rows, &NodeId::from("n2")), Some(5));
+    }
+
+    #[test]
+    fn focus_display_line_none_when_focus_is_not_visible() {
+        let graph = chain_graph(2);
+        let layers = layout(&graph).layers;
+        let rows =
+            crate::core::rail_view::visible_rows_with_layers(&graph, &layers, &HashSet::new());
+        assert_eq!(focus_display_line(&rows, &NodeId::from("ghost")), None);
+    }
+
+    /// Reproduces the clipping bug end to end: 6 single-node layers (12
+    /// display lines total: 6 separators + 6 rows), a 4-line viewport, and
+    /// focus on the very last row -- the row-index-only scroll math this
+    /// fixes would compute a scroll offset that, once separators are
+    /// actually rendered, clips the focused row's line off the bottom.
+    #[test]
+    fn focused_row_stays_visible_at_the_bottom_of_a_deep_chain() {
+        let graph = chain_graph(6);
+        let layers = layout(&graph).layers;
+        let rows =
+            crate::core::rail_view::visible_rows_with_layers(&graph, &layers, &HashSet::new());
+        let focus = NodeId::from("n5");
+        let focus_idx = focus_display_line(&rows, &focus).expect("n5 must be visible");
+        let total_lines = display_line_count(&rows);
+        let viewport_height = 4;
+        let scroll = clamp_scroll(0, focus_idx, total_lines, viewport_height);
+
+        let app = app_for_chain(graph, "n5");
+        // area.height == viewport_height once LEGEND_HEIGHT is subtracted.
+        let text = render_to_string_at(&app, 40, viewport_height as u16 + LEGEND_HEIGHT, scroll);
+        assert!(
+            text.contains("n5"),
+            "focused row must still be on screen, got:\n{text}"
+        );
+    }
+
+    /// Companion to the previous test: after scrolling down to reveal the
+    /// bottom row, moving focus back to the top must scroll back up so the
+    /// top row is visible again (and not, say, get stuck at the previous
+    /// bottom-anchored scroll offset).
+    #[test]
+    fn focused_row_stays_visible_after_scrolling_back_to_the_top() {
+        let graph = chain_graph(6);
+        let layers = layout(&graph).layers;
+        let rows =
+            crate::core::rail_view::visible_rows_with_layers(&graph, &layers, &HashSet::new());
+        let total_lines = display_line_count(&rows);
+        let viewport_height = 4;
+
+        let bottom_focus_idx = focus_display_line(&rows, &NodeId::from("n5")).unwrap();
+        let scrolled_down = clamp_scroll(0, bottom_focus_idx, total_lines, viewport_height);
+        assert!(
+            scrolled_down > 0,
+            "sanity: the chain is taller than the viewport"
+        );
+
+        let top_focus_idx = focus_display_line(&rows, &NodeId::from("n0")).unwrap();
+        let scroll = clamp_scroll(scrolled_down, top_focus_idx, total_lines, viewport_height);
+
+        let app = app_for_chain(graph, "n0");
+        let text = render_to_string_at(&app, 40, viewport_height as u16 + LEGEND_HEIGHT, scroll);
+        assert!(
+            text.contains("n0"),
+            "focused row must be back on screen after scrolling up, got:\n{text}"
+        );
     }
 }

@@ -9,26 +9,44 @@
 //!
 //! # The algorithm
 //!
-//! Every edge `(from_row, to_row)` (`from_row < to_row` -- the caller is
-//! expected to have already dropped/collapsed edges that don't run strictly
-//! downward, since the row order is the graph's topological layer order)
-//! occupies exactly one rail *column* for the span of rows it covers.
-//! Columns are assigned greedily, like a classic interval-graph coloring:
-//! process edges sorted by `(from_row, to_row)`, and for each one reuse the
-//! lowest-numbered column whose current edge has already finished (its
-//! `to_row` is `<=` this edge's `from_row`) -- otherwise open a new column.
-//! This is exactly the minimum-track scheduling used by every git-log-style
-//! renderer, and it guarantees the hard invariant this module is unit-tested
-//! against: two edges whose row spans actually overlap never share a column.
-//! Edges that merely *touch* (one's `to_row` equals another's `from_row`)
-//! are free to share a column, since only one of them is ever "in flight" at
-//! any single row.
+//! Every edge occupies exactly one rail *column* for the span of rows it
+//! covers, keyed by the *unordered* row interval `(top_row, bottom_row)` =
+//! `(min(from_row, to_row), max(from_row, to_row))` -- not by which
+//! endpoint is the dependency's `from`/`to`. This matters once the caller
+//! (`crate::core::rail_view::collapse_edges`) has folded a namespace: a
+//! collapsed row absorbs descendants from several original layers, so a
+//! perfectly ordinary dependency edge between two still-*visible* rows can
+//! end up pointing visually upward in row order (the collapsed row lands
+//! above a row that, structurally, depends on something inside it). Row
+//! order here is a *display* order, not a guaranteed topological one, so
+//! this module never assumes `from_row < to_row` for layout purposes --
+//! only a same-row edge (both endpoints collapsed into the very same row)
+//! has nothing left to rail and is dropped (see [`resolve_spans`]).
+//! [`RailRole`], by contrast, *does* care about true dependency direction
+//! (`FocusedOutgoing`/`FocusedIncoming` need to know which end is really
+//! the focused node's dependency vs. dependent) -- see [`Span`]'s own doc
+//! for how the two are kept independent.
 //!
-//! Each column-row cell is rendered from the one edge active there (if any):
-//! `╮` where the edge starts (`row == from_row`, branching down out of the
-//! row's own node), `╯` where it ends (`row == to_row`, arriving back at the
-//! row's own node), `│` for every row strictly between the two. A column
-//! with no edge covering a given row renders as a blank cell.
+//! Columns are assigned greedily, like a classic interval-graph coloring:
+//! process edges sorted by `(top_row, bottom_row)`, and for each one reuse
+//! the lowest-numbered column whose current edge has already finished (its
+//! `bottom_row` is `<=` this edge's `top_row`) -- otherwise open a new
+//! column. This is exactly the minimum-track scheduling used by every
+//! git-log-style renderer, and it guarantees the hard invariant this
+//! module is unit-tested against: two edges whose row spans actually
+//! overlap never share a column. Edges that merely *touch* (one's
+//! `bottom_row` equals another's `top_row`) are free to share a column,
+//! since only one of them is ever "in flight" at any single row.
+//!
+//! Each column-row cell is rendered from the one edge active there (if
+//! any): `╮` at `top_row` (branching out of that row's own node), `╯` at
+//! `bottom_row` (arriving at that row's own node), `│` for every row
+//! strictly between the two. A column with no edge covering a given row
+//! renders as a blank cell. This glyph choice is purely about the visual
+//! span, independent of dependency direction -- an upward edge renders
+//! with exactly the same `╮`/`│`/`╯` shape a downward one would over the
+//! same two rows; only its [`RailRole`] color (if it touches focus) gives
+//! away that it's semantically reversed.
 //!
 //! # The width cap
 //!
@@ -87,12 +105,13 @@ pub struct RailLayout {
 
 /// Compute the rail gutter for `row_ids` (top-to-bottom display order) and
 /// `edges` (pairs of ids that must both appear in `row_ids`; any edge whose
-/// endpoints aren't both present, or that isn't strictly downward in row
-/// order, is silently dropped -- the caller is responsible for handing in a
-/// graph-consistent edge set, but this stays total rather than panicking on
-/// a malformed one). `focus` picks out [`RailRole::FocusedOutgoing`]/
-/// [`RailRole::FocusedIncoming`] cells. `terminal_width` drives the cap
-/// described in the module doc; pass e.g. the real terminal column count.
+/// endpoints aren't both present, or that resolve to the same row, is
+/// silently dropped -- see [`resolve_spans`]'s doc; an edge that resolves to
+/// two *different* rows is always kept regardless of which direction it
+/// points in that order -- see the module doc). `focus` picks out
+/// [`RailRole::FocusedOutgoing`]/[`RailRole::FocusedIncoming`] cells.
+/// `terminal_width` drives the cap described in the module doc; pass e.g.
+/// the real terminal column count.
 pub fn compute(
     row_ids: &[NodeId],
     edges: &[(NodeId, NodeId)],
@@ -121,36 +140,53 @@ pub fn compute(
     capped
 }
 
-/// One edge resolved to row indices plus the original ids (kept so
-/// [`compute`]'s focus filter can still check identity after resolution).
+/// One edge resolved to row indices, keeping both the *visual* span
+/// (`top_row`/`bottom_row`, unordered -- what column assignment and glyph
+/// placement key off, see the module doc) and the *true* dependency
+/// direction (`from`/`to`, the original edge's own endpoints -- what
+/// [`RailRole`] keys off in [`layout_spans`]). These two are deliberately
+/// independent: `top_row`/`bottom_row` can disagree with `from`'s/`to`'s
+/// row order whenever the display order isn't a strict topological one
+/// (see the module doc's fold-collapse example), but `from`/`to` always
+/// still name the actual dependency, so `FocusedOutgoing`/`FocusedIncoming`
+/// stay semantically correct regardless of which way the rail visually
+/// points.
 #[derive(Debug, Clone)]
 struct Span {
     from: NodeId,
     to: NodeId,
-    from_row: usize,
-    to_row: usize,
+    top_row: usize,
+    bottom_row: usize,
 }
 
 /// Resolve `edges` to [`Span`]s, dropping any edge with an unknown endpoint
-/// or that isn't strictly downward (`from_row < to_row`) -- a same-row edge
-/// has nothing to rail (the caller should have already deduped/dropped
-/// those before calling `compute`), and a reversed one shouldn't occur given
-/// a proper topological row order but is dropped defensively rather than
-/// panicking.
+/// or whose two endpoints resolve to the *same* row -- both endpoints
+/// collapsed into one visible row, so there's nothing left to rail (the
+/// caller, `crate::core::rail_view::collapse_edges`, already drops these
+/// itself before calling `compute`, but this stays defensive rather than
+/// assuming). An edge whose endpoints resolve to two *different* rows is
+/// always kept, however those rows happen to be ordered -- see the module
+/// doc for why an "upward" edge is a real, expected case once fold-collapse
+/// is in play, not a malformed input to guard against.
 fn resolve_spans(edges: &[(NodeId, NodeId)], row_of: &HashMap<&NodeId, usize>) -> Vec<Span> {
     edges
         .iter()
         .filter_map(|(from, to)| {
             let from_row = *row_of.get(from)?;
             let to_row = *row_of.get(to)?;
-            if from_row >= to_row {
+            if from_row == to_row {
                 return None;
             }
+            let (top_row, bottom_row) = if from_row <= to_row {
+                (from_row, to_row)
+            } else {
+                (to_row, from_row)
+            };
             Some(Span {
                 from: from.clone(),
                 to: to.clone(),
-                from_row,
-                to_row,
+                top_row,
+                bottom_row,
             })
         })
         .collect()
@@ -171,7 +207,7 @@ struct Assigned {
 /// placed cell reports.
 fn layout_spans(spans: &[Span], row_count: usize, focus: &NodeId) -> RailLayout {
     let mut order: Vec<usize> = (0..spans.len()).collect();
-    order.sort_by_key(|&i| (spans[i].from_row, spans[i].to_row));
+    order.sort_by_key(|&i| (spans[i].top_row, spans[i].bottom_row));
 
     let mut busy_until: Vec<usize> = Vec::new();
     let mut assigned: Vec<Assigned> = Vec::with_capacity(spans.len());
@@ -180,12 +216,12 @@ fn layout_spans(spans: &[Span], row_count: usize, focus: &NodeId) -> RailLayout 
         let span = &spans[span_idx];
         let free_column = busy_until
             .iter()
-            .position(|&busy| busy <= span.from_row)
+            .position(|&busy| busy <= span.top_row)
             .unwrap_or_else(|| {
                 busy_until.push(0);
                 busy_until.len() - 1
             });
-        busy_until[free_column] = span.to_row;
+        busy_until[free_column] = span.bottom_row;
         assigned.push(Assigned {
             span_idx,
             column: free_column,
@@ -195,6 +231,8 @@ fn layout_spans(spans: &[Span], row_count: usize, focus: &NodeId) -> RailLayout 
     let mut rows: Vec<Vec<RailCell>> = vec![Vec::new(); row_count];
     for a in &assigned {
         let span = &spans[a.span_idx];
+        // Role keys off the *true* dependency direction (`from`/`to`), not
+        // the visual `top_row`/`bottom_row` span -- see `Span`'s own doc.
         let role = if &span.from == focus {
             RailRole::FocusedOutgoing
         } else if &span.to == focus {
@@ -205,12 +243,12 @@ fn layout_spans(spans: &[Span], row_count: usize, focus: &NodeId) -> RailLayout 
         for (row, cells) in rows
             .iter_mut()
             .enumerate()
-            .take(span.to_row + 1)
-            .skip(span.from_row)
+            .take(span.bottom_row + 1)
+            .skip(span.top_row)
         {
-            let glyph = if row == span.from_row {
+            let glyph = if row == span.top_row {
                 '╮'
-            } else if row == span.to_row {
+            } else if row == span.bottom_row {
                 '╯'
             } else {
                 '│'
@@ -357,11 +395,76 @@ mod tests {
     }
 
     #[test]
-    fn reversed_or_same_row_edges_are_dropped() {
+    fn same_row_edges_are_dropped() {
         let rows = ids(&["a", "b"]);
-        let edges = vec![edge("b", "a"), edge("a", "a")];
+        let edges = vec![edge("a", "a")];
         let layout = compute(&rows, &edges, &NodeId::from("a"), 200);
         assert_eq!(layout.columns, 0);
+    }
+
+    #[test]
+    fn an_upward_edge_between_visible_rows_still_renders_a_rail() {
+        // `edge("b", "a")` is "upward" in row order (b sits below a) --
+        // e.g. what a fold-collapsed row can produce (see the module doc).
+        // It must still get a column and the same `╮`/`╯` glyphs a
+        // downward edge over the same two rows would.
+        let rows = ids(&["a", "b"]);
+        let edges = vec![edge("b", "a")];
+        let layout = compute(&rows, &edges, &NodeId::from("nobody"), 200);
+
+        assert_eq!(layout.columns, 1, "upward edge must still occupy a column");
+        assert_eq!(cell_at(&layout.rows, 0, 0).unwrap().glyph, '╮');
+        assert_eq!(cell_at(&layout.rows, 1, 0).unwrap().glyph, '╯');
+    }
+
+    #[test]
+    fn an_upward_edge_spanning_several_rows_still_gets_passthrough_cells() {
+        let rows = ids(&["a", "b", "c", "d"]);
+        let edges = vec![edge("d", "a")];
+        let layout = compute(&rows, &edges, &NodeId::from("nobody"), 200);
+
+        assert_eq!(cell_at(&layout.rows, 0, 0).unwrap().glyph, '╮');
+        assert_eq!(cell_at(&layout.rows, 1, 0).unwrap().glyph, '│');
+        assert_eq!(cell_at(&layout.rows, 2, 0).unwrap().glyph, '│');
+        assert_eq!(cell_at(&layout.rows, 3, 0).unwrap().glyph, '╯');
+    }
+
+    #[test]
+    fn an_upward_edges_role_reflects_true_dependency_direction_when_focused() {
+        // `b` (row 1, visually below `a`) is the true dependency source:
+        // `edge("b", "a")` means "b depends on a". Focusing `b` must color
+        // the rail as `b`'s own *outgoing* dependency, even though visually
+        // the rail's `top_row` (0) is `a`, not `b`.
+        let rows = ids(&["a", "b"]);
+        let edges = vec![edge("b", "a")];
+
+        let layout = compute(&rows, &edges, &NodeId::from("b"), 200);
+        let cell = cell_at(&layout.rows, 0, 0).unwrap();
+        assert_eq!(cell.role, RailRole::FocusedOutgoing);
+
+        let layout = compute(&rows, &edges, &NodeId::from("a"), 200);
+        let cell = cell_at(&layout.rows, 0, 0).unwrap();
+        assert_eq!(cell.role, RailRole::FocusedIncoming);
+    }
+
+    #[test]
+    fn downward_edge_behavior_is_unchanged_by_the_unordered_span_fix() {
+        // Sanity check against regressions: a plain downward edge behaves
+        // exactly as before -- straight span, correct roles both ways.
+        let rows = ids(&["a", "b"]);
+        let edges = vec![edge("a", "b")];
+
+        let layout = compute(&rows, &edges, &NodeId::from("a"), 200);
+        assert_eq!(
+            cell_at(&layout.rows, 0, 0).unwrap().role,
+            RailRole::FocusedOutgoing
+        );
+
+        let layout = compute(&rows, &edges, &NodeId::from("b"), 200);
+        assert_eq!(
+            cell_at(&layout.rows, 1, 0).unwrap().role,
+            RailRole::FocusedIncoming
+        );
     }
 
     #[test]
