@@ -116,6 +116,18 @@ pub struct Cli {
     /// as published to this PR.
     #[arg(long, requires = "publish_comments")]
     pub republish: bool,
+    /// Launch the ratatui/crossterm terminal frontend (issue #16) instead
+    /// of the default egui/eframe GUI: a focused-neighborhood view of one
+    /// module at a time (the module plus its direct dependencies/
+    /// dependents), not a ported graph canvas -- see `crate::tui`'s module
+    /// doc. Conflicts with `--dump`/`--export-comments`/
+    /// `--publish-comments`, same as the GUI path this replaces (all three
+    /// are headless and never launch either frontend). Works combined with
+    /// `--pr`/`--findings` exactly like the GUI does. Errors cleanly,
+    /// naming the missing feature, on a build without the `tui` feature
+    /// (see `src/main.rs`'s `launch_tui`).
+    #[arg(long, conflicts_with_all = ["dump", "export_comments", "publish_comments"])]
+    pub tui: bool,
 }
 
 /// `--dump` output format.

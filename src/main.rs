@@ -6,13 +6,13 @@ use std::time::SystemTime;
 use clap::Parser;
 
 use vdiff::cli::{self, Cli};
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "tui"))]
 use vdiff::core::app::{initial_show_tests, App, Pane, Screen};
 use vdiff::graph::filter::focus_on_changes;
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "tui"))]
 use vdiff::graph::layout::layout;
 use vdiff::graph::model::{NodeId, ProjectGraph};
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "tui"))]
 use vdiff::graph::test_modules::{group_matched_test_modules, hide_test_modules};
 #[cfg(feature = "gui")]
 use vdiff::nvim::session::nvim_available;
@@ -39,12 +39,12 @@ use vdiff::ui::nvim_pane::NvimPane;
 /// <path>`'s already-loaded-and-mapped result (see [`load_findings`]) --
 /// unrelated to review-completion, but seeded once at startup exactly the
 /// same way, so it rides along in this bundle rather than pushing
-/// `run_gui` over the argument-count limit on its own. In a
-/// `--no-default-features` (headless) build these fields are computed and
-/// then dropped unread by `launch_gui`'s headless stub, which errors out
-/// before ever looking at them -- harmless, but `dead_code` doesn't know
-/// that, hence the lint override.
-#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+/// `run_gui` over the argument-count limit on its own. In a build with
+/// neither `gui` nor `tui` these fields are computed and then dropped
+/// unread by both `launch_gui`'s and `launch_tui`'s headless stubs, which
+/// error out before ever looking at them -- harmless, but `dead_code`
+/// doesn't know that, hence the lint override.
+#[cfg_attr(not(any(feature = "gui", feature = "tui")), allow(dead_code))]
 struct ReviewSetup {
     git_dir: PathBuf,
     branch: String,
@@ -186,15 +186,25 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
                 findings,
                 comments,
             };
-            launch_gui(
-                graph,
-                repo_path,
-                cli.smoke,
-                cli.nvim,
-                cli.nvim_cmd.clone(),
-                DiffSource { repo, base_oid },
-                review_setup,
-            )
+            if cli.tui {
+                launch_tui(
+                    graph,
+                    repo_path,
+                    cli.smoke,
+                    DiffSource { repo, base_oid },
+                    review_setup,
+                )
+            } else {
+                launch_gui(
+                    graph,
+                    repo_path,
+                    cli.smoke,
+                    cli.nvim,
+                    cli.nvim_cmd.clone(),
+                    DiffSource { repo, base_oid },
+                    review_setup,
+                )
+            }
         }
     }
 }
@@ -205,8 +215,9 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
 /// twin, which never touches either field: on the `gui` build this is
 /// exactly [`DiffLoader`]'s two fields before they're wrapped in that type
 /// (which only exists behind the `gui` feature, so can't be built at this
-/// call site in a headless build).
-#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+/// call site in a headless build). Also threaded into [`launch_tui`], which
+/// wraps the same two fields into `crate::tui::loader::TuiLoader` instead.
+#[cfg_attr(not(any(feature = "gui", feature = "tui")), allow(dead_code))]
 struct DiffSource {
     repo: Box<dyn GitRepo>,
     base_oid: String,
@@ -261,6 +272,102 @@ fn launch_gui(
 ) -> ExitCode {
     eprintln!(
         "error: vdiff was built without the `gui` feature (--no-default-features); only --dump, --export-comments, and --publish-comments are available in this build"
+    );
+    ExitCode::FAILURE
+}
+
+/// `--tui`: build the same starting [`App`] `run_gui` builds (same
+/// `show_tests`/layers/focus seeding -- see that function's doc, which this
+/// mirrors exactly), then hand it to [`vdiff::tui::run`] instead of opening
+/// an eframe window. Split out from a hypothetical shared `run_gui`/
+/// `run_tui` the same way [`launch_gui`] is: `vdiff::tui` only exists
+/// behind the `tui` feature, so `diff_source` stays a plain [`DiffSource`]
+/// at this call site rather than already being wrapped in
+/// `crate::tui::loader::TuiLoader`.
+#[cfg(feature = "tui")]
+fn launch_tui(
+    graph: ProjectGraph,
+    repo_path: &Path,
+    smoke: bool,
+    diff_source: DiffSource,
+    review_setup: ReviewSetup,
+) -> ExitCode {
+    let ReviewSetup {
+        git_dir,
+        branch,
+        findings,
+        comments,
+    } = review_setup;
+    let show_tests = initial_show_tests(&graph);
+    let visible = if show_tests {
+        group_matched_test_modules(&graph)
+    } else {
+        hide_test_modules(&graph).0
+    };
+    let layout_result = layout(&visible);
+    let focus = layout_result
+        .layers
+        .first()
+        .and_then(|layer| layer.first())
+        .cloned()
+        .unwrap_or_else(|| NodeId::from(""));
+    let review_store = vdiff::review::store::load_review_state(&git_dir);
+    let reviewed =
+        vdiff::review::review_state::seed_reviewed(&review_store.branch(&branch), &graph);
+
+    let rows = vdiff::graph::layout::rows_with_x_centers(&layout_result);
+    let app = App {
+        graph,
+        layers: layout_result.layers,
+        rows,
+        focus,
+        screen: Screen::Graph,
+        diff: None,
+        picker: None,
+        show_tests,
+        file_view: None,
+        pane: Pane::Graph,
+        viewport_rows: 1,
+        reviewed,
+        findings,
+        comments,
+    };
+
+    let config = vdiff::tui::TuiConfig {
+        loader: vdiff::tui::loader::TuiLoader {
+            repo: diff_source.repo,
+            base_oid: diff_source.base_oid,
+        },
+        review_store,
+        review_branch: branch,
+        repo_root: repo_path.to_path_buf(),
+        smoke,
+    };
+
+    match vdiff::tui::run(app, config) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error running TUI: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The headless-build (no `tui` feature) counterpart of [`launch_tui`]:
+/// `--tui` was given but this binary has no `ratatui`/`crossterm` in it at
+/// all, so fail cleanly with a stderr message naming the missing feature
+/// rather than a compile hole -- mirrors [`launch_gui`]'s own
+/// `not(feature = "gui")` stub.
+#[cfg(not(feature = "tui"))]
+fn launch_tui(
+    _graph: ProjectGraph,
+    _repo_path: &Path,
+    _smoke: bool,
+    _diff_source: DiffSource,
+    _review_setup: ReviewSetup,
+) -> ExitCode {
+    eprintln!(
+        "error: vdiff was built without the `tui` feature; --tui is unavailable in this build"
     );
     ExitCode::FAILURE
 }
