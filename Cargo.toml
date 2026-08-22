@@ -56,3 +56,11 @@ tree-sitter-elixir = "0.3.5"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# Headless TUI snapshot harness: renders one frame of a chosen `--tui` view
+# for a real repo to stdout via ratatui's TestBackend -- lets agents and CI
+# eyeball the graph screens without a TTY. `tui`-only, like the views it
+# renders.
+[[example]]
+name = "tui_snapshot"
+required-features = ["tui"]

@@ -177,7 +177,18 @@ fn route_one(
         (src.y.saturating_sub(1), tgt.y + tgt.h)
     };
     let (lo, hi) = (y_start.min(y_end), y_start.max(y_end));
-    let mid = lo + (hi - lo) / 2;
+    // The bend row hugs the *target*: `y_end` is the row directly adjacent
+    // to the target label (above it when descending, below it when
+    // ascending), which [`crate::graph::plane`]'s shelf gaps/padding
+    // guarantee is blank. Two payoffs over an arbitrary midpoint row: (1) a
+    // midpoint routinely lands on *other* shelves' label rows, trailing `─`
+    // runs across every label sharing that row (labels overwrite the edge,
+    // leaving runs only in the gaps between them -- reading as connections
+    // that don't exist); (2) fan-in -- many sources depending on one target,
+    // the dominant real-world shape -- makes every such edge share one
+    // horizontal run on the target's own gap row, converging into a single
+    // line instead of one parallel row per edge.
+    let mid = y_end.clamp(lo, hi);
 
     let mut write = |x: usize, y: usize, glyph: char| {
         grid.entry((x, y))
@@ -278,6 +289,31 @@ mod tests {
         let routed = route_edges(&layout, &edges, &id("nobody"));
         assert!(routed.cells.iter().any(|c| c.glyph == '╮'));
         assert!(routed.cells.iter().any(|c| c.glyph == '╯'));
+    }
+
+    #[test]
+    fn horizontal_leg_hugs_the_gap_row_adjacent_to_the_source() {
+        // Source label on row 0, target on row 6: the layout guarantees a
+        // blank gap row directly adjacent to any label row (`plane`'s
+        // GAP_Y / padding), so the horizontal jog must hug the target's own
+        // gap row (y = 5), not an arbitrary midpoint row (y = 3) where it
+        // would trail `\u{2500}` runs across other shelves' label rows --
+        // and hugging the *target* specifically lets fan-in edges share one
+        // converging run (see `route_one`'s doc).
+        let layout = layout_with(&[("a", 0, 0, 3, 1), ("b", 20, 6, 3, 1)]);
+        let edges = vec![(id("a"), id("b"))];
+        let routed = route_edges(&layout, &edges, &id("nobody"));
+        let horiz_rows: Vec<usize> = routed
+            .cells
+            .iter()
+            .filter(|c| c.glyph == '\u{2500}')
+            .map(|c| c.y)
+            .collect();
+        assert!(!horiz_rows.is_empty());
+        assert!(
+            horiz_rows.iter().all(|&y| y == 5),
+            "horizontal leg must sit on the target's own gap row, got rows {horiz_rows:?}"
+        );
     }
 
     #[test]
