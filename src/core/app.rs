@@ -364,16 +364,36 @@ pub enum Msg {
     /// no-op if the focused row has no parent namespace to collapse into
     /// (it's already top-level). Only acted on on
     /// [`Screen::Graph`]/[`Pane::Graph`] with no picker open. Focus re-seats
-    /// onto the resulting collapsed row.
+    /// onto the resulting collapsed row. Also drops any already-collapsed
+    /// *descendant* of the newly-collapsed parent from
+    /// [`App::fold_collapsed`] -- those entries are now redundant (their
+    /// namespace is absorbed into the parent's own row) and, left behind,
+    /// would round-trip with [`Msg::ExpandFocusedNamespace`]'s one-level
+    /// semantics into a stale nested fold that no longer corresponds to
+    /// anything reachable from the visible row list.
     CollapseFocusedNamespace,
     /// `l` on the `--tui` rail view: expand the namespace `focus` currently
-    /// names -- a no-op unless `focus` is actually a collapsed row (i.e.
-    /// present in [`App::fold_collapsed`]). Focus re-seats onto the first
-    /// now-visible row that was inside the expanded namespace (see
-    /// [`crate::core::rail_view::first_visible_descendant`]), mirroring the
-    /// GUI's `toggle_tests` re-seat precedent for a fold operation that can
-    /// drop the currently focused row out of existence. Only acted on on
-    /// [`Screen::Graph`]/[`Pane::Graph`] with no picker open.
+    /// names by exactly one level -- a no-op unless `focus` is actually a
+    /// collapsed row (i.e. present in [`App::fold_collapsed`]). Removes
+    /// `focus` from [`App::fold_collapsed`] (revealing its immediate
+    /// children), then re-collapses every one of those children that is
+    /// itself a namespace (has children of its own) -- so a namespace's
+    /// direct leaf modules become visible alongside its child namespaces as
+    /// single collapsed rows, while grandchildren stay hidden until that
+    /// child namespace is itself expanded. This is what keeps a single `l`
+    /// on a namespace with dozens of nested descendants from exploding the
+    /// whole subtree into view at once (the previous behavior, which simply
+    /// removed `focus` from `fold_collapsed` with nothing re-inserted).
+    /// Repeated `l` on the newly-revealed child namespace rows zooms in one
+    /// further level at a time. Focus re-seats onto the first now-visible
+    /// row that was inside the expanded namespace (see
+    /// [`crate::core::rail_view::first_visible_descendant`], which -- given
+    /// the one-level re-collapse above -- lands on either a direct leaf
+    /// child or a newly-collapsed child-namespace row, never a
+    /// grandchild), mirroring the GUI's `toggle_tests` re-seat precedent for
+    /// a fold operation that can drop the currently focused row out of
+    /// existence. Only acted on on [`Screen::Graph`]/[`Pane::Graph`] with no
+    /// picker open.
     ExpandFocusedNamespace,
 }
 
@@ -645,6 +665,13 @@ fn collapse_focused_namespace(mut app: App) -> (App, Cmd) {
         return (app, Cmd::None);
     };
     app.fold_collapsed.insert(parent.clone());
+    // Prune any already-collapsed descendant of `parent` -- see
+    // `Msg::CollapseFocusedNamespace`'s doc for why a stale nested entry
+    // left behind here would round-trip badly with the one-level expand.
+    let graph = &app.graph;
+    let parent_for_prune = parent.clone();
+    app.fold_collapsed
+        .retain(|id| id == &parent_for_prune || !is_descendant_of(graph, id, &parent_for_prune));
     app.focus = parent;
     (app, Cmd::None)
 }
@@ -658,12 +685,44 @@ fn expand_focused_namespace(mut app: App) -> (App, Cmd) {
         return (app, Cmd::None);
     }
     let namespace = app.focus.clone();
+    // Reveal exactly one level: re-collapse every immediate child that is
+    // itself a namespace (has children of its own), so `namespace`'s direct
+    // leaf modules become visible while grandchildren stay hidden behind a
+    // freshly-collapsed child-namespace row. See `Msg::ExpandFocusedNamespace`'s
+    // doc for why a flat "reveal everything" expand is unusable on a dense
+    // change set.
+    if let Some(children) = app.graph.node(&namespace).map(|n| n.children.clone()) {
+        for child in children {
+            if app
+                .graph
+                .node(&child)
+                .is_some_and(|c| !c.children.is_empty())
+            {
+                app.fold_collapsed.insert(child);
+            }
+        }
+    }
     if let Some(reseated) =
         rail_view::first_visible_descendant(&app.graph, &namespace, &app.fold_collapsed)
     {
         app.focus = reseated;
     }
     (app, Cmd::None)
+}
+
+/// `true` if `id` sits anywhere under `ancestor` in the parent chain (`id`
+/// itself doesn't count). Used by [`collapse_focused_namespace`] to prune
+/// now-redundant nested fold entries once a namespace collapses one of its
+/// own ancestors.
+fn is_descendant_of(graph: &ProjectGraph, id: &NodeId, ancestor: &NodeId) -> bool {
+    let mut current = graph.node(id).and_then(|n| n.parent.clone());
+    while let Some(p) = current {
+        if &p == ancestor {
+            return true;
+        }
+        current = graph.node(&p).and_then(|n| n.parent.clone());
+    }
+    false
 }
 
 /// Handle [`Msg::ToggleReviewed`]: only on [`Screen::Graph`]/[`Pane::Graph`]
@@ -2088,6 +2147,156 @@ mod tests {
         let (app, _) = update(app, Msg::ExpandFocusedNamespace);
         assert_eq!(app.focus, NodeId::from("leaf_a"));
         assert!(app.fold_collapsed.is_empty());
+    }
+
+    // -- One-level semantic zoom (real-use fix: a single `zo`/`l` on a
+    // namespace with dozens of nested descendants used to reveal the
+    // entire subtree at once) ------------------------------------------
+
+    /// Three-level nesting: `outer` (namespace, top-level) contains `inner`
+    /// (namespace) and `leaf_direct` (leaf); `inner` contains `leaf1`/
+    /// `leaf2` (both leaves, no further nesting). Enough to exercise one
+    /// level of expand revealing `inner` as a still-collapsed row alongside
+    /// `leaf_direct`, and a second expand on `inner` bottoming out at plain
+    /// leaves.
+    fn graph_fixture_nested_namespaces() -> ProjectGraph {
+        let outer = NodeId::from("outer");
+        let inner = NodeId::from("inner");
+        let leaf_direct = NodeId::from("leaf_direct");
+        let leaf1 = NodeId::from("leaf1");
+        let leaf2 = NodeId::from("leaf2");
+
+        let leaf = |id: &NodeId, name: &str, parent: NodeId| ModuleNode {
+            id: id.clone(),
+            display_name: name.to_string(),
+            parent: Some(parent),
+            children: vec![],
+            status: GitStatus::Unchanged,
+            files: vec![crate::graph::model::FileRef {
+                path: PathBuf::from(format!("{name}.rs")),
+                base_blob: Some("b".to_string()),
+                head_blob: Some("h".to_string()),
+            }],
+        };
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            outer.clone(),
+            ModuleNode {
+                id: outer.clone(),
+                display_name: "outer".to_string(),
+                parent: None,
+                children: vec![inner.clone(), leaf_direct.clone()],
+                status: GitStatus::Unchanged,
+                files: vec![],
+            },
+        );
+        nodes.insert(
+            inner.clone(),
+            ModuleNode {
+                id: inner.clone(),
+                display_name: "inner".to_string(),
+                parent: Some(outer.clone()),
+                children: vec![leaf1.clone(), leaf2.clone()],
+                status: GitStatus::Unchanged,
+                files: vec![],
+            },
+        );
+        nodes.insert(
+            leaf_direct.clone(),
+            leaf(&leaf_direct, "leaf_direct", outer.clone()),
+        );
+        nodes.insert(leaf1.clone(), leaf(&leaf1, "leaf1", inner.clone()));
+        nodes.insert(leaf2.clone(), leaf(&leaf2, "leaf2", inner.clone()));
+
+        ProjectGraph {
+            roots: vec![outer],
+            nodes,
+            edges: vec![],
+        }
+    }
+
+    fn app_for_nested_fold(focus: &str) -> App {
+        let graph = graph_fixture_nested_namespaces();
+        let result = crate::graph::layout::layout(&graph);
+        let rows = crate::graph::layout::rows_with_x_centers(&result);
+        App {
+            graph,
+            layers: result.layers,
+            rows,
+            focus: NodeId::from(focus),
+            screen: Screen::Graph,
+            diff: None,
+            picker: None,
+            show_tests: false,
+            file_view: None,
+            pane: Pane::Graph,
+            viewport_rows: 20,
+            reviewed: HashSet::new(),
+            findings: HashMap::new(),
+            comments: HashMap::new(),
+            fold_collapsed: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn expand_focused_namespace_reveals_one_level_keeping_grandchildren_hidden() {
+        let mut app = app_for_nested_fold("outer");
+        app.fold_collapsed.insert(NodeId::from("outer"));
+        app.focus = NodeId::from("outer");
+
+        let (app, cmd) = update(app, Msg::ExpandFocusedNamespace);
+
+        // `outer` itself is expanded; `inner` (a child namespace) is
+        // re-collapsed in its place, so `leaf1`/`leaf2` stay hidden.
+        assert!(!app.fold_collapsed.contains(&NodeId::from("outer")));
+        assert!(app.fold_collapsed.contains(&NodeId::from("inner")));
+        assert_eq!(app.fold_collapsed.len(), 1);
+        // Name-first among `outer`'s children is `inner` -- focus re-seats
+        // onto that now-collapsed row, not past it.
+        assert_eq!(app.focus, NodeId::from("inner"));
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn expand_focused_namespace_at_deepest_level_reveals_leaves() {
+        // Continue from the previous test's end state: `inner` is now the
+        // one collapsed row, with only leaves underneath it -- expanding it
+        // must bottom out with nothing left to re-collapse.
+        let mut app = app_for_nested_fold("inner");
+        app.fold_collapsed.insert(NodeId::from("inner"));
+
+        let (app, cmd) = update(app, Msg::ExpandFocusedNamespace);
+
+        assert!(app.fold_collapsed.is_empty());
+        assert_eq!(app.focus, NodeId::from("leaf1"), "name-first leaf child");
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn expand_then_collapse_round_trips_without_stranding_focus() {
+        // zo on `outer` reveals `inner` as a collapsed row and reseats
+        // focus there; an immediate zc on that row must climb back out to
+        // `outer` cleanly, with `fold_collapsed` left in a state that
+        // matches exactly one visible row (`outer`), not a stale nested
+        // leftover for `inner`.
+        let mut app = app_for_nested_fold("outer");
+        app.fold_collapsed.insert(NodeId::from("outer"));
+
+        let (app, _) = update(app, Msg::ExpandFocusedNamespace);
+        assert_eq!(app.focus, NodeId::from("inner"));
+
+        let (app, _) = update(app, Msg::CollapseFocusedNamespace);
+
+        assert_eq!(app.focus, NodeId::from("outer"));
+        assert_eq!(app.fold_collapsed, HashSet::from([NodeId::from("outer")]));
+
+        // The round-tripped focus must correspond to an actual visible row.
+        let rows = rail_view::visible_rows(&app.graph, &app.layers, &app.fold_collapsed);
+        assert!(
+            rows.iter().any(|row| row.id() == &app.focus),
+            "focus must land on a row rail_view::visible_rows actually renders"
+        );
     }
 
     #[test]

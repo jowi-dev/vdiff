@@ -310,7 +310,7 @@ fn launch_tui(
     // doc) -- this only ever touches this TUI-local `App`, never the GUI's
     // (see that function's own doc for why it can't just live in the
     // shared `build_initial_app` above).
-    vdiff::tui::seed_fold_collapsed_if_dense(&mut app);
+    let dense_fold_seeded = vdiff::tui::seed_fold_collapsed_if_dense(&mut app);
 
     let config = vdiff::tui::TuiConfig {
         loader: vdiff::tui::loader::TuiLoader {
@@ -321,6 +321,7 @@ fn launch_tui(
         review_branch: branch,
         repo_root: repo_path.to_path_buf(),
         smoke,
+        dense_fold_seeded,
     };
 
     match vdiff::tui::run(app, config) {

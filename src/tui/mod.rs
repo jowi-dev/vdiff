@@ -110,6 +110,16 @@ pub struct TuiConfig {
     pub review_branch: String,
     pub repo_root: PathBuf,
     pub smoke: bool,
+    /// Whether [`seed_fold_collapsed_if_dense`] actually fired for this
+    /// `App` -- when `true`, [`run`] seeds [`TuiState::notice`] with
+    /// [`DENSE_FOLD_SEED_NOTICE`] so the first paint tells the user the
+    /// graph opened pre-folded and how to zoom in, rather than silently
+    /// handing them a rail view that looks collapsed/empty with no
+    /// explanation. Set by the caller (`main`'s `launch_tui`) from that
+    /// function's return value -- `seed_fold_collapsed_if_dense` runs
+    /// before `TuiState` exists, so there's nowhere earlier to set the
+    /// notice directly.
+    pub dense_fold_seeded: bool,
 }
 
 /// Owns [`App`] and everything [`TuiConfig`] carried in, driving the
@@ -386,6 +396,22 @@ fn default_fold_seed(
         .collect()
 }
 
+/// The one-time notice [`run`] seeds [`TuiState::notice`] with when
+/// [`seed_fold_collapsed_if_dense`] actually fires -- see
+/// [`TuiConfig::dense_fold_seeded`]'s doc for the threading. Names the
+/// concrete key (`zo` in the canvas view; `l` does the same thing in the
+/// rail view, but `zo` is what the canvas -- the default view -- binds) so
+/// the user isn't left wondering why the graph looks pre-collapsed on
+/// first paint.
+const DENSE_FOLD_SEED_NOTICE: &str = "dense graph: opened folded -- zo expands one level";
+
+/// [`run`]'s `TuiState::notice` seed, factored out as a pure function so it
+/// can be unit-tested without a real terminal (`run` itself needs one for
+/// [`enable_raw_mode`]/[`EnterAlternateScreen`]).
+fn initial_notice(dense_fold_seeded: bool) -> Option<String> {
+    dense_fold_seeded.then(|| DENSE_FOLD_SEED_NOTICE.to_string())
+}
+
 /// Pre-seed `app.fold_collapsed` (see [`default_fold_seed`]) if the graph
 /// is dense enough to need it (see [`should_fold_by_default`]) -- called
 /// once by `main`'s `launch_tui`, right after building the initial `App`
@@ -394,7 +420,17 @@ fn default_fold_seed(
 /// fold_collapsed` starting non-empty is a TUI-only possibility (the GUI
 /// frontend never populates it at all -- see `core::app::update`'s own doc
 /// on that), so this must not run on the GUI's copy of the same `App`.
-pub fn seed_fold_collapsed_if_dense(app: &mut App) {
+///
+/// Seeds only top-level roots -- with [`crate::core::app::Msg::
+/// ExpandFocusedNamespace`]'s one-level-per-`zo`/`l` semantics, that's
+/// exactly right: each expand reveals one further layer of the seeded
+/// subtree rather than the whole thing at once, so seeding any deeper
+/// wouldn't buy anything the first expand wouldn't immediately undo.
+///
+/// Returns whether the seed actually fired, so the caller (`main`'s
+/// `launch_tui`) can thread that into [`TuiConfig::dense_fold_seeded`] and
+/// surface [`DENSE_FOLD_SEED_NOTICE`] on first paint.
+pub fn seed_fold_collapsed_if_dense(app: &mut App) -> bool {
     let visible_node_count: usize = app.layers.iter().map(Vec::len).sum();
     let edge_count = app.graph.edges.len();
     if should_fold_by_default(visible_node_count, edge_count) {
@@ -406,6 +442,9 @@ pub fn seed_fold_collapsed_if_dense(app: &mut App) {
         // and Enter/`d` acting on a node the user can't see).
         app.focus =
             crate::core::rail_view::effective_row_id(&app.graph, &app.focus, &app.fold_collapsed);
+        true
+    } else {
+        false
     }
 }
 
@@ -435,7 +474,7 @@ pub fn run(app: App, config: TuiConfig) -> io::Result<()> {
         review_store: config.review_store,
         review_branch: config.review_branch,
         repo_root: config.repo_root,
-        notice: None,
+        notice: initial_notice(config.dense_fold_seeded),
         rail_scroll: 0,
         view_mode: ViewMode::default(),
         canvas_scroll: 0,
@@ -1372,7 +1411,8 @@ mod tests {
         let mut app = state_fixture().app;
         app.graph = graph;
         app.layers = vec![vec![NodeId::from("parent"), NodeId::from("lonely")]];
-        seed_fold_collapsed_if_dense(&mut app);
+        let seeded = seed_fold_collapsed_if_dense(&mut app);
+        assert!(!seeded);
         assert!(app.fold_collapsed.is_empty());
     }
 
@@ -1385,7 +1425,8 @@ mod tests {
         // be a realistic layering, `seed_fold_collapsed_if_dense` only
         // sums layer lengths for the node count.
         app.layers = vec![vec![NodeId::from("x"); FOLD_DEFAULT_NODE_THRESHOLD + 1]];
-        seed_fold_collapsed_if_dense(&mut app);
+        let seeded = seed_fold_collapsed_if_dense(&mut app);
+        assert!(seeded);
         assert_eq!(app.fold_collapsed, HashSet::from([NodeId::from("parent")]));
     }
 
@@ -1403,5 +1444,88 @@ mod tests {
         app.layers = vec![vec![NodeId::from("x"); FOLD_DEFAULT_NODE_THRESHOLD + 1]];
         seed_fold_collapsed_if_dense(&mut app);
         assert_eq!(app.focus, NodeId::from("parent"));
+    }
+
+    /// Like [`graph_with_one_childful_root`], but `leaf` actually carries a
+    /// file -- needed for [`seed_fold_collapsed_if_dense_seeds_only_top_level_roots_one_level_expand_ready`],
+    /// which dispatches a real `ExpandFocusedNamespace` and needs
+    /// `rail_view::first_visible_descendant` to find a drawn (file-backed)
+    /// row to re-seat onto.
+    fn graph_with_one_file_backed_childful_root() -> ProjectGraph {
+        use crate::graph::model::{FileRef, GitStatus, ModuleNode};
+        use std::path::PathBuf;
+
+        let parent = NodeId::from("parent");
+        let leaf = NodeId::from("leaf");
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            parent.clone(),
+            ModuleNode {
+                id: parent.clone(),
+                display_name: "parent".to_string(),
+                parent: None,
+                children: vec![leaf.clone()],
+                status: GitStatus::Unchanged,
+                files: vec![],
+            },
+        );
+        nodes.insert(
+            leaf.clone(),
+            ModuleNode {
+                id: leaf.clone(),
+                display_name: "leaf".to_string(),
+                parent: Some(parent.clone()),
+                children: vec![],
+                status: GitStatus::Modified,
+                files: vec![FileRef {
+                    path: PathBuf::from("leaf.rs"),
+                    base_blob: Some("b".to_string()),
+                    head_blob: Some("h".to_string()),
+                }],
+            },
+        );
+        ProjectGraph {
+            roots: vec![parent],
+            nodes,
+            edges: vec![],
+        }
+    }
+
+    #[test]
+    fn seed_fold_collapsed_if_dense_seeds_only_top_level_roots_one_level_expand_ready() {
+        // Verifies the seed/expand interaction the doc on
+        // `seed_fold_collapsed_if_dense` claims: seeding only top-level
+        // roots is correct once `ExpandFocusedNamespace` is one-level-at-a-
+        // time -- expanding the seeded root here should reveal exactly its
+        // direct children (all leaves in this fixture), nothing deeper, and
+        // never explode into a fully-flat view in one keypress.
+        let graph = graph_with_one_file_backed_childful_root();
+        let mut app = state_fixture().app;
+        app.graph = graph;
+        app.focus = NodeId::from("parent");
+        app.layers = vec![vec![NodeId::from("x"); FOLD_DEFAULT_NODE_THRESHOLD + 1]];
+
+        seed_fold_collapsed_if_dense(&mut app);
+        assert_eq!(app.fold_collapsed, HashSet::from([NodeId::from("parent")]));
+
+        let (app, _) = update(app, Msg::ExpandFocusedNamespace);
+        // `parent`'s only child is `leaf`, which has no children of its
+        // own -- expanding reveals it as a plain visible row with nothing
+        // left in `fold_collapsed`.
+        assert!(app.fold_collapsed.is_empty());
+        assert_eq!(app.focus, NodeId::from("leaf"));
+    }
+
+    #[test]
+    fn initial_notice_is_none_when_the_seed_never_fired() {
+        assert_eq!(initial_notice(false), None);
+    }
+
+    #[test]
+    fn initial_notice_surfaces_the_dense_fold_seed_notice_when_it_fired() {
+        assert_eq!(
+            initial_notice(true),
+            Some(DENSE_FOLD_SEED_NOTICE.to_string())
+        );
     }
 }
