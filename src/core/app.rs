@@ -155,7 +155,9 @@ pub struct App {
 impl App {
     /// Whether `id` is a drawn (real, navigable) node -- present in
     /// `self.layers` -- as opposed to a synthetic namespace node or an
-    /// unknown id. [`Msg::FocusSet`] rejects any target that isn't.
+    /// unknown id. [`Msg::FocusSet`] rejects any target that isn't *this or*
+    /// currently collapsed (see that variant's own doc for why a collapsed
+    /// namespace id also has to pass).
     fn is_drawn(&self, id: &NodeId) -> bool {
         self.layers.iter().any(|layer| layer.contains(id))
     }
@@ -215,7 +217,20 @@ pub enum Msg {
     /// acted on on [`Screen::Graph`] with no picker open.
     FocusMove(Direction),
     /// Jump focus directly to a node. Only acted on on [`Screen::Graph`]
-    /// with no picker open, and only if the node exists in the graph.
+    /// with no picker open, and only if the target is a drawn node (see
+    /// [`App::is_drawn`]) *or* is currently a collapsed-namespace id (see
+    /// [`App::fold_collapsed`]) -- the plane/canvas views' spatial `h`/`j`/
+    /// `k`/`l` (`plane_key_msg`/`canvas_key_msg` in `crate::tui`) route
+    /// through this variant, and their focus grids legitimately include
+    /// collapsed-namespace rows as targets (a collapsed namespace is a
+    /// real, visible row, not a dead id); rejecting those left plane/canvas
+    /// hjkl silently and permanently unable to refocus a collapsed row once
+    /// focus moved off it, with no way back except switching to the rail
+    /// view. The rail view's own `Msg::RailFocusMove`/
+    /// `Msg::CollapseFocusedNamespace` already set `App::focus` to a
+    /// namespace id directly without going through this guard at all, and
+    /// [`update`]'s central fold-aware remap keeps whichever id lands here
+    /// consistent either way.
     FocusSet(NodeId),
     /// `gd`: follow the focused node's outgoing dependency edges.
     FollowDeps,
@@ -484,7 +499,8 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Cmd) {
             (app, cmd)
         }
         Msg::FocusSet(id) => {
-            if !on_graph_with_no_picker_and_graph_pane(&app) || !app.is_drawn(&id) {
+            let acceptable = app.is_drawn(&id) || app.fold_collapsed.contains(&id);
+            if !on_graph_with_no_picker_and_graph_pane(&app) || !acceptable {
                 return (app, Cmd::None);
             }
             let old_focus = app.focus.clone();
@@ -886,10 +902,14 @@ fn picker_select(app: &mut App) {
 /// Whether `id` has at least one backing file -- the guard [`open_diff`]/
 /// [`open_file`] apply before emitting [`Cmd::LoadDiff`]/[`Cmd::LoadFile`]
 /// for it. Unreachable on the GUI in practice: the GUI never focuses a
-/// file-less node at all (`App::is_drawn`/[`Msg::FocusSet`]'s own guard
-/// only ever accept ids present in `App::layers`, and [`crate::graph::layers::assign_layers`]
-/// excludes every file-less synthetic namespace container from `layers` in
-/// the first place -- see that module's doc). The `--tui` rail view is
+/// file-less node at all. [`Msg::FocusSet`]'s guard does also accept ids
+/// currently in `App::fold_collapsed` (see that variant's own doc), but the
+/// GUI never populates `fold_collapsed` (nothing there ever collapses
+/// anything), so that half of the guard is dead weight for it -- the only
+/// ids it can ever pass are ones `App::is_drawn` accepts, i.e. present in
+/// `App::layers`, and [`crate::graph::layers::assign_layers`] excludes
+/// every file-less synthetic namespace container from `layers` in the
+/// first place -- see that module's doc. The `--tui` rail view is
 /// what actually needs this: a collapsed namespace row's id (see
 /// [`crate::core::rail_view::RailRow::Collapsed`]) is exactly such a
 /// file-less container, and it *is* focusable there (that's the whole
@@ -1134,6 +1154,30 @@ mod tests {
         let app = app_at("leaf_a");
         let (app, _) = update(app, Msg::FocusSet(NodeId::from("root")));
         assert_eq!(app.focus, NodeId::from("leaf_a"));
+    }
+
+    #[test]
+    fn focus_set_can_land_on_a_collapsed_namespace_row() {
+        // Reproduces the plane/canvas hjkl soft-lock found in review:
+        // collapse `root` (focus lands on it, same as `zc` would leave it),
+        // move focus away onto an unrelated sibling with no relation to
+        // `root` (standing in for the hjkl step that walks off it), then
+        // dispatch `FocusSet` back onto `root`'s own id -- exactly what
+        // `plane_key_msg`/`canvas_key_msg` compute via `move_focus` over
+        // `plane_focus_grid`/`canvas_focus_grid` (both of which legitimately
+        // include collapsed-namespace ids as focus targets) once hjkl points
+        // back at the collapsed row. Before the fix, `is_drawn(&root)` is
+        // false (`root` has no files and `assign_layers` excludes it -- see
+        // `focus_set_noop_for_synthetic_node`), so the guard swallowed the
+        // move silently and permanently: `root` is the *only* way back to
+        // its own children, so a `move_focus` that returns it becomes an
+        // unrecoverable dead end.
+        let mut app = app_at("leaf_a");
+        app.fold_collapsed.insert(NodeId::from("root"));
+        app.focus = NodeId::from("target_x");
+        let (app, cmd) = update(app, Msg::FocusSet(NodeId::from("root")));
+        assert_eq!(app.focus, NodeId::from("root"));
+        assert_eq!(cmd, Cmd::None);
     }
 
     #[test]

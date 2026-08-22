@@ -1460,6 +1460,125 @@ mod tests {
         assert!(!state.canvas_fold_pending, "chord clears after completing");
     }
 
+    /// A namespace `ns` (drawn as a plane-view box, containing leaf `a`)
+    /// plus an unrelated top-level sibling `b` -- enough to reproduce the
+    /// plane/canvas hjkl soft-lock found in review: collapse `ns` (focus
+    /// lands on it), move focus onto `b` with a real hjkl press, then prove
+    /// hjkl can navigate back onto `ns`'s own (collapsed) row instead of
+    /// silently going dead forever (see `core::app::Msg::FocusSet`'s doc
+    /// for why the bug lived in that message's guard, not in this
+    /// movement math).
+    fn state_with_namespace_and_sibling() -> TuiState {
+        use crate::graph::model::{FileRef, GitStatus, ModuleNode};
+        use std::path::PathBuf as StdPathBuf;
+
+        let ns = NodeId::from("ns");
+        let a = NodeId::from("a");
+        let b = NodeId::from("b");
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            ns.clone(),
+            ModuleNode {
+                id: ns.clone(),
+                display_name: "ns".to_string(),
+                parent: None,
+                children: vec![a.clone()],
+                status: GitStatus::Unchanged,
+                files: vec![],
+            },
+        );
+        nodes.insert(
+            a.clone(),
+            ModuleNode {
+                id: a.clone(),
+                display_name: "a".to_string(),
+                parent: Some(ns.clone()),
+                children: vec![],
+                status: GitStatus::Modified,
+                files: vec![FileRef {
+                    path: StdPathBuf::from("a.rs"),
+                    base_blob: Some("b".to_string()),
+                    head_blob: Some("h".to_string()),
+                }],
+            },
+        );
+        nodes.insert(
+            b.clone(),
+            ModuleNode {
+                id: b.clone(),
+                display_name: "b".to_string(),
+                parent: None,
+                children: vec![],
+                status: GitStatus::Modified,
+                files: vec![FileRef {
+                    path: StdPathBuf::from("b.rs"),
+                    base_blob: Some("b".to_string()),
+                    head_blob: Some("h".to_string()),
+                }],
+            },
+        );
+        let graph = ProjectGraph {
+            roots: vec![ns.clone(), b],
+            nodes,
+            edges: vec![],
+        };
+        let layers = crate::graph::layers::assign_layers(&graph);
+
+        let mut state = state_fixture();
+        state.app.graph = graph;
+        state.app.layers = layers;
+        state.app.focus = a;
+        state
+    }
+
+    /// The one hjkl key that, per [`render::plane_focus_grid`], currently
+    /// steps focus from `from` to `to` -- panics if none of the four does,
+    /// so the test using this fails loudly on a fixture/layout mismatch
+    /// instead of silently asserting nothing.
+    fn plane_key_stepping_from_to(state: &TuiState, from: &NodeId, to: &NodeId) -> char {
+        let (layers, rows) = render::plane_focus_grid(&state.app);
+        for (c, dir) in [
+            ('h', Direction::Left),
+            ('l', Direction::Right),
+            ('k', Direction::Up),
+            ('j', Direction::Down),
+        ] {
+            if &move_focus(&layers, &rows, from, dir) == to {
+                return c;
+            }
+        }
+        panic!("no hjkl direction steps plane focus from {from:?} to {to:?}");
+    }
+
+    #[test]
+    fn plane_mode_hjkl_can_refocus_a_collapsed_namespace_after_moving_away() {
+        let mut state = state_with_namespace_and_sibling();
+        let ns = NodeId::from("ns");
+        let b = NodeId::from("b");
+
+        // `zc` on leaf `a` collapses `ns` and seats focus on it -- the same
+        // state a user reaches by folding a namespace before wandering off.
+        handle_key(&mut state, press('z'));
+        handle_key(&mut state, press('c'));
+        assert_eq!(state.app.focus, ns);
+        assert!(state.app.fold_collapsed.contains(&ns));
+
+        // Move away onto the unrelated sibling with a real hjkl press.
+        let away_key = plane_key_stepping_from_to(&state, &ns, &b);
+        handle_key(&mut state, press(away_key));
+        assert_eq!(state.app.focus, b);
+
+        // Move back with hjkl pointed at the collapsed row -- before the
+        // `Msg::FocusSet` fix this silently no-oped forever (the collapsed
+        // id isn't `is_drawn`), leaving no way back except the rail view.
+        let back_key = plane_key_stepping_from_to(&state, &b, &ns);
+        handle_key(&mut state, press(back_key));
+        assert_eq!(
+            state.app.focus, ns,
+            "hjkl must be able to refocus a collapsed namespace row"
+        );
+    }
+
     #[test]
     fn an_unrelated_key_after_z_clears_the_pending_chord() {
         let mut state = state_with_layered_graph("leaf");
