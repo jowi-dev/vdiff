@@ -7,6 +7,8 @@ pub mod labels;
 pub mod layers;
 pub mod layout;
 pub mod model;
+pub mod plane;
+pub mod plane_edges;
 pub mod rails;
 pub mod sugiyama;
 pub mod test_modules;

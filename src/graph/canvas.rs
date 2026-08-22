@@ -287,7 +287,7 @@ fn route_one_channel(layout: &Layout, channel: usize, focus: &NodeId) -> Channel
 /// rather than panicking -- a rare, cosmetically-imperfect edge case on a
 /// dense fixture, not a correctness bug worth failing the whole render
 /// over.
-fn merge_glyph(existing: char, new: char) -> char {
+pub(crate) fn merge_glyph(existing: char, new: char) -> char {
     if existing == new {
         return existing;
     }
