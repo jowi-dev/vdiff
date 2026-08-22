@@ -35,6 +35,8 @@ use crate::core::file_view::FileViewState;
 use crate::core::rail_view::{self, RailRow};
 use crate::graph::canvas::{self, CanvasRole, Channel};
 use crate::graph::model::{GitStatus, NodeId};
+use crate::graph::plane::{self, PlaneLayout};
+use crate::graph::plane_edges::{self, PlaneEdges};
 use crate::graph::rails::{self, RailRole};
 use crate::graph::sugiyama::{self, SlotId};
 use crate::review::findings::Severity;
@@ -143,6 +145,10 @@ pub fn draw(
                             canvas_scroll,
                             canvas_scroll_x,
                         );
+                    }
+                    ViewMode::Plane => {
+                        dropped_edges =
+                            draw_plane_graph(frame, main_area, app, canvas_scroll, canvas_scroll_x);
                     }
                 }
             }
@@ -957,6 +963,298 @@ fn draw_canvas_graph(
     dropped_edges
 }
 
+// -- The `--tui` plane graph screen (the third TUI graph attempt) ---------
+//
+// A true 2D nested layout: expanded namespaces render as actual boxes
+// containing their children, laid out in char space by
+// `crate::graph::plane`, with dependency edges routed by
+// `crate::graph::plane_edges`. Unlike the rail view's single gutter or the
+// canvas view's horizontal Sugiyama bands (both flatten the tree and funnel
+// every edge into a narrow channel), this view spreads the graph across
+// both dimensions the way the GUI's own nested-cluster rendering does --
+// see `crate::graph::plane`'s module doc for why band-based layouts were
+// rejected in real use.
+//
+// Paint order matters and is the reason garbling is structurally
+// impossible: edges are painted into the grid first, then every box
+// border, then every leaf/collapsed-namespace label -- each layer painted
+// strictly *over* whatever the previous layer left in the same cells (see
+// `draw_plane_graph`). An edge is only ever visible in the blank routing
+// space `crate::graph::plane::shelf_pack` leaves between siblings and shelf
+// rows; it can never visually collide with a box or a label because
+// whichever was painted later always wins that cell.
+
+/// Everything the plane screen needs, built fresh each frame from `App`
+/// state -- mirrors [`CanvasView`]'s own "recompute, don't cache" precedent
+/// (see [`rail_view`]'s module doc for why that's cheap enough to do every
+/// frame): the pure nested layout, and the edges already routed against it.
+pub struct PlaneView {
+    layout: PlaneLayout,
+    edges: PlaneEdges,
+}
+
+/// Build [`PlaneView`] from `app`'s current fold state: [`plane::layout`]
+/// over `app.graph`/`app.layers`/`app.fold_collapsed`, with
+/// [`plane_leaf_label`] supplying each leaf/collapsed row's exact text (so
+/// this view's widths and content agree with the rail/canvas views' own
+/// badges), then [`plane_edges::route_edges`] over the result using
+/// [`rail_view::collapse_edges`]'s fold-aware edge list -- the same edge set
+/// [`build_canvas_view`] routes.
+pub fn build_plane_view(app: &App) -> PlaneView {
+    let layout = plane::layout(&app.graph, &app.layers, &app.fold_collapsed, |id| {
+        plane_leaf_label(app, id)
+    });
+    let edges = rail_view::collapse_edges(&app.graph, &app.graph.edges, &app.fold_collapsed);
+    let routed = plane_edges::route_edges(&layout, &edges, &app.focus);
+    PlaneView {
+        layout,
+        edges: routed,
+    }
+}
+
+/// The styled spans for `id`'s label row: [`node_line`] for a plain drawn
+/// module, or [`collapsed_row_spans`] (via [`rail_view::namespace_stats`])
+/// when `id` is currently folded -- the same two span-builders the rail/
+/// canvas views already use, so all three views render identical text/
+/// badges for the same node. Unlike [`plain_row_text`] (which takes a
+/// [`RailRow`] the caller already resolved via [`rail_view::visible_rows_with_layers`]),
+/// this takes a bare id directly: [`crate::graph::plane::layout`]'s nested
+/// walk discovers collapsed/leaf ids on its own by walking
+/// [`crate::graph::model::ModuleNode::children`], never by consulting the
+/// rail view's flattened row list at all (see that module's own doc).
+fn plane_leaf_spans(app: &App, id: &NodeId) -> Vec<Span<'static>> {
+    if app.fold_collapsed.contains(id) {
+        let (module_count, changed_count) = rail_view::namespace_stats(&app.graph, id);
+        collapsed_row_spans(app, id, module_count, changed_count)
+    } else {
+        node_line(app, id).spans
+    }
+}
+
+/// The plain-text content of [`plane_leaf_spans`] -- what [`build_plane_view`]
+/// feeds [`plane::layout`] as each row's label width.
+fn plane_leaf_label(app: &App, id: &NodeId) -> String {
+    plane_leaf_spans(app, id)
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect()
+}
+
+/// The `(layers, rows)` pair [`crate::core::focus::move_focus`] needs for
+/// plane-mode spatial `h`/`j`/`k`/`l` -- [`plane::focus_grid`] over a freshly
+/// built [`PlaneView`]'s layout, mirroring [`canvas_focus_grid`]'s own role
+/// for the canvas view exactly.
+pub fn plane_focus_grid(app: &App) -> (Vec<Vec<NodeId>>, plane::FocusRows) {
+    let view = build_plane_view(app);
+    plane::focus_grid(&view.layout)
+}
+
+/// `focus`'s own rect in `view`'s absolute char space, or `None` if `focus`
+/// isn't present as a visible row at all -- what `crate::tui::event_loop`
+/// feeds into [`clamp_scroll`]/[`clamp_scroll_x`] every frame for the
+/// plane view's 2D auto-pan, mirroring [`focus_canvas_line`]/
+/// [`focused_slot_range`]'s combined role for the canvas view.
+pub fn focused_plane_rect(view: &PlaneView, focus: &NodeId) -> Option<plane::Rect> {
+    view.layout.rows.get(focus).copied()
+}
+
+/// The plane view's total rendered height -- what `crate::tui::event_loop`
+/// feeds into [`clamp_scroll`] as `total_rows`, mirroring
+/// [`canvas_line_count`]'s role for the canvas view.
+pub fn plane_view_height(view: &PlaneView) -> usize {
+    view.layout.height
+}
+
+/// One grid cell's paint state while [`draw_plane_graph`] composes the full
+/// (unscrolled, but height-windowed -- see that function's doc) char canvas:
+/// the glyph to show and the style to paint it with. Distinct from
+/// [`CanvasCell`]-style sparse storage -- the plane view's paint order
+/// (edges, then box borders, then labels, each strictly overwriting the
+/// last) is most naturally expressed as a dense per-visible-row buffer.
+type PlaneCell = (char, Style);
+
+fn empty_row(width: usize) -> Vec<PlaneCell> {
+    vec![(' ', Style::default()); width]
+}
+
+/// Paint `spans`' characters into `row` starting at column `start_x`,
+/// clipping silently at `row`'s own length -- used for both a leaf/
+/// collapsed row's label ([`draw_plane_graph`]) and a box's title line
+/// ([`plane_box_border_lines`]).
+fn paint_spans(row: &mut [PlaneCell], start_x: usize, spans: &[Span<'static>]) {
+    let mut cols = start_x..;
+    for span in spans {
+        for ch in span.content.chars() {
+            let col = cols.next().expect("unbounded range always yields");
+            if col < row.len() {
+                row[col] = (ch, span.style);
+            }
+        }
+    }
+}
+
+/// Paint a bare (unstyled-content, uniformly `style`d) string into `row`
+/// starting at column `start_x`, clipping silently at `row`'s own length --
+/// [`plane_box_border_lines`]'s own border-glyph painter.
+fn paint_str(row: &mut [PlaneCell], start_x: usize, text: &str, style: Style) {
+    for (col, ch) in (start_x..).zip(text.chars()) {
+        if col < row.len() {
+            row[col] = (ch, style);
+        }
+    }
+}
+
+/// Dim color for a box's own border glyphs -- matches [`RAIL_DIM`]'s "keep
+/// a dense screen readable" role, just applied to plane-view box borders
+/// instead of rail-gutter cells.
+const BOX_BORDER_DIM: Color = Color::DarkGray;
+
+/// `box_rect`'s title border text: `"╭─ Name ─...─╮"`, exactly `box_rect.w`
+/// characters wide (padding with extra `─` before the closing `╮`, or
+/// truncating in the pathological case a caller-supplied name is somehow
+/// wider than [`crate::graph::plane`]'s own `title_min_w` reserved for it --
+/// defensive, not expected to actually trigger given that invariant).
+fn plane_box_title(name: &str, width: usize) -> String {
+    let prefix = format!("\u{256d}\u{2500} {name} ");
+    let prefix_len = prefix.chars().count();
+    let closing = '\u{256e}';
+    if prefix_len + 1 > width {
+        let mut truncated: String = prefix.chars().take(width.saturating_sub(1)).collect();
+        truncated.push(closing);
+        return truncated;
+    }
+    let dashes = width - prefix_len - 1;
+    format!("{prefix}{}{closing}", "\u{2500}".repeat(dashes))
+}
+
+/// `box_rect`'s bottom border: `"╰─...─╯"`, exactly `width` characters wide.
+fn plane_box_bottom(width: usize) -> String {
+    if width < 2 {
+        return "\u{2570}".repeat(width);
+    }
+    format!("\u{2570}{}\u{256f}", "\u{2500}".repeat(width - 2))
+}
+
+/// Compose the plane view's full char canvas as styled [`Line`]s, windowed
+/// to the visible `[scroll_y, scroll_y + area.height)` row range up front
+/// (so a graph thousands of rows tall never allocates more than one
+/// screen's worth of grid rows -- see the module doc's sparse-space
+/// efficiency note) and `[scroll_x, scroll_x + area.width)` column range via
+/// [`slice_line_columns`] at the very end, exactly like [`draw_canvas_graph`]'s
+/// own scroll-then-slice discipline. Returns [`PlaneEdges::hidden`] so
+/// [`draw`] can feed it into [`draw_legend`]'s "+N edges hidden" hint, the
+/// plane view's counterpart to [`Channel::dropped`]/[`rails::RailLayout::dropped_edges`].
+fn draw_plane_graph(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    scroll_y: usize,
+    scroll_x: usize,
+) -> usize {
+    let view = build_plane_view(app);
+    if view.layout.rows.is_empty() && view.layout.boxes.is_empty() {
+        frame.render_widget(
+            Paragraph::new("(no visible nodes)").alignment(Alignment::Center),
+            area,
+        );
+        return view.edges.hidden;
+    }
+
+    let total_height = view.layout.height;
+    let width = view.layout.width.max(area.width as usize + scroll_x);
+    let start_y = scroll_y.min(total_height);
+    let end_y = (start_y + area.height as usize).min(total_height);
+    let window_height = end_y.saturating_sub(start_y);
+
+    let mut grid: Vec<Vec<PlaneCell>> = (0..window_height).map(|_| empty_row(width)).collect();
+
+    // 1. Edges, painted first -- everything below overwrites them, exactly
+    // the "edges pass under boxes" invariant `crate::graph::plane_edges`'s
+    // module doc relies on.
+    for cell in &view.edges.cells {
+        if cell.y >= start_y && cell.y < end_y && cell.x < width {
+            let row = &mut grid[cell.y - start_y];
+            row[cell.x] = (
+                cell.glyph,
+                Style::default().fg(canvas_role_color(cell.role)),
+            );
+        }
+    }
+
+    // 2. Every box's own border, any order (boxes never overlap each other
+    // -- see `crate::graph::plane`'s no-overlap guarantee).
+    for (id, rect) in &view.layout.boxes {
+        let name = app
+            .graph
+            .node(id)
+            .map(|n| n.display_name.clone())
+            .unwrap_or_else(|| id.to_string());
+        let border_style = Style::default().fg(BOX_BORDER_DIM);
+        if rect.y >= start_y && rect.y < end_y {
+            let row = &mut grid[rect.y - start_y];
+            paint_str(row, rect.x, &plane_box_title(&name, rect.w), border_style);
+        }
+        let bottom = rect.y + rect.h - 1;
+        if bottom >= start_y && bottom < end_y {
+            let row = &mut grid[bottom - start_y];
+            paint_str(row, rect.x, &plane_box_bottom(rect.w), border_style);
+        }
+        for y in (rect.y + 1)..(rect.y + rect.h - 1) {
+            if y >= start_y && y < end_y {
+                let row = &mut grid[y - start_y];
+                paint_str(row, rect.x, "\u{2502}", border_style);
+                if rect.w > 1 {
+                    paint_str(row, rect.x + rect.w - 1, "\u{2502}", border_style);
+                }
+            }
+        }
+    }
+
+    // 3. Every leaf/collapsed row's label, on top of everything -- rows
+    // never overlap a box's own border/padding ring (see
+    // `crate::graph::plane`'s containment guarantee), only its blank
+    // interior, so this never clobbers a border glyph.
+    for (id, rect) in &view.layout.rows {
+        if rect.y < start_y || rect.y >= end_y {
+            continue;
+        }
+        let mut spans = plane_leaf_spans(app, id);
+        if id == &app.focus {
+            for span in &mut spans {
+                span.style = span.style.add_modifier(Modifier::BOLD);
+            }
+        }
+        let row = &mut grid[rect.y - start_y];
+        paint_spans(row, rect.x, &spans);
+    }
+
+    let lines: Vec<Line> = grid
+        .into_iter()
+        .map(|row| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut current: Option<(String, Style)> = None;
+            for (ch, style) in row {
+                match &mut current {
+                    Some((text, cur_style)) if *cur_style == style => text.push(ch),
+                    _ => {
+                        if let Some((text, cur_style)) = current.take() {
+                            spans.push(Span::styled(text, cur_style));
+                        }
+                        current = Some((ch.to_string(), style));
+                    }
+                }
+            }
+            if let Some((text, cur_style)) = current {
+                spans.push(Span::styled(text, cur_style));
+            }
+            slice_line_columns(&Line::from(spans), scroll_x, area.width as usize)
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), area);
+    view.edges.hidden
+}
+
 fn draw_file_view(frame: &mut Frame, area: Rect, file_view: &FileViewState) {
     let Some(file) = file_view.current_file() else {
         frame.render_widget(
@@ -1230,11 +1528,15 @@ fn draw_legend(
             (Screen::Graph, Pane::Graph) => {
                 let mut hint = match view_mode {
                     ViewMode::Rail => {
-                        "` canvas  j/k move  h/l fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
+                        "` plane  j/k move  h/l fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
                             .to_string()
                     }
                     ViewMode::Canvas => {
                         "` rail  h/j/k/l move  zc/zo fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
+                            .to_string()
+                    }
+                    ViewMode::Plane => {
+                        "` canvas  h/j/k/l move  zc/zo fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
                             .to_string()
                     }
                 };
@@ -1245,6 +1547,9 @@ fn draw_legend(
                         ViewMode::Canvas => {
                             hint.push_str(&format!("  (+{dropped_edges} edges not drawn)"))
                         }
+                        ViewMode::Plane => hint.push_str(&format!(
+                            "  (+{dropped_edges} edges hidden — move focus to reveal)"
+                        )),
                     }
                 }
                 hint

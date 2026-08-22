@@ -75,18 +75,34 @@ use crate::review::review_state::ReviewStore;
 use crate::review::store as review_store;
 use loader::TuiLoader;
 
-/// Which of the two graph screens is showing, per issue #17's maintainer
-/// override: the rail-DAG row renderer (issue #16 phase 2, unchanged) and
-/// the new semantic-zoom Sugiyama canvas both stay, side by side, toggled
-/// with backtick (see [`TuiState::view_mode`]'s doc for why this lives
-/// entirely in the TUI rather than on `core::App`). `Canvas` is the
-/// default -- the canvas is what's being evaluated against real use; the
-/// rail view is kept for comparison, not as the primary experience.
+/// Which of the three graph screens is showing: the rail-DAG row renderer
+/// (issue #16 phase 2), the semantic-zoom Sugiyama canvas (issue #17/#18),
+/// and the nested 2D plane view (the third TUI graph attempt -- see
+/// [`crate::graph::plane`]'s module doc for why the first two, both
+/// band-based, were rejected in real use), all three kept side by side,
+/// cycled with backtick in `Plane -> Canvas -> Rail -> Plane` order (see
+/// [`TuiState::view_mode`]'s doc for why this lives entirely in the TUI
+/// rather than on `core::App`). `Plane` is the default -- it's the view
+/// being evaluated against real use now; the other two are kept for
+/// side-by-side comparison, not as the primary experience.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViewMode {
     #[default]
+    Plane,
     Canvas,
     Rail,
+}
+
+impl ViewMode {
+    /// The next mode in the backtick cycle (`Plane -> Canvas -> Rail ->
+    /// Plane`) -- see [`ViewMode`]'s own doc for why this order.
+    fn next(self) -> ViewMode {
+        match self {
+            ViewMode::Plane => ViewMode::Canvas,
+            ViewMode::Canvas => ViewMode::Rail,
+            ViewMode::Rail => ViewMode::Plane,
+        }
+    }
 }
 
 /// How long `--smoke` keeps the terminal open before exiting 0 -- mirrors
@@ -566,6 +582,28 @@ fn event_loop(
                         );
                     }
                 }
+                ViewMode::Plane => {
+                    // Reuses `canvas_scroll`/`canvas_scroll_x` (see those
+                    // fields' own doc) -- the plane view is never showing at
+                    // the same time as the canvas view, so there's no
+                    // cross-talk between the two modes' auto-pan.
+                    let view = render::build_plane_view(&state.app);
+                    let total_height = render::plane_view_height(&view);
+                    if let Some(rect) = render::focused_plane_rect(&view, &state.app.focus) {
+                        state.canvas_scroll = render::clamp_scroll(
+                            state.canvas_scroll,
+                            rect.y,
+                            total_height,
+                            viewport_height,
+                        );
+                        state.canvas_scroll_x = render::clamp_scroll_x(
+                            state.canvas_scroll_x,
+                            rect.x,
+                            rect.w,
+                            size.width as usize,
+                        );
+                    }
+                }
             }
         }
         terminal.draw(|frame| {
@@ -666,10 +704,7 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
     }
 
     if should_toggle_view_mode(state, input) {
-        state.view_mode = match state.view_mode {
-            ViewMode::Canvas => ViewMode::Rail,
-            ViewMode::Rail => ViewMode::Canvas,
-        };
+        state.view_mode = state.view_mode.next();
         state.canvas_fold_pending = false;
         return KeyAction::Continue;
     }
@@ -683,6 +718,12 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
         }
         ViewMode::Canvas => {
             if let Some(msg) = canvas_key_msg(state, input) {
+                state.dispatch(msg);
+                return KeyAction::Continue;
+            }
+        }
+        ViewMode::Plane => {
+            if let Some(msg) = plane_key_msg(state, input) {
                 state.dispatch(msg);
                 return KeyAction::Continue;
             }
@@ -837,6 +878,55 @@ fn canvas_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
                 _ => Direction::Down,
             };
             let (layers, rows) = render::canvas_focus_grid(&state.app);
+            let target = move_focus(&layers, &rows, &state.app.focus, dir);
+            Some(Msg::FocusSet(target))
+        }
+        _ => None,
+    }
+}
+
+/// The plane-view message `input` should dispatch directly, bypassing
+/// `map_key` -- identical in shape to [`canvas_key_msg`] (spatial `h`/`j`/
+/// `k`/`l` over [`move_focus`], `zc`/`zo` fold chord), just fed
+/// [`render::plane_focus_grid`]'s rects instead of the canvas's Sugiyama
+/// band x-centers. Shares [`TuiState::canvas_fold_pending`] with the canvas
+/// view rather than a separate flag -- the two view modes are mutually
+/// exclusive at any given moment (see [`ViewMode`]'s doc), so there's never
+/// a chord in flight for one mode while the other is showing, and
+/// `should_toggle_view_mode`'s backtick handler already clears it on every
+/// mode switch regardless.
+fn plane_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
+    if state.app.screen != Screen::Graph
+        || state.app.pane != Pane::Graph
+        || state.app.picker.is_some()
+        || state.pending_key.is_some()
+    {
+        state.canvas_fold_pending = false;
+        return None;
+    }
+
+    if state.canvas_fold_pending {
+        state.canvas_fold_pending = false;
+        return match input {
+            KeyInput::Char('c') => Some(Msg::CollapseFocusedNamespace),
+            KeyInput::Char('o') => Some(Msg::ExpandFocusedNamespace),
+            _ => None,
+        };
+    }
+
+    match input {
+        KeyInput::Char('z') => {
+            state.canvas_fold_pending = true;
+            None
+        }
+        KeyInput::Char(c @ ('h' | 'j' | 'k' | 'l')) => {
+            let dir = match c {
+                'h' => Direction::Left,
+                'l' => Direction::Right,
+                'k' => Direction::Up,
+                _ => Direction::Down,
+            };
+            let (layers, rows) = render::plane_focus_grid(&state.app);
             let target = move_focus(&layers, &rows, &state.app.focus, dir);
             Some(Msg::FocusSet(target))
         }
@@ -1244,19 +1334,21 @@ mod tests {
     }
 
     #[test]
-    fn canvas_mode_is_the_default() {
+    fn plane_mode_is_the_default() {
         let state = state_fixture();
-        assert_eq!(state.view_mode, ViewMode::Canvas);
+        assert_eq!(state.view_mode, ViewMode::Plane);
     }
 
     #[test]
-    fn backtick_toggles_between_canvas_and_rail_and_back() {
+    fn backtick_cycles_through_plane_canvas_and_rail_and_back() {
         let mut state = state_fixture();
+        assert_eq!(state.view_mode, ViewMode::Plane);
+        handle_key(&mut state, press('`'));
         assert_eq!(state.view_mode, ViewMode::Canvas);
         handle_key(&mut state, press('`'));
         assert_eq!(state.view_mode, ViewMode::Rail);
         handle_key(&mut state, press('`'));
-        assert_eq!(state.view_mode, ViewMode::Canvas);
+        assert_eq!(state.view_mode, ViewMode::Plane);
     }
 
     #[test]
@@ -1280,7 +1372,7 @@ mod tests {
     #[test]
     fn in_canvas_mode_j_moves_focus_spatially_to_the_dependency_below() {
         let mut state = state_with_layered_graph("leaf");
-        assert_eq!(state.view_mode, ViewMode::Canvas);
+        state.view_mode = ViewMode::Canvas;
         handle_key(&mut state, press('j'));
         assert_eq!(state.app.focus, NodeId::from("target"));
     }
@@ -1293,10 +1385,47 @@ mod tests {
         // stayed put here too if they were, but `fold_collapsed` must be
         // untouched either way).
         let mut state = state_with_layered_graph("leaf");
+        state.view_mode = ViewMode::Canvas;
         handle_key(&mut state, press('h'));
         assert!(state.app.fold_collapsed.is_empty());
         handle_key(&mut state, press('l'));
         assert!(state.app.fold_collapsed.is_empty());
+    }
+
+    #[test]
+    fn in_plane_mode_j_moves_focus_spatially_to_the_dependency_below() {
+        let mut state = state_with_layered_graph("leaf");
+        assert_eq!(state.view_mode, ViewMode::Plane);
+        handle_key(&mut state, press('j'));
+        assert_eq!(state.app.focus, NodeId::from("target"));
+    }
+
+    #[test]
+    fn in_plane_mode_h_and_l_do_not_fold_they_move_spatially() {
+        let mut state = state_with_layered_graph("leaf");
+        assert_eq!(state.view_mode, ViewMode::Plane);
+        handle_key(&mut state, press('h'));
+        assert!(state.app.fold_collapsed.is_empty());
+        handle_key(&mut state, press('l'));
+        assert!(state.app.fold_collapsed.is_empty());
+    }
+
+    #[test]
+    fn zc_then_zo_collapses_then_expands_in_plane_mode() {
+        let mut state = state_with_layered_graph("leaf");
+        assert_eq!(state.view_mode, ViewMode::Plane);
+        handle_key(&mut state, press('z'));
+        assert!(
+            state.canvas_fold_pending,
+            "z alone should arm the chord, not dispatch anything yet"
+        );
+        handle_key(&mut state, press('c'));
+        // `leaf` has no parent namespace, so nothing actually collapses --
+        // this just proves the chord dispatched `Msg::CollapseFocusedNamespace`
+        // rather than falling through to `map_key`'s own `c`
+        // (`Msg::CommentNode`), which would have requested an nvim handoff
+        // instead.
+        assert!(!state.canvas_fold_pending, "chord clears after completing");
     }
 
     #[test]

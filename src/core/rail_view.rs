@@ -224,7 +224,7 @@ fn collapse_root(graph: &ProjectGraph, id: &NodeId, collapsed: &HashSet<NodeId>)
 /// regardless of whether an intermediate node itself happens to carry files
 /// (shouldn't occur for a real namespace container, but this stays correct
 /// either way rather than assuming the shape).
-fn namespace_stats(graph: &ProjectGraph, namespace: &NodeId) -> (usize, usize) {
+pub(crate) fn namespace_stats(graph: &ProjectGraph, namespace: &NodeId) -> (usize, usize) {
     let mut modules = 0;
     let mut changed = 0;
     collect_stats(graph, namespace, &mut modules, &mut changed);
