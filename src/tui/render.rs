@@ -837,9 +837,10 @@ fn dummy_role(view: &CanvasView, edge_idx: usize, focus: &NodeId) -> CanvasRole 
 
 /// One band's label row: every slot's content placed at its assigned
 /// `x` column (padded with spaces up to that column), a real node's content
-/// coming from [`node_line`]/[`collapsed_row_spans`] (bolded if it's the
-/// focused node), a dummy slot rendering as a bare `│` passthrough (in the
-/// role of whichever edge it belongs to -- see [`dummy_role`]) so a
+/// coming from [`node_line`]/[`collapsed_row_spans`] (bolded and reverse-
+/// videoed if it's the focused node), a dummy slot rendering as a bare `│`
+/// passthrough (in the role of whichever edge it belongs to -- see
+/// [`dummy_role`]) so a
 /// long edge reads as one continuous rail through the bands it merely
 /// passes over, not a gap.
 fn canvas_label_line(app: &App, view: &CanvasView, band_idx: usize) -> Line<'static> {
@@ -873,7 +874,7 @@ fn canvas_label_line(app: &App, view: &CanvasView, band_idx: usize) -> Line<'sta
                 };
                 if id == &app.focus {
                     for span in &mut node_spans {
-                        span.style = span.style.add_modifier(Modifier::BOLD);
+                        span.style = span.style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
                     }
                 }
                 col += slot.width;
@@ -984,6 +985,14 @@ fn draw_canvas_graph(
 // space `crate::graph::plane::shelf_pack` leaves between siblings and shelf
 // rows; it can never visually collide with a box or a label because
 // whichever was painted later always wins that cell.
+//
+// The focused row is unmistakable two ways, both style-only (never a marker
+// character -- see `plane_leaf_label`'s doc on why layout must not react to
+// which row happens to be focused): its own label spans get
+// `Modifier::REVERSED` on top of the existing `Modifier::BOLD`, and the box
+// that contains it (or that it *is*, for a drawn namespace's own self-row)
+// gets `BOX_BORDER_FOCUSED` instead of the usual `BOX_BORDER_DIM` -- see
+// `rect_contains`'s doc.
 
 /// Everything the plane screen needs, built fresh each frame from `App`
 /// state -- mirrors [`CanvasView`]'s own "recompute, don't cache" precedent
@@ -1127,6 +1136,27 @@ fn paint_str(row: &mut [PlaneCell], start_x: usize, text: &str, style: Style) {
 /// instead of rail-gutter cells.
 const BOX_BORDER_DIM: Color = Color::DarkGray;
 
+/// Accent color for a box's border when it contains (or *is*) the focused
+/// row -- lets the eye find the focused region's box at a glance instead of
+/// having to spot a single reversed-video row inside a screenful of dim
+/// boxes. Distinct from [`RAIL_OUTGOING`]/[`RAIL_INCOMING`] (which mark
+/// edge direction, not focus location).
+const BOX_BORDER_FOCUSED: Color = Color::Yellow;
+
+/// Whether `box_rect` contains `row_rect` -- both in the same absolute char
+/// space (see [`plane::Rect`]'s doc), used by [`draw_plane_graph`] to decide
+/// which box (if any) gets [`BOX_BORDER_FOCUSED`] instead of
+/// [`BOX_BORDER_DIM`]. A box's own self-row rect (see
+/// [`plane::layout`]'s "a drawn namespace keeps a self-row" behavior) is
+/// always contained by its own box, so this one check covers both "focus is
+/// a descendant row inside the box" and "focus is the box's own self-row".
+fn rect_contains(box_rect: &plane::Rect, row_rect: &plane::Rect) -> bool {
+    row_rect.x >= box_rect.x
+        && row_rect.y >= box_rect.y
+        && row_rect.x + row_rect.w <= box_rect.x + box_rect.w
+        && row_rect.y + row_rect.h <= box_rect.y + box_rect.h
+}
+
 /// `box_rect`'s title border text: `"╭─ Name ─...─╮"`, exactly `box_rect.w`
 /// characters wide (padding with extra `─` before the closing `╮`, or
 /// truncating in the pathological case a caller-supplied name is somehow
@@ -1200,14 +1230,23 @@ fn draw_plane_graph(
     }
 
     // 2. Every box's own border, any order (boxes never overlap each other
-    // -- see `crate::graph::plane`'s no-overlap guarantee).
+    // -- see `crate::graph::plane`'s no-overlap guarantee). The box
+    // containing (or being) the focused row gets `BOX_BORDER_FOCUSED`
+    // instead of the usual dim color -- see `rect_contains`'s doc.
+    let focus_rect = view.layout.rows.get(&app.focus).copied();
     for (id, rect) in &view.layout.boxes {
         let name = app
             .graph
             .node(id)
             .map(|n| n.display_name.clone())
             .unwrap_or_else(|| id.to_string());
-        let border_style = Style::default().fg(BOX_BORDER_DIM);
+        let is_focused_box = focus_rect.is_some_and(|fr| rect_contains(rect, &fr));
+        let border_color = if is_focused_box {
+            BOX_BORDER_FOCUSED
+        } else {
+            BOX_BORDER_DIM
+        };
+        let border_style = Style::default().fg(border_color);
         if rect.y >= start_y && rect.y < end_y {
             let row = &mut grid[rect.y - start_y];
             paint_str(row, rect.x, &plane_box_title(&name, rect.w), border_style);
@@ -1239,7 +1278,7 @@ fn draw_plane_graph(
         let mut spans = plane_leaf_spans(app, id, &view.labels);
         if id == &app.focus {
             for span in &mut spans {
-                span.style = span.style.add_modifier(Modifier::BOLD);
+                span.style = span.style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
             }
         }
         let row = &mut grid[rect.y - start_y];
@@ -2772,6 +2811,206 @@ mod tests {
         );
         let text = render_plane_to_string(&app, 40, 10, 0, 0);
         assert!(text.contains("no visible nodes"));
+    }
+
+    /// Two separate top-level namespaces, `ns1` (containing leaf `a`) and
+    /// `ns2` (containing leaf `b`) -- enough to prove the focused-box accent
+    /// border (requirement 3) paints only the box that actually contains
+    /// (or *is*) the focused row, leaving every sibling box dim.
+    fn two_namespace_graph_fixture() -> ProjectGraph {
+        let ns1_id = NodeId::from("ns1");
+        let ns2_id = NodeId::from("ns2");
+        let a_id = NodeId::from("a");
+        let b_id = NodeId::from("b");
+        let leaf = |id: &NodeId, name: &str, parent: &NodeId| ModuleNode {
+            id: id.clone(),
+            display_name: name.to_string(),
+            parent: Some(parent.clone()),
+            children: vec![],
+            status: GitStatus::Modified,
+            files: vec![FileRef {
+                path: PathBuf::from(format!("{name}.rs")),
+                base_blob: Some("b".to_string()),
+                head_blob: Some("h".to_string()),
+            }],
+        };
+        let mut nodes = HashMap::new();
+        nodes.insert(a_id.clone(), leaf(&a_id, "a", &ns1_id));
+        nodes.insert(b_id.clone(), leaf(&b_id, "b", &ns2_id));
+        nodes.insert(
+            ns1_id.clone(),
+            ModuleNode {
+                id: ns1_id.clone(),
+                display_name: "ns1".to_string(),
+                parent: None,
+                children: vec![a_id],
+                status: GitStatus::Unchanged,
+                // A real backing file makes this a *drawn* namespace (see
+                // `plane::layout`'s "a drawn namespace keeps a self-row"
+                // behavior), which the self-row-focus test below relies on.
+                files: vec![FileRef {
+                    path: PathBuf::from("ns1.rs"),
+                    base_blob: None,
+                    head_blob: None,
+                }],
+            },
+        );
+        nodes.insert(
+            ns2_id.clone(),
+            ModuleNode {
+                id: ns2_id.clone(),
+                display_name: "ns2".to_string(),
+                parent: None,
+                children: vec![b_id],
+                status: GitStatus::Unchanged,
+                files: vec![],
+            },
+        );
+        ProjectGraph {
+            roots: vec![ns1_id, ns2_id],
+            nodes,
+            edges: vec![],
+        }
+    }
+
+    /// Every cell in `buffer` whose symbol is `symbol` and whose style
+    /// carries `Modifier::REVERSED` -- the shared assertion helper for the
+    /// reversed-video focus tests below.
+    fn reversed_cells(buffer: &ratatui::buffer::Buffer, symbol: &str) -> Vec<(u16, u16)> {
+        let mut hits = Vec::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                if cell.symbol() == symbol && cell.style().add_modifier.contains(Modifier::REVERSED)
+                {
+                    hits.push((x, y));
+                }
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn plane_graph_reverses_the_focused_node_s_own_cell() {
+        let (graph, _ns_id) = namespaced_graph_fixture();
+        let app = app_for_plane(graph, "a");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        terminal
+            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Plane))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        assert!(
+            !reversed_cells(buffer, "a").is_empty(),
+            "expected the focused node's label to carry REVERSED"
+        );
+        assert!(
+            reversed_cells(buffer, "b").is_empty(),
+            "the non-focused sibling must not carry REVERSED"
+        );
+    }
+
+    #[test]
+    fn plane_graph_reversed_video_moves_with_focus() {
+        let (graph, _ns_id) = namespaced_graph_fixture();
+
+        let app_a = app_for_plane(graph.clone(), "a");
+        let mut terminal_a = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        terminal_a
+            .draw(|frame| draw(frame, &app_a, None, 0, 0, 0, ViewMode::Plane))
+            .expect("draw");
+        let buffer_a = terminal_a.backend().buffer();
+        assert!(!reversed_cells(buffer_a, "a").is_empty());
+        assert!(reversed_cells(buffer_a, "b").is_empty());
+
+        let mut app_b = app_for_plane(graph, "a");
+        app_b.focus = NodeId::from("b");
+        let mut terminal_b = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        terminal_b
+            .draw(|frame| draw(frame, &app_b, None, 0, 0, 0, ViewMode::Plane))
+            .expect("draw");
+        let buffer_b = terminal_b.backend().buffer();
+        assert!(
+            reversed_cells(buffer_b, "a").is_empty(),
+            "moving focus off `a` must drop its REVERSED styling"
+        );
+        assert!(
+            !reversed_cells(buffer_b, "b").is_empty(),
+            "moving focus onto `b` must give it REVERSED styling"
+        );
+    }
+
+    #[test]
+    fn plane_graph_accents_the_box_containing_the_focused_row() {
+        let graph = two_namespace_graph_fixture();
+        let app = app_for_plane(graph, "a");
+        let view = build_plane_view(&app);
+        let ns1_rect = *view
+            .layout
+            .boxes
+            .get(&NodeId::from("ns1"))
+            .expect("ns1 box");
+        let ns2_rect = *view
+            .layout
+            .boxes
+            .get(&NodeId::from("ns2"))
+            .expect("ns2 box");
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        terminal
+            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Plane))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+
+        let top_border_style = |rect: plane::Rect| buffer[(rect.x as u16, rect.y as u16)].style();
+
+        assert_eq!(
+            top_border_style(ns1_rect).fg,
+            Some(BOX_BORDER_FOCUSED),
+            "ns1 contains the focused row `a` and should get the accent border"
+        );
+        assert_eq!(
+            top_border_style(ns2_rect).fg,
+            Some(BOX_BORDER_DIM),
+            "ns2 does not contain the focused row and should stay dim"
+        );
+    }
+
+    #[test]
+    fn plane_graph_accents_a_drawn_namespace_s_own_box_when_it_is_itself_focused() {
+        let graph = two_namespace_graph_fixture();
+        let app = app_for_plane(graph, "ns1");
+        let view = build_plane_view(&app);
+        let ns1_rect = *view
+            .layout
+            .boxes
+            .get(&NodeId::from("ns1"))
+            .expect("ns1 box");
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        terminal
+            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Plane))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let top_border_style = buffer[(ns1_rect.x as u16, ns1_rect.y as u16)].style();
+        assert_eq!(
+            top_border_style.fg,
+            Some(BOX_BORDER_FOCUSED),
+            "ns1 is itself the focused self-row and should get the accent border"
+        );
+    }
+
+    #[test]
+    fn canvas_graph_reverses_the_focused_node_s_own_cell() {
+        let app = app_for(diamond_graph_fixture(), "p1");
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).expect("test backend");
+        terminal
+            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Canvas))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        assert!(
+            !reversed_cells(buffer, "p").is_empty(),
+            "expected the focused node's label to carry REVERSED"
+        );
     }
 
     #[test]
