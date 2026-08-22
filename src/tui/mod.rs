@@ -180,12 +180,15 @@ struct TuiState {
     /// semantics it drives (`gd`/`gr`, `Enter`, `d`, ...) are identical in
     /// both modes.
     view_mode: ViewMode,
-    /// The canvas view's own scroll offset, the [`ViewMode::Canvas`] analog
-    /// of [`Self::rail_scroll`] -- see that field's doc for why this is
-    /// TUI-local. Reclamped every frame in [`event_loop`] the same way.
+    /// The scroll offset shared by [`ViewMode::Canvas`] and [`ViewMode::Plane`]
+    /// (both lay out in the same unbounded char space and are never showing
+    /// at once, so there's no cross-talk sharing one field between them --
+    /// see [`ViewMode`]'s doc), the char-space analog of [`Self::rail_scroll`]
+    /// -- see that field's doc for why this is TUI-local. Reclamped every
+    /// frame in [`event_loop`] the same way.
     canvas_scroll: usize,
-    /// The canvas view's horizontal pan offset (leftmost visible column,
-    /// issue #18) -- the horizontal counterpart of [`Self::canvas_scroll`],
+    /// [`Self::canvas_scroll`]'s horizontal counterpart (issue #18), shared
+    /// the same way between [`ViewMode::Canvas`] and [`ViewMode::Plane`],
     /// for the same TUI-local reason that field is TUI-local. Auto-panned
     /// every frame in [`event_loop`] via [`render::clamp_scroll_x`] to keep
     /// the focused node's own column range inside the viewport, mirroring
@@ -193,13 +196,15 @@ struct TuiState {
     /// the pre-#18 behavior of simply clipping a band wider than the
     /// terminal at its right edge with no way to reach what fell off it.
     canvas_scroll_x: usize,
-    /// Whether a `z` chord prefix is in progress for the canvas view's
-    /// fold keys (`zc`/`zo` -- see [`canvas_key_msg`]'s doc for why this
-    /// isn't threaded through `crate::keymap::Pending`, which is shared
-    /// with the GUI and the rail view's own chord handling). Cleared on
-    /// every keypress that isn't itself `z` starting a fresh chord, or the
-    /// `c`/`o` that completes one -- there's no chord that survives an
-    /// unrelated keypress.
+    /// Whether a `z` chord prefix is in progress for the canvas/plane
+    /// views' shared fold keys (`zc`/`zo` -- see [`canvas_key_msg`]'s doc
+    /// for why this isn't threaded through `crate::keymap::Pending`, which
+    /// is shared with the GUI and the rail view's own chord handling).
+    /// Shared between [`canvas_key_msg`] and [`plane_key_msg`] the same way
+    /// [`Self::canvas_scroll`] is (see that field's doc). Cleared on every
+    /// keypress that isn't itself `z` starting a fresh chord, or the `c`/`o`
+    /// that completes one -- there's no chord that survives an unrelated
+    /// keypress.
     canvas_fold_pending: bool,
     /// The `nvim` handoff target [`TuiState::execute`]'s `Cmd::CommentNode`
     /// arm just computed, if any -- [`handle_key`] reads this back out

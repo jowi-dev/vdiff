@@ -94,14 +94,15 @@ pub fn file_view_visible_rows(terminal_rows: u16) -> usize {
 /// this one frame -- see `crate::tui::TuiState::notice`'s doc for why the
 /// TUI needs this display-only glue state at all (in short: `eprintln!` is
 /// invisible/garbled while the alternate screen owns the terminal).
-/// `rail_scroll`/`canvas_scroll` are the rail/canvas views' current
-/// vertical scroll offsets, already clamped by the caller via
+/// `rail_scroll`/`canvas_scroll` are the rail view's and the canvas/plane
+/// views' (which share `canvas_scroll` -- see `crate::tui::TuiState::canvas_scroll`'s
+/// doc) current vertical scroll offsets, already clamped by the caller via
 /// [`clamp_scroll`] -- see [`rail_visible_rows`]'s doc for why that
 /// clamping happens in `crate::tui::event_loop` rather than in here.
-/// `canvas_scroll_x` is the canvas view's own horizontal counterpart (issue
-/// #18's auto-pan -- see [`clamp_scroll_x`]'s doc), unused by the rail view
-/// entirely (it has no horizontal scroll at all). `view_mode` picks which
-/// of the two graph screens actually paints (issue #17's maintainer
+/// `canvas_scroll_x` is the canvas/plane views' own horizontal counterpart
+/// (issue #18's auto-pan -- see [`clamp_scroll_x`]'s doc), unused by the
+/// rail view entirely (it has no horizontal scroll at all). `view_mode`
+/// picks which of the three graph screens actually paints (issue #17's maintainer
 /// override -- see [`crate::tui::ViewMode`]'s doc); the one not currently
 /// showing has no rendering cost paid for it at all.
 pub fn draw(
