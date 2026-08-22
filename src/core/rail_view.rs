@@ -122,7 +122,7 @@ pub fn visible_rows_with_layers(
     let mut emitted: HashSet<NodeId> = HashSet::new();
     for (layer_idx, layer) in layers.iter().enumerate() {
         for id in layer {
-            match collapse_root(graph, id, collapsed) {
+            match collapsed_namespace_of(graph, id, collapsed) {
                 Some(namespace) => {
                     if emitted.insert(namespace.clone()) {
                         let (module_count, changed_count) = namespace_stats(graph, &namespace);
@@ -155,7 +155,37 @@ pub fn visible_rows_with_layers(
 /// this has no effect on the GUI, which never populates
 /// `App::fold_collapsed` at all.
 pub fn effective_row_id(graph: &ProjectGraph, id: &NodeId, collapsed: &HashSet<NodeId>) -> NodeId {
-    collapse_root(graph, id, collapsed).unwrap_or_else(|| id.clone())
+    collapsed_namespace_of(graph, id, collapsed).unwrap_or_else(|| id.clone())
+}
+
+/// The namespace row `id` belongs to once folding is applied, including
+/// `id` itself: `Some(id.clone())` when `id` is directly in `collapsed`,
+/// otherwise [`collapse_root`]'s nearest-collapsed-ancestor result. `None`
+/// when neither `id` nor any ancestor is collapsed (it renders as its own
+/// [`RailRow::Node`]).
+///
+/// The "`id` itself" case matters because a namespace can be a *drawn* node
+/// in its own right -- see `crate::graph::builder`'s "real defmodule takes
+/// precedence over synthetic namespace" precedent (e.g. a real
+/// `defmodule AppWeb do end` that also has `AppWeb.Foo`/`AppWeb.Bar`
+/// submodules) -- so its own entry sits in `layers` right alongside its
+/// descendants. [`collapse_root`] only walks *ancestors*, so without this
+/// check the namespace's own layer entry would fall through to
+/// [`visible_rows_with_layers`]'s `None` arm and render a second,
+/// duplicate row for the same [`NodeId`] (one [`RailRow::Node`] for the
+/// namespace's own entry, plus the [`RailRow::Collapsed`] its descendants
+/// already produce) -- exactly the real-use "same row twice" bug this
+/// function exists to close. [`first_visible_descendant`] already applies
+/// this same "check `id` itself first" rule for the same reason.
+fn collapsed_namespace_of(
+    graph: &ProjectGraph,
+    id: &NodeId,
+    collapsed: &HashSet<NodeId>,
+) -> Option<NodeId> {
+    if collapsed.contains(id) {
+        return Some(id.clone());
+    }
+    collapse_root(graph, id, collapsed)
 }
 
 /// Walk `id`'s parent chain looking for the nearest ancestor present in
@@ -308,6 +338,36 @@ mod tests {
         )
     }
 
+    /// Like [`namespace`], but the namespace node itself is also drawn
+    /// (has a backing file) -- the "real defmodule takes precedence over
+    /// synthetic namespace" shape from `crate::graph::builder`'s own tests,
+    /// e.g. a real `defmodule AppWeb do end` that also has `AppWeb.Foo`/
+    /// `AppWeb.Bar` submodules. Exercises the case where the namespace's
+    /// own drawn entry sits in `layers` right alongside its descendants.
+    fn drawn_namespace(
+        id: &str,
+        name: &str,
+        parent: Option<&str>,
+        children: &[&str],
+    ) -> (NodeId, ModuleNode) {
+        let node_id = NodeId::from(id);
+        (
+            node_id.clone(),
+            ModuleNode {
+                id: node_id,
+                display_name: name.to_string(),
+                parent: parent.map(NodeId::from),
+                children: children.iter().map(|c| NodeId::from(*c)).collect(),
+                status: GitStatus::Unchanged,
+                files: vec![crate::graph::model::FileRef {
+                    path: PathBuf::from(format!("{id}.ex")),
+                    base_blob: Some("b".to_string()),
+                    head_blob: Some("h".to_string()),
+                }],
+            },
+        )
+    }
+
     /// Two namespaces (`ns_a` with children `a1`/`a2`, `ns_b` with child
     /// `b1`), plus a cross-namespace dependency edge `a1 -> b1` and an
     /// intra-namespace one `a2 -> a1` (so collapsing `ns_a` drops the
@@ -398,6 +458,48 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(matches!(rows[0], RailRow::Collapsed { .. }));
         assert!(matches!(rows[1], RailRow::Collapsed { .. }));
+    }
+
+    /// Real-world shape from a `--tui` bug report: a namespace that is
+    /// itself a drawn node (a real `defmodule AppWeb do end`, per
+    /// `crate::graph::builder`'s "real defmodule takes precedence over
+    /// synthetic namespace" precedent) sits in `layers` alongside its own
+    /// descendants. Collapsing it must absorb the namespace's own drawn
+    /// entry into the single [`RailRow::Collapsed`] row too, not also emit
+    /// a separate [`RailRow::Node`] for it -- `collapse_root` only walks
+    /// *ancestors*, so without an explicit "is `id` itself collapsed?"
+    /// check the namespace's own layer entry falls through to the `None`
+    /// arm and renders a second, duplicate row for the same [`NodeId`].
+    #[test]
+    fn collapsing_a_namespace_that_is_itself_drawn_yields_only_one_row_for_it() {
+        let (ns_id, ns) = drawn_namespace("ns_a", "NsA", None, &["a1"]);
+        let (a1_id, a1) = leaf("a1", "a1", Some("ns_a"), GitStatus::Modified);
+
+        let mut nodes = HashMap::new();
+        nodes.insert(ns_id.clone(), ns);
+        nodes.insert(a1_id.clone(), a1);
+        let g = ProjectGraph {
+            roots: vec![ns_id.clone()],
+            nodes,
+            edges: vec![],
+        };
+        // The namespace's own drawn entry sits in `layers` right alongside
+        // its child, exactly as `crate::graph::layers::assign_layers` would
+        // place two unrelated drawn nodes.
+        let layers = vec![vec![ns_id.clone(), a1_id]];
+        let collapsed = HashSet::from([ns_id.clone()]);
+
+        let rows = visible_rows(&g, &layers, &collapsed);
+
+        assert_eq!(
+            rows,
+            vec![RailRow::Collapsed {
+                namespace: ns_id,
+                module_count: 2,
+                changed_count: 1,
+            }],
+            "expected exactly one collapsed row absorbing both the namespace's own entry and its child, not a duplicate Node row"
+        );
     }
 
     #[test]
