@@ -992,6 +992,11 @@ fn draw_canvas_graph(
 pub struct PlaneView {
     layout: PlaneLayout,
     edges: PlaneEdges,
+    /// [`rail_view::disambiguated_labels`]'s map for the same visible row
+    /// set the rail/canvas views derive -- so a name collision renders
+    /// qualified on the plane view exactly as it does on the other two
+    /// (see [`node_line`]'s doc on why a bare `display_name` isn't safe).
+    labels: HashMap<NodeId, String>,
 }
 
 /// Build [`PlaneView`] from `app`'s current fold state: [`plane::layout`]
@@ -1002,14 +1007,17 @@ pub struct PlaneView {
 /// [`rail_view::collapse_edges`]'s fold-aware edge list -- the same edge set
 /// [`build_canvas_view`] routes.
 pub fn build_plane_view(app: &App) -> PlaneView {
+    let raw_rows = rail_view::visible_rows(&app.graph, &app.layers, &app.fold_collapsed);
+    let labels = rail_view::disambiguated_labels(&app.graph, &raw_rows);
     let layout = plane::layout(&app.graph, &app.layers, &app.fold_collapsed, |id| {
-        plane_leaf_label(app, id)
+        plane_leaf_label(app, id, &labels)
     });
     let edges = rail_view::collapse_edges(&app.graph, &app.graph.edges, &app.fold_collapsed);
     let routed = plane_edges::route_edges(&layout, &edges, &app.focus);
     PlaneView {
         layout,
         edges: routed,
+        labels,
     }
 }
 
@@ -1023,19 +1031,28 @@ pub fn build_plane_view(app: &App) -> PlaneView {
 /// walk discovers collapsed/leaf ids on its own by walking
 /// [`crate::graph::model::ModuleNode::children`], never by consulting the
 /// rail view's flattened row list at all (see that module's own doc).
-fn plane_leaf_spans(app: &App, id: &NodeId) -> Vec<Span<'static>> {
+fn plane_leaf_spans(
+    app: &App,
+    id: &NodeId,
+    labels: &HashMap<NodeId, String>,
+) -> Vec<Span<'static>> {
+    let label = labels
+        .get(id)
+        .cloned()
+        .or_else(|| app.graph.node(id).map(|n| n.display_name.clone()))
+        .unwrap_or_else(|| id.to_string());
     if app.fold_collapsed.contains(id) {
         let (module_count, changed_count) = rail_view::namespace_stats(&app.graph, id);
-        collapsed_row_spans(app, id, module_count, changed_count)
+        collapsed_row_spans(&label, module_count, changed_count)
     } else {
-        node_line(app, id).spans
+        node_line(app, id, &label).spans
     }
 }
 
 /// The plain-text content of [`plane_leaf_spans`] -- what [`build_plane_view`]
 /// feeds [`plane::layout`] as each row's label width.
-fn plane_leaf_label(app: &App, id: &NodeId) -> String {
-    plane_leaf_spans(app, id)
+fn plane_leaf_label(app: &App, id: &NodeId, labels: &HashMap<NodeId, String>) -> String {
+    plane_leaf_spans(app, id, labels)
         .iter()
         .map(|s| s.content.as_ref())
         .collect()
@@ -1219,7 +1236,7 @@ fn draw_plane_graph(
         if rect.y < start_y || rect.y >= end_y {
             continue;
         }
-        let mut spans = plane_leaf_spans(app, id);
+        let mut spans = plane_leaf_spans(app, id, &view.labels);
         if id == &app.focus {
             for span in &mut spans {
                 span.style = span.style.add_modifier(Modifier::BOLD);

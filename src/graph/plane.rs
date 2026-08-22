@@ -289,10 +289,40 @@ fn build_item(
         ))
     });
 
-    let child_items: Vec<Item> = children
+    let mut child_items: Vec<Item> = children
         .iter()
         .map(|child| build_item(graph, child, collapsed, leaf_layer, order_cache, leaf_label))
         .collect();
+    // A *drawn* namespace (a real module with its own backing file that also
+    // has children -- `crate::graph::builder`'s "real defmodule takes
+    // precedence over synthetic namespace" shape) keeps a focusable self-row
+    // as its box's first child: without one, its own diff is unreachable
+    // from this view and any edge terminating at the namespace itself
+    // silently vanishes ([`crate::graph::plane_edges`] skips endpoints
+    // missing from [`PlaneLayout::rows`]). Same id lands in both
+    // [`PlaneLayout::rows`] (the self-row) and [`PlaneLayout::boxes`] (the
+    // container) -- the two maps are keyed independently, and the renderer
+    // paints borders and labels in separate passes.
+    let is_drawn = graph
+        .node(id)
+        .map(|node| !node.files.is_empty())
+        .unwrap_or(false);
+    if is_drawn {
+        let width = leaf_label(id).chars().count().max(1);
+        child_items.insert(
+            0,
+            Item {
+                id: id.clone(),
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    w: width,
+                    h: 1,
+                },
+                kind: ItemKind::Leaf,
+            },
+        );
+    }
     let packed = shelf_pack(child_items);
     let (children_w, children_h) = bounding_size(&packed);
 
@@ -531,6 +561,53 @@ mod tests {
             vec![NodeId::from("a"), NodeId::from("c")],
             vec![NodeId::from("b")],
         ]
+    }
+
+    /// A *drawn* namespace -- a real module with its own backing file that
+    /// also has children (`crate::graph::builder`'s "real defmodule takes
+    /// precedence over synthetic namespace" shape, e.g. `defmodule AppWeb`
+    /// with `AppWeb.Foo` submodules). When expanded, it must render as a box
+    /// AND keep a focusable self-row inside that box -- without one, its own
+    /// diff can't be opened from the plane view at all and any edge whose
+    /// endpoint is the namespace itself silently vanishes
+    /// (`crate::graph::plane_edges::route_one` skips endpoints missing from
+    /// [`PlaneLayout::rows`]).
+    #[test]
+    fn a_drawn_namespace_keeps_a_self_row_inside_its_own_box() {
+        let (ns_id, mut ns) = namespace("ns", "Ns", None, &["a", "b"]);
+        ns.files = vec![FileRef {
+            path: PathBuf::from("ns.rs"),
+            base_blob: None,
+            head_blob: None,
+        }];
+        let (a_id, a) = leaf("a", "A", Some("ns"));
+        let (b_id, b) = leaf("b", "B", Some("ns"));
+        let mut nodes = HashMap::new();
+        nodes.insert(ns_id.clone(), ns);
+        nodes.insert(a_id, a);
+        nodes.insert(b_id, b);
+        let g = ProjectGraph {
+            roots: vec![ns_id.clone()],
+            nodes,
+            edges: vec![],
+        };
+
+        let layout = layout(&g, &layers_fixture(), &HashSet::new(), label);
+
+        let box_rect = *layout.boxes.get(&ns_id).expect("ns renders as a box");
+        let self_rect = *layout
+            .rows
+            .get(&ns_id)
+            .expect("drawn namespace keeps a focusable self-row");
+        assert!(
+            box_rect.contains(&self_rect),
+            "self-row {self_rect:?} must sit inside the box {box_rect:?}"
+        );
+        for (other, rect) in &layout.rows {
+            if other != &ns_id {
+                assert!(!rect.overlaps(&self_rect), "self-row overlaps {other}");
+            }
+        }
     }
 
     #[test]
