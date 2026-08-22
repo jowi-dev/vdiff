@@ -562,14 +562,24 @@ fn event_loop(
                 }
                 ViewMode::Canvas => {
                     let view = render::build_canvas_view(&state.app);
-                    let focus_idx = render::focus_canvas_line(&view, &state.app.focus).unwrap_or(0);
-                    let total_lines = render::canvas_line_count(&view);
-                    state.canvas_scroll = render::clamp_scroll(
-                        state.canvas_scroll,
-                        focus_idx,
-                        total_lines,
-                        viewport_height,
-                    );
+                    // A focus with no line at all (nothing visible yet)
+                    // leaves the vertical scroll wherever it already was
+                    // rather than snapping to line 0 -- the same "missing
+                    // focus is a no-op, not a reset" rule the horizontal
+                    // pan just below (and the plane view's own auto-pan)
+                    // already follow; unlike those, this used to fall back
+                    // to `unwrap_or(0)` and always clamp regardless, which
+                    // would yank the viewport toward the top the moment
+                    // focus briefly has no rendered line.
+                    if let Some(focus_idx) = render::focus_canvas_line(&view, &state.app.focus) {
+                        let total_lines = render::canvas_line_count(&view);
+                        state.canvas_scroll = render::clamp_scroll(
+                            state.canvas_scroll,
+                            focus_idx,
+                            total_lines,
+                            viewport_height,
+                        );
+                    }
                     // Horizontal auto-pan (issue #18): keep the focused
                     // node's own `[x, x+width)` range inside the viewport
                     // the same way `clamp_scroll` already does vertically
