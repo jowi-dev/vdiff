@@ -32,16 +32,33 @@
 //!
 //! [`visible_rows`] walks `layers` in layer order (top to bottom, matching
 //! the graph's dependency depth -- see [`crate::graph::layers`]) and, for
-//! each drawn node, checks whether any ancestor in its parent chain is
-//! collapsed. If so, every node under that ancestor collapses into a single
-//! [`RailRow::Collapsed`] row, emitted once, at the position of the first
-//! (shallowest-layer) member encountered -- descendants scattered across
-//! multiple layers (a namespace's modules don't all sit at the same
-//! dependency depth) still produce exactly one row, not one per layer they
-//! touch. Nested collapse (a collapsed namespace itself sitting under
-//! another collapsed ancestor) resolves to the *outermost* collapsed
-//! ancestor, so collapsing a grandparent after already collapsing a parent
-//! correctly absorbs the parent's row into the grandparent's.
+//! each drawn node, checks whether *it itself* or any ancestor in its
+//! parent chain is collapsed (see [`collapsed_namespace_of`] -- the
+//! "itself" half matters because a namespace can be a drawn node in its
+//! own right, e.g. a real `defmodule AppWeb do end` with `AppWeb.Foo`/
+//! `AppWeb.Bar` submodules, so its own layer entry needs the same check
+//! its descendants get). If either finds a collapsed namespace, every node
+//! under it collapses into a single [`RailRow::Collapsed`] row, emitted
+//! once, at the position of the first (shallowest-layer) member
+//! encountered -- descendants scattered across multiple layers (a
+//! namespace's modules don't all sit at the same dependency depth) still
+//! produce exactly one row, not one per layer they touch. Nested collapse
+//! (a collapsed namespace itself sitting under another collapsed
+//! ancestor) resolves to the *outermost* collapsed ancestor, so collapsing
+//! a grandparent after already collapsing a parent correctly absorbs the
+//! parent's row into the grandparent's.
+//!
+//! # Colliding display names
+//!
+//! [`RailRow`] identity is always a [`NodeId`], which is unique, but the
+//! *text* a row renders (`ModuleNode::display_name`, just the last path/
+//! module segment) is not -- two distinct nodes (two different `docs`
+//! directories, two `Auction` namespaces under different parents) can
+//! share one. [`disambiguated_labels`] computes, for whichever rows are
+//! actually visible this frame, a qualified label for any bare name two of
+//! them share (see that function's own doc for the exact algorithm) --
+//! `crate::tui::render` renders this instead of `display_name` directly,
+//! on both the rail and canvas screens.
 
 use std::collections::HashSet;
 
