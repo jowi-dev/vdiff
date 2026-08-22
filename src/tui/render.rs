@@ -2590,4 +2590,190 @@ mod tests {
         );
         assert_eq!(target, NodeId::from("child"));
     }
+
+    // -- The plane graph screen --------------------------------------------
+
+    fn app_for_plane(graph: ProjectGraph, focus: &str) -> App {
+        app_for(graph, focus)
+    }
+
+    fn render_plane_to_string(
+        app: &App,
+        width: u16,
+        height: u16,
+        scroll_y: usize,
+        scroll_x: usize,
+    ) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
+        terminal
+            .draw(|frame| draw(frame, app, None, 0, scroll_y, scroll_x, ViewMode::Plane))
+            .expect("draw");
+        buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn plane_graph_renders_a_nested_box_with_its_children_and_labels() {
+        let (graph, _ns_id) = namespaced_graph_fixture();
+        let app = app_for_plane(graph, "a");
+        let text = render_plane_to_string(&app, 80, 24, 0, 0);
+        assert!(text.contains("ns"), "missing namespace title, got:\n{text}");
+        assert!(text.contains('a'), "missing child a, got:\n{text}");
+        assert!(text.contains('b'), "missing child b, got:\n{text}");
+        assert!(
+            text.contains('\u{256d}') && text.contains('\u{256e}'),
+            "expected the box's top border corners, got:\n{text}"
+        );
+        assert!(
+            text.contains('\u{2570}') && text.contains('\u{256f}'),
+            "expected the box's bottom border corners, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn plane_graph_bolds_the_focused_node_s_own_cell() {
+        let (graph, _ns_id) = namespaced_graph_fixture();
+        let app = app_for_plane(graph, "a");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        terminal
+            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Plane))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let bolded = (0..buffer.area.height).any(|y| {
+            (0..buffer.area.width).any(|x| {
+                let cell = &buffer[(x, y)];
+                cell.symbol() == "a"
+                    && cell
+                        .style()
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::BOLD)
+            })
+        });
+        assert!(bolded, "expected the focused node's label to carry BOLD");
+    }
+
+    #[test]
+    fn plane_graph_vertical_panning_changes_rendered_content() {
+        let (graph, _ns_id) = namespaced_graph_fixture();
+        let app = app_for_plane(graph, "a");
+        let view = build_plane_view(&app);
+        let total_height = plane_view_height(&view);
+        assert!(total_height > 1, "fixture must have more than one row");
+
+        let text_at_top = render_plane_to_string(&app, 80, 8, 0, 0);
+        let text_scrolled = render_plane_to_string(&app, 80, 8, total_height.saturating_sub(1), 0);
+        assert_ne!(
+            text_at_top, text_scrolled,
+            "vertical scroll must change what's rendered"
+        );
+    }
+
+    #[test]
+    fn plane_graph_horizontal_panning_changes_rendered_content() {
+        let (graph, _ns_id) = namespaced_graph_fixture();
+        let app = app_for_plane(graph, "a");
+        let view = build_plane_view(&app);
+        let total_width = view.layout.width;
+        assert!(total_width > 1, "fixture must have more than one column");
+
+        let text_at_left = render_plane_to_string(&app, 6, 24, 0, 0);
+        let text_panned = render_plane_to_string(&app, 6, 24, 0, total_width.saturating_sub(1));
+        assert_ne!(
+            text_at_left, text_panned,
+            "horizontal scroll must change what's rendered"
+        );
+    }
+
+    #[test]
+    fn plane_graph_draws_an_edge_between_dependent_columns() {
+        let app = app_for_plane(diamond_graph_fixture(), "child");
+        let text = render_plane_to_string(&app, 80, 24, 0, 0);
+        assert!(text.contains("p1"), "missing p1, got:\n{text}");
+        assert!(text.contains("p2"), "missing p2, got:\n{text}");
+        assert!(text.contains("child"), "missing child, got:\n{text}");
+        assert!(
+            text.contains('\u{2502}')
+                || text.contains('\u{256e}')
+                || text.contains('\u{256f}')
+                || text.contains('\u{253c}'),
+            "expected at least one routed edge glyph, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn plane_edges_route_between_the_correct_absolute_columns() {
+        let app = app_for_plane(diamond_graph_fixture(), "child");
+        let view = build_plane_view(&app);
+        let child_rect = view
+            .layout
+            .rows
+            .get(&NodeId::from("child"))
+            .expect("child is a row");
+        // At least one edge cell should land in `child`'s own column range
+        // (its incoming edges converge on it).
+        let touches_child_column = view.edges.cells.iter().any(|cell| {
+            cell.x >= child_rect.x && cell.x < child_rect.x + child_rect.w.max(1)
+                || cell.x == child_rect.x_center().round() as usize
+        });
+        assert!(
+            touches_child_column,
+            "expected a routed edge cell in child's column range"
+        );
+    }
+
+    #[test]
+    fn plane_legend_shows_edges_hidden_hint_when_the_budget_trips() {
+        let dropped_edges = 5;
+        let app = app_for_plane(diamond_graph_fixture(), "child");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_legend(frame, area, &app, None, dropped_edges, ViewMode::Plane)
+            })
+            .expect("draw");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("+5 edges"),
+            "expected the hidden-edge count, got: {text}"
+        );
+        assert!(
+            text.contains("hidden") || text.contains("reveal"),
+            "expected the plane-specific wording, got: {text}"
+        );
+    }
+
+    #[test]
+    fn empty_plane_shows_a_placeholder_without_panicking() {
+        let app = app_for_plane(
+            ProjectGraph {
+                roots: vec![],
+                nodes: HashMap::new(),
+                edges: vec![],
+            },
+            "nobody",
+        );
+        let text = render_plane_to_string(&app, 40, 10, 0, 0);
+        assert!(text.contains("no visible nodes"));
+    }
+
+    #[test]
+    fn plane_focus_grid_matches_move_focus_over_the_diamond() {
+        // Each of `p1`/`p2`/`child` is a small top-level leaf, and
+        // `crate::graph::plane::shelf_pack`'s target-width heuristic wraps
+        // onto a new shelf row well before three items this size would
+        // share one -- so each ends up its own row here, ordered `p1`,
+        // `p2`, `child` (layer 0 before layer 1, `p1` before `p2` by name).
+        // `Direction::Down` (`j`) steps between adjacent rows, landing on
+        // whichever's x-nearest -- with one entry per row, that's simply
+        // the next one in sequence.
+        let app = app_for_plane(diamond_graph_fixture(), "p1");
+        let (layers, rows) = plane_focus_grid(&app);
+        let target = crate::core::focus::move_focus(
+            &layers,
+            &rows,
+            &NodeId::from("p1"),
+            crate::core::focus::Direction::Down,
+        );
+        assert_eq!(target, NodeId::from("p2"));
+    }
 }
