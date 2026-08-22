@@ -370,24 +370,29 @@ pub fn display_line_count(rows: &[(RailRow, usize)]) -> usize {
     build_display_lines(rows).len()
 }
 
-/// One node's rendered line: a status-colored bullet, its display name, and
+/// One node's rendered line: a status-colored bullet, `label`, and
 /// trailing badges -- changed-test checkmark, findings count/severity,
-/// comment count, reviewed mark. Shared by every row [`row_line`] builds
-/// for a [`RailRow::Node`], so the badge set stays exactly what the GUI's
-/// own `crate::ui::graph_view::paint_node`/badge functions paint. A
-/// reviewed node's entire line gets [`Modifier::DIM`] on top of its normal
-/// colors -- the terminal analogue of the GUI's
+/// comment count, reviewed mark. `label` is `id`'s
+/// [`rail_view::disambiguated_labels`] entry rather than
+/// `node.display_name` directly, so two distinct ids that happen to share
+/// a bare display name (e.g. two different `docs` directories) render
+/// distinguishably instead of as byte-identical text -- see that
+/// function's doc for when/how it qualifies a name. Shared by every row
+/// [`row_line`] builds for a [`RailRow::Node`], so the badge set stays
+/// exactly what the GUI's own `crate::ui::graph_view::paint_node`/badge
+/// functions paint. A reviewed node's entire line gets [`Modifier::DIM`]
+/// on top of its normal colors -- the terminal analogue of the GUI's
 /// `crate::ui::theme::dim_reviewed` (which blends a box's fill 1/3 toward
 /// gray): a true partial color blend isn't expressible per-glyph in a
 /// 16/256-color terminal palette, so `DIM` is the closest "still legible,
 /// visibly muted" terminal equivalent.
-fn node_line(app: &App, id: &NodeId) -> Line<'static> {
+fn node_line(app: &App, id: &NodeId, label: &str) -> Line<'static> {
     let Some(node) = app.graph.node(id) else {
         return Line::from(id.to_string());
     };
     let mut spans = vec![
         Span::styled("● ", Style::default().fg(status_color(node.status))),
-        Span::raw(node.display_name.clone()),
+        Span::raw(label.to_string()),
     ];
     if crate::graph::test_modules::matched_test_module(&app.graph, id)
         .is_some_and(|test_id| app.graph.node(&test_id).is_some())
@@ -468,6 +473,8 @@ fn draw_rail_graph(frame: &mut Frame, area: Rect, app: &App, rail_scroll: usize)
     let row_ids: Vec<NodeId> = rows.iter().map(|(row, _)| row.id().clone()).collect();
     let edges = rail_view::collapse_edges(&app.graph, &app.graph.edges, &app.fold_collapsed);
     let rail_layout = rails::compute(&row_ids, &edges, &app.focus, area.width as usize);
+    let raw_rows: Vec<RailRow> = rows.iter().map(|(row, _)| row.clone()).collect();
+    let labels = rail_view::disambiguated_labels(&app.graph, &raw_rows);
 
     let display_lines = build_display_lines(&rows);
     let start = rail_scroll.min(display_lines.len().saturating_sub(1));
@@ -480,7 +487,7 @@ fn draw_rail_graph(frame: &mut Frame, area: Rect, app: &App, rail_scroll: usize)
             DisplayLine::Row(idx) => {
                 let (row, _layer) = &rows[*idx];
                 let focused = row.id() == &app.focus;
-                lines.push(row_line(app, row, &rail_layout, *idx, focused));
+                lines.push(row_line(app, row, &rail_layout, *idx, focused, &labels));
             }
         }
     }
@@ -509,27 +516,27 @@ fn band_separator_line(layer: usize, width: u16) -> Line<'static> {
 /// then the row's own content -- [`node_line`] for a [`RailRow::Node`], or
 /// a `"name/ (N modules, M changed)"` summary for a [`RailRow::Collapsed`]
 /// namespace (see the task brief's fold-by-namespace summary format).
+/// `labels` is [`rail_view::disambiguated_labels`]'s output for the current
+/// frame's visible row set -- see [`node_line`]'s doc for why the row's
+/// bare `display_name` isn't rendered directly.
 fn row_line(
     app: &App,
     row: &RailRow,
     rail_layout: &rails::RailLayout,
     row_idx: usize,
     focused: bool,
+    labels: &HashMap<NodeId, String>,
 ) -> Line<'static> {
     let mut spans = gutter_spans(rail_layout, row_idx);
     spans.push(Span::raw(if focused { "▸ " } else { "  " }));
+    let label = labels.get(row.id()).map(String::as_str).unwrap_or("");
     match row {
-        RailRow::Node(id) => spans.extend(node_line(app, id).spans),
+        RailRow::Node(id) => spans.extend(node_line(app, id, label).spans),
         RailRow::Collapsed {
-            namespace,
             module_count,
             changed_count,
-        } => spans.extend(collapsed_row_spans(
-            app,
-            namespace,
-            *module_count,
-            *changed_count,
-        )),
+            ..
+        } => spans.extend(collapsed_row_spans(label, *module_count, *changed_count)),
     }
     if focused {
         for span in &mut spans {
@@ -569,18 +576,14 @@ fn role_color(role: RailRole) -> Color {
 }
 
 /// `"<name>/ (N modules, M changed)"` for a collapsed namespace row -- the
-/// task brief's fold summary format.
+/// task brief's fold summary format. `name` is the namespace's
+/// [`rail_view::disambiguated_labels`] entry (see [`node_line`]'s doc on
+/// why a plain `display_name` isn't safe to render directly here either).
 fn collapsed_row_spans(
-    app: &App,
-    namespace: &NodeId,
+    name: &str,
     module_count: usize,
     changed_count: usize,
 ) -> Vec<Span<'static>> {
-    let name = app
-        .graph
-        .node(namespace)
-        .map(|n| n.display_name.clone())
-        .unwrap_or_else(|| namespace.to_string());
     let modules_word = if module_count == 1 {
         "module"
     } else {
@@ -629,16 +632,20 @@ fn collapsed_row_spans(
 /// don't cache" precedent -- see that module's doc): the pure Sugiyama
 /// layout, its routed inter-band channels, the original (fold-collapsed)
 /// edge list (needed to recover a dummy slot's true edge for role/color --
-/// see [`SlotId::Dummy`]'s doc), and a lookup from real node id back to its
+/// see [`SlotId::Dummy`]'s doc), a lookup from real node id back to its
 /// [`RailRow`] (so label rendering can reuse [`node_line`]/
 /// [`collapsed_row_spans`] exactly as the rail view does, keeping the two
 /// views' badge/color conventions identical -- see the issue's own note to
-/// mirror `crate::ui::graph_view`'s badge/accent semantics).
+/// mirror `crate::ui::graph_view`'s badge/accent semantics), and this
+/// frame's [`rail_view::disambiguated_labels`] map (so a name collision
+/// between two visible rows -- see that function's doc -- reads
+/// disambiguated on the canvas exactly as it does on the rail view).
 pub struct CanvasView {
     layout: sugiyama::Layout,
     channels: Vec<Channel>,
     edges: Vec<(NodeId, NodeId)>,
     row_of: HashMap<NodeId, RailRow>,
+    labels: HashMap<NodeId, String>,
 }
 
 /// Build [`CanvasView`] from `app`'s current fold state -- one band per
@@ -661,11 +668,13 @@ pub fn build_canvas_view(app: &App) -> CanvasView {
         row_of.insert(id.clone(), row.clone());
         bands.last_mut().expect("just pushed").push(id);
     }
+    let raw_rows: Vec<RailRow> = rows.iter().map(|(row, _)| row.clone()).collect();
+    let labels = rail_view::disambiguated_labels(&app.graph, &raw_rows);
     let edges = rail_view::collapse_edges(&app.graph, &app.graph.edges, &app.fold_collapsed);
     let layout = sugiyama::layout(&bands, &edges, |id| {
         row_of
             .get(id)
-            .map(|row| plain_row_text(app, row))
+            .map(|row| plain_row_text(app, row, &labels))
             .unwrap_or_else(|| id.to_string())
     });
     let channels = canvas::route_channels(&layout, &app.focus);
@@ -674,6 +683,7 @@ pub fn build_canvas_view(app: &App) -> CanvasView {
         channels,
         edges,
         row_of,
+        labels,
     }
 }
 
@@ -684,15 +694,19 @@ pub fn build_canvas_view(app: &App) -> CanvasView {
 /// separately at actual draw time -- see [`canvas_label_line`]) so the
 /// canvas's width estimate always matches the badges the rail view already
 /// shows, rather than drifting out of sync with a second, hand-maintained
-/// format string.
-fn plain_row_text(app: &App, row: &RailRow) -> String {
+/// format string. `labels` is [`rail_view::disambiguated_labels`]'s output
+/// -- same map [`build_canvas_view`] stores for [`canvas_label_line`]'s use
+/// at actual draw time, so the width estimate and the drawn text always
+/// agree on which name each row renders.
+fn plain_row_text(app: &App, row: &RailRow, labels: &HashMap<NodeId, String>) -> String {
+    let label = labels.get(row.id()).map(String::as_str).unwrap_or("");
     let spans = match row {
-        RailRow::Node(id) => node_line(app, id).spans,
+        RailRow::Node(id) => node_line(app, id, label).spans,
         RailRow::Collapsed {
-            namespace,
             module_count,
             changed_count,
-        } => collapsed_row_spans(app, namespace, *module_count, *changed_count),
+            ..
+        } => collapsed_row_spans(label, *module_count, *changed_count),
     };
     spans.iter().map(|s| s.content.as_ref()).collect()
 }
@@ -840,13 +854,14 @@ fn canvas_label_line(app: &App, view: &CanvasView, band_idx: usize) -> Line<'sta
                 col += 1;
             }
             SlotId::Real(id) => {
+                let label = view.labels.get(id).map(String::as_str).unwrap_or("");
                 let mut node_spans = match view.row_of.get(id) {
-                    Some(RailRow::Node(nid)) => node_line(app, nid).spans,
+                    Some(RailRow::Node(nid)) => node_line(app, nid, label).spans,
                     Some(RailRow::Collapsed {
-                        namespace,
                         module_count,
                         changed_count,
-                    }) => collapsed_row_spans(app, namespace, *module_count, *changed_count),
+                        ..
+                    }) => collapsed_row_spans(label, *module_count, *changed_count),
                     None => vec![Span::raw(id.to_string())],
                 };
                 if id == &app.focus {
@@ -1459,6 +1474,87 @@ mod tests {
             })
         });
         assert!(dimmed, "expected the reviewed node's line to carry DIM");
+    }
+
+    /// Real-use shape: two distinct drawn nodes (`elixir:Foo.Auction`,
+    /// `elixir:Bar.Auction`) whose `display_name`s both collapse to plain
+    /// `"Auction"`. The rail view must render each qualified with its
+    /// parent's name rather than showing the same bare text twice -- see
+    /// `crate::core::rail_view::disambiguated_labels`'s doc.
+    #[test]
+    fn rail_graph_disambiguates_two_nodes_that_share_a_display_name() {
+        let foo_id = NodeId::from("elixir:Foo");
+        let foo_auction_id = NodeId::from("elixir:Foo.Auction");
+        let bar_id = NodeId::from("elixir:Bar");
+        let bar_auction_id = NodeId::from("elixir:Bar.Auction");
+
+        let leaf = |id: &NodeId, name: &str, parent: &NodeId| ModuleNode {
+            id: id.clone(),
+            display_name: name.to_string(),
+            parent: Some(parent.clone()),
+            children: vec![],
+            status: GitStatus::Modified,
+            files: vec![FileRef {
+                path: PathBuf::from(format!("{name}.ex")),
+                base_blob: Some("b".to_string()),
+                head_blob: Some("h".to_string()),
+            }],
+        };
+        let namespace = |id: &NodeId, name: &str, child: &NodeId| ModuleNode {
+            id: id.clone(),
+            display_name: name.to_string(),
+            parent: None,
+            children: vec![child.clone()],
+            status: GitStatus::Unchanged,
+            files: vec![],
+        };
+
+        let mut nodes = HashMap::new();
+        nodes.insert(foo_id.clone(), namespace(&foo_id, "Foo", &foo_auction_id));
+        nodes.insert(
+            foo_auction_id.clone(),
+            leaf(&foo_auction_id, "Auction", &foo_id),
+        );
+        nodes.insert(bar_id.clone(), namespace(&bar_id, "Bar", &bar_auction_id));
+        nodes.insert(
+            bar_auction_id.clone(),
+            leaf(&bar_auction_id, "Auction", &bar_id),
+        );
+        let graph = ProjectGraph {
+            roots: vec![foo_id, bar_id],
+            nodes,
+            edges: vec![],
+        };
+
+        let layers = crate::graph::layers::assign_layers(&graph);
+        let result = layout(&graph);
+        let rows = crate::graph::layout::rows_with_x_centers(&result);
+        let app = App {
+            graph,
+            layers,
+            rows,
+            focus: foo_auction_id,
+            screen: Screen::Graph,
+            diff: None,
+            picker: None,
+            show_tests: false,
+            file_view: None,
+            pane: Pane::Graph,
+            viewport_rows: 1,
+            reviewed: HashSet::new(),
+            findings: HashMap::new(),
+            comments: HashMap::new(),
+            fold_collapsed: HashSet::new(),
+        };
+        let text = render_to_string(&app);
+        assert!(
+            text.contains("Foo.Auction"),
+            "expected the Foo-side Auction row qualified with its parent, got: {text}"
+        );
+        assert!(
+            text.contains("Bar.Auction"),
+            "expected the Bar-side Auction row qualified with its parent, got: {text}"
+        );
     }
 
     #[test]

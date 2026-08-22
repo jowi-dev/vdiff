@@ -229,6 +229,125 @@ fn collect_stats(graph: &ProjectGraph, id: &NodeId, modules: &mut usize, changed
     }
 }
 
+/// The bare label [`disambiguated_labels`] compares for collisions: a
+/// [`RailRow::Node`]'s own `display_name`, or a [`RailRow::Collapsed`]
+/// namespace's `display_name` (the same text `crate::tui::render`'s
+/// `node_line`/`collapsed_row_spans` would otherwise render verbatim).
+fn raw_label(graph: &ProjectGraph, row: &RailRow) -> String {
+    graph
+        .node(row.id())
+        .map(|n| n.display_name.clone())
+        .unwrap_or_else(|| row.id().to_string())
+}
+
+/// `id`'s ancestor chain as display names, nearest parent first, root
+/// last. Stops (rather than panicking) at the first ancestor id missing
+/// from `graph` -- shouldn't happen, but [`disambiguated_labels`] only
+/// needs however much of the chain actually resolves.
+fn ancestor_names(graph: &ProjectGraph, id: &NodeId) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut current = graph.node(id).and_then(|n| n.parent.clone());
+    while let Some(ancestor) = current {
+        let Some(node) = graph.node(&ancestor) else {
+            break;
+        };
+        names.push(node.display_name.clone());
+        current = node.parent.clone();
+    }
+    names
+}
+
+/// The separator a qualified label joins its ancestry with: `/` for a
+/// file-backed id (`crate::graph::builder`'s `file:` namespace prefix,
+/// used for anything outside a recognized module language -- directories
+/// read naturally path-style), `.` otherwise (Elixir's/Rust's dotted
+/// module-path convention). Read straight off the id's own text rather
+/// than importing `crate::graph::builder`'s private `Sep` enum, since this
+/// only needs the one bit builder.rs's id convention already encodes.
+fn qualifier_separator(id: &NodeId) -> &'static str {
+    if id.to_string().starts_with("file:") {
+        "/"
+    } else {
+        "."
+    }
+}
+
+/// A display label per row in `rows`, qualified with just enough trailing
+/// ancestry to tell apart any two *currently visible* rows that would
+/// otherwise render the identical bare name -- e.g. two distinct `docs`
+/// directories (`file:docs` and `file:priv/static/docs`), or two distinct
+/// `Auction` namespaces under different parents. [`NodeId`]s are unique, so
+/// this is strictly about distinct ids whose [`raw_label`] happens to
+/// collide (contrast [`visible_rows_with_layers`]'s `emitted` dedup, which
+/// is about the same id showing up twice); a row whose bare name is unique
+/// among `rows` is returned unqualified. Only ids actually present in
+/// `rows` are considered -- a name colliding with something currently
+/// folded away out of view isn't a collision the user can see, so it isn't
+/// qualified.
+///
+/// Disambiguation is per colliding group: each group's ancestry depth
+/// grows by one (nearest ancestor first) until every member's qualified
+/// label is distinct from the rest of its own group, so a row only carries
+/// as much extra path as its *own* collision actually needs. Shared by
+/// `crate::tui::render`'s rail and canvas screens (both call this over the
+/// same [`visible_rows_with_layers`] output) so the two views never
+/// disagree about which rows are ambiguous.
+pub fn disambiguated_labels(
+    graph: &ProjectGraph,
+    rows: &[RailRow],
+) -> std::collections::HashMap<NodeId, String> {
+    let mut groups: std::collections::HashMap<String, Vec<NodeId>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        groups
+            .entry(raw_label(graph, row))
+            .or_default()
+            .push(row.id().clone());
+    }
+
+    let mut out = std::collections::HashMap::new();
+    for (name, ids) in groups {
+        if ids.len() < 2 {
+            if let Some(id) = ids.into_iter().next() {
+                out.insert(id, name);
+            }
+            continue;
+        }
+
+        let chains: std::collections::HashMap<NodeId, Vec<String>> = ids
+            .iter()
+            .map(|id| (id.clone(), ancestor_names(graph, id)))
+            .collect();
+        let max_depth = chains.values().map(Vec::len).max().unwrap_or(0);
+
+        let mut depth = 1;
+        loop {
+            let candidates: Vec<(NodeId, String)> = ids
+                .iter()
+                .map(|id| {
+                    let chain = &chains[id];
+                    let sep = qualifier_separator(id);
+                    let mut parts: Vec<&str> =
+                        chain.iter().take(depth).rev().map(String::as_str).collect();
+                    parts.push(name.as_str());
+                    (id.clone(), parts.join(sep))
+                })
+                .collect();
+
+            let mut seen: HashSet<&str> = HashSet::new();
+            let all_unique = candidates
+                .iter()
+                .all(|(_, label)| seen.insert(label.as_str()));
+            if all_unique || depth >= max_depth {
+                out.extend(candidates);
+                break;
+            }
+            depth += 1;
+        }
+    }
+    out
+}
+
 /// Translate `edges` onto the visible row set: each edge's endpoints are
 /// mapped through [`effective_row_id`] (a drawn node absorbed into a
 /// collapsed namespace reports that namespace's id instead of its own), a
@@ -500,6 +619,142 @@ mod tests {
             }],
             "expected exactly one collapsed row absorbing both the namespace's own entry and its child, not a duplicate Node row"
         );
+    }
+
+    /// Real-world shape: two distinct file-backed `docs` directories
+    /// (`file:docs` at the repo root, `file:priv/static/docs` nested three
+    /// levels down) both visible as plain [`RailRow::Node`]s -- their
+    /// `display_name`s collide even though the ids are unrelated. The
+    /// root-level one has no parent at all, so it can never gain a prefix;
+    /// disambiguation must still make the *other* one distinct from it.
+    #[test]
+    fn disambiguated_labels_qualifies_colliding_file_nodes_with_a_slash_path() {
+        let (root_docs_id, root_docs) = leaf("file:docs", "docs", None, GitStatus::Unchanged);
+        let (priv_id, priv_ns) = namespace("file:priv", "priv", None, &["file:priv/static"]);
+        let (static_id, static_ns) = namespace(
+            "file:priv/static",
+            "static",
+            Some("file:priv"),
+            &["file:priv/static/docs"],
+        );
+        let (nested_docs_id, nested_docs) = leaf(
+            "file:priv/static/docs",
+            "docs",
+            Some("file:priv/static"),
+            GitStatus::Unchanged,
+        );
+
+        let mut nodes = HashMap::new();
+        nodes.insert(root_docs_id.clone(), root_docs);
+        nodes.insert(priv_id.clone(), priv_ns);
+        nodes.insert(static_id, static_ns);
+        nodes.insert(nested_docs_id.clone(), nested_docs);
+        let g = ProjectGraph {
+            roots: vec![root_docs_id.clone(), priv_id],
+            nodes,
+            edges: vec![],
+        };
+
+        let rows = vec![
+            RailRow::Node(root_docs_id.clone()),
+            RailRow::Node(nested_docs_id.clone()),
+        ];
+        let labels = disambiguated_labels(&g, &rows);
+
+        assert_eq!(labels.get(&root_docs_id), Some(&"docs".to_string()));
+        assert_eq!(
+            labels.get(&nested_docs_id),
+            Some(&"static/docs".to_string())
+        );
+    }
+
+    /// Two distinct `Auction` namespaces under different Elixir parents --
+    /// one folded (so it renders as a [`RailRow::Collapsed`] summary), one
+    /// a plain drawn module. Disambiguation must key off [`RailRow::id`]'s
+    /// bare name regardless of which row kind it renders as, and use `.`
+    /// (not `/`) for a non-file id.
+    #[test]
+    fn disambiguated_labels_qualifies_colliding_elixir_namespaces_with_a_dot_path() {
+        let (foo_id, foo) = namespace("elixir:Foo", "Foo", None, &["elixir:Foo.Auction"]);
+        let (foo_auction_id, foo_auction) =
+            namespace("elixir:Foo.Auction", "Auction", Some("elixir:Foo"), &[]);
+        let (bar_auction_id, bar_auction) = leaf(
+            "elixir:Bar.Auction",
+            "Auction",
+            Some("elixir:Bar"),
+            GitStatus::Modified,
+        );
+        let (bar_id, bar) = namespace("elixir:Bar", "Bar", None, &["elixir:Bar.Auction"]);
+
+        let mut nodes = HashMap::new();
+        nodes.insert(foo_id.clone(), foo);
+        nodes.insert(foo_auction_id.clone(), foo_auction);
+        nodes.insert(bar_auction_id.clone(), bar_auction);
+        nodes.insert(bar_id, bar);
+        let g = ProjectGraph {
+            roots: vec![foo_id, bar_auction_id.clone()],
+            nodes,
+            edges: vec![],
+        };
+
+        let rows = vec![
+            RailRow::Collapsed {
+                namespace: foo_auction_id.clone(),
+                module_count: 0,
+                changed_count: 0,
+            },
+            RailRow::Node(bar_auction_id.clone()),
+        ];
+        let labels = disambiguated_labels(&g, &rows);
+
+        assert_eq!(
+            labels.get(&foo_auction_id),
+            Some(&"Foo.Auction".to_string())
+        );
+        assert_eq!(
+            labels.get(&bar_auction_id),
+            Some(&"Bar.Auction".to_string())
+        );
+    }
+
+    #[test]
+    fn disambiguated_labels_leaves_a_unique_name_unqualified() {
+        let (a1_id, a1) = leaf("a1", "a1", None, GitStatus::Unchanged);
+        let mut nodes = HashMap::new();
+        nodes.insert(a1_id.clone(), a1);
+        let g = ProjectGraph {
+            roots: vec![a1_id.clone()],
+            nodes,
+            edges: vec![],
+        };
+
+        let rows = vec![RailRow::Node(a1_id.clone())];
+        let labels = disambiguated_labels(&g, &rows);
+
+        assert_eq!(labels.get(&a1_id), Some(&"a1".to_string()));
+    }
+
+    /// A name colliding with something currently folded out of view (not
+    /// present in `rows` at all) isn't a collision the user can actually
+    /// see, so it must not be qualified.
+    #[test]
+    fn disambiguated_labels_ignores_collisions_outside_the_visible_row_set() {
+        let (a1_id, a1) = leaf("ns_a::docs", "docs", Some("ns_a"), GitStatus::Unchanged);
+        let (b1_id, b1) = leaf("ns_b::docs", "docs", Some("ns_b"), GitStatus::Unchanged);
+        let mut nodes = HashMap::new();
+        nodes.insert(a1_id.clone(), a1);
+        nodes.insert(b1_id, b1);
+        let g = ProjectGraph {
+            roots: vec![a1_id.clone()],
+            nodes,
+            edges: vec![],
+        };
+
+        // Only `a1_id` is actually visible right now.
+        let rows = vec![RailRow::Node(a1_id.clone())];
+        let labels = disambiguated_labels(&g, &rows);
+
+        assert_eq!(labels.get(&a1_id), Some(&"docs".to_string()));
     }
 
     #[test]
