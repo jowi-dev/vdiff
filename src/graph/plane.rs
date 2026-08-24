@@ -177,8 +177,10 @@ pub fn layout(
         .flat_map(|(idx, row)| row.iter().map(move |id| (id.clone(), idx)))
         .collect();
     let mut order_cache: HashMap<NodeId, usize> = HashMap::new();
+    let mut visible_cache: HashMap<NodeId, bool> = HashMap::new();
 
     let mut roots = graph.sorted_roots();
+    roots.retain(|id| is_visible(graph, id, collapsed, &mut visible_cache));
     roots.sort_by(|a, b| {
         order_key(graph, a, &leaf_layer, &mut order_cache).cmp(&order_key(
             graph,
@@ -201,6 +203,7 @@ pub fn layout(
                 collapsed,
                 &leaf_layer,
                 &mut order_cache,
+                &mut visible_cache,
                 &leaf_label,
             )
         })
@@ -247,16 +250,63 @@ fn order_key(
     key
 }
 
+/// Whether `id` should ever occupy a row/box in the plane layout at all:
+/// currently collapsed (a real, visible summary row -- see
+/// [`Msg::FocusSet`]'s own guard, which accepts exactly this same
+/// condition), drawn (`node.files` non-empty -- present in `App::layers`,
+/// so [`Msg::FocusSet`]'s guard accepts it too), or having at least one
+/// visible descendant (recursively) -- an ordinary synthetic namespace
+/// container, boxing real content below it. A node that's none of these --
+/// a childless, file-less synthetic namespace with nothing left under it --
+/// carries no id [`Msg::FocusSet`]'s guard would ever accept, so giving it a
+/// row/box here would draw a cell no hjkl press could ever land on (see the
+/// module doc's own note on why this matters). This shape is reachable in
+/// practice: [`crate::graph::test_modules::hide_test_modules`] (and
+/// [`crate::graph::filter::focus_on_changes`]'s own ancestor-hiding pass)
+/// can prune every child out of a namespace whose own `files` were already
+/// empty, leaving exactly this orphan behind. Memoized in `cache` for the
+/// same reason [`order_key`]'s own cache exists -- the same id's visibility
+/// can be asked about repeatedly across sibling comparisons and the parent
+/// filtering pass below.
+///
+/// [`Msg::FocusSet`]: crate::core::app::Msg::FocusSet
+fn is_visible(
+    graph: &ProjectGraph,
+    id: &NodeId,
+    collapsed: &HashSet<NodeId>,
+    cache: &mut HashMap<NodeId, bool>,
+) -> bool {
+    if collapsed.contains(id) {
+        return true;
+    }
+    if let Some(visible) = cache.get(id) {
+        return *visible;
+    }
+    let visible = match graph.node(id) {
+        None => false,
+        Some(node) if !node.files.is_empty() => true,
+        Some(node) => node
+            .children
+            .iter()
+            .any(|child| is_visible(graph, child, collapsed, cache)),
+    };
+    cache.insert(id.clone(), visible);
+    visible
+}
+
 /// Build one unpositioned [`Item`] for `id`: a leaf (real drawn module, or
 /// a node with no children at all) or a collapsed-namespace summary row
 /// stop recursion; anything else is an expanded namespace, boxing its own
-/// (recursively built, then shelf-packed) children.
+/// (recursively built, then shelf-packed) children. Only ever called on an
+/// `id` [`is_visible`] already accepted -- see that function's doc for why
+/// a node failing it must never reach here.
 fn build_item(
     graph: &ProjectGraph,
     id: &NodeId,
     collapsed: &HashSet<NodeId>,
     leaf_layer: &HashMap<NodeId, usize>,
     order_cache: &mut HashMap<NodeId, usize>,
+    visible_cache: &mut HashMap<NodeId, bool>,
     leaf_label: &impl Fn(&NodeId) -> String,
 ) -> Item {
     let is_leaf_like = collapsed.contains(id)
@@ -280,6 +330,10 @@ fn build_item(
     }
 
     let mut children = graph.sorted_children(id);
+    // Drop any child that would itself resolve to nothing focusable (see
+    // [`is_visible`]'s doc) before recursing -- a namespace whose only
+    // children are such orphans must not box them into existence.
+    children.retain(|child| is_visible(graph, child, collapsed, visible_cache));
     children.sort_by(|a, b| {
         order_key(graph, a, leaf_layer, order_cache).cmp(&order_key(
             graph,
@@ -291,7 +345,17 @@ fn build_item(
 
     let mut child_items: Vec<Item> = children
         .iter()
-        .map(|child| build_item(graph, child, collapsed, leaf_layer, order_cache, leaf_label))
+        .map(|child| {
+            build_item(
+                graph,
+                child,
+                collapsed,
+                leaf_layer,
+                order_cache,
+                visible_cache,
+                leaf_label,
+            )
+        })
         .collect();
     // A *drawn* namespace (a real module with its own backing file that also
     // has children -- `crate::graph::builder`'s "real defmodule takes
@@ -486,6 +550,7 @@ pub fn focus_grid(layout: &PlaneLayout) -> (Vec<Vec<NodeId>>, FocusRows) {
 mod tests {
     use super::*;
     use crate::graph::model::{FileRef, GitStatus, ModuleNode};
+    use std::collections::VecDeque;
     use std::path::PathBuf;
 
     fn leaf(id: &str, name: &str, parent: Option<&str>) -> (NodeId, ModuleNode) {
@@ -789,5 +854,257 @@ mod tests {
             .find(|group| group.contains(&NodeId::from("c")))
             .expect("c is in some group");
         assert!(!c_group.contains(&NodeId::from("a")));
+    }
+
+    /// Reproduces the shape [`crate::graph::test_modules::hide_test_modules`]
+    /// (and [`crate::graph::filter::focus_on_changes`]'s ancestor-hiding
+    /// pass) can leave behind: a synthetic namespace (`files` empty, per
+    /// [`namespace`]'s own construction) whose every child got pruned away,
+    /// leaving `children` empty too. Such a node is neither drawn
+    /// (`App::is_drawn`, which only ever consults `App::layers` --
+    /// file-backed nodes -- says no) nor collapsed, so
+    /// `Msg::FocusSet`'s guard permanently rejects it as a target; before
+    /// the fix, [`build_item`]'s `is_leaf_like` check (`children.is_empty()`
+    /// alone, with no `files` check) drew it as an ordinary leaf row anyway
+    /// -- present on screen and in [`PlaneLayout::rows`], but unreachable by
+    /// any hjkl press, and (per [`focus_grid`]'s single global y-ordering)
+    /// splitting every row below it off from every row above it, since `j`/
+    /// `k` only ever step to the *adjacent* y-group and this row's group
+    /// could never become focus to make that step from.
+    #[test]
+    fn orphan_namespace_with_no_files_and_no_children_gets_no_row() {
+        let (root_id, root) = namespace("root", "Root", None, &["left", "orphan", "right"]);
+        let (left_id, left) = leaf("left", "Left", Some("root"));
+        let (orphan_id, orphan) = namespace("orphan", "Orphan", Some("root"), &[]);
+        let (right_id, right) = leaf("right", "Right", Some("root"));
+
+        let mut nodes = HashMap::new();
+        nodes.insert(root_id.clone(), root);
+        nodes.insert(left_id.clone(), left);
+        nodes.insert(orphan_id.clone(), orphan);
+        nodes.insert(right_id.clone(), right);
+        let g = ProjectGraph {
+            roots: vec![root_id.clone()],
+            nodes,
+            edges: vec![],
+        };
+
+        let layout = layout(&g, &[], &HashSet::new(), label);
+
+        assert!(
+            !layout.rows.contains_key(&orphan_id),
+            "a childless, file-less orphan must not get a focusable row"
+        );
+        assert!(!layout.boxes.contains_key(&orphan_id));
+        let root_children = layout.children_of.get(&root_id).expect("root is a box");
+        assert!(
+            !root_children.contains(&orphan_id),
+            "the orphan must not be listed as one of root's children either"
+        );
+        assert!(layout.rows.contains_key(&left_id));
+        assert!(layout.rows.contains_key(&right_id));
+    }
+
+    /// A collapsed namespace has no children *in this layout* either (it
+    /// renders as a single summary row -- see
+    /// [`collapsed_namespace_renders_as_a_single_row_not_a_box`]), but it
+    /// must still get a row: [`Msg::FocusSet`]'s guard accepts any
+    /// currently-collapsed id regardless of `files`, so [`is_visible`] has
+    /// to check `collapsed` before falling back to the files/children test.
+    #[test]
+    fn a_collapsed_namespace_with_no_files_still_gets_a_row() {
+        let (root_id, root) = namespace("root", "Root", None, &["ns"]);
+        let (ns_id, ns) = namespace("ns", "Ns", Some("root"), &["a"]);
+        let (a_id, a) = leaf("a", "A", Some("ns"));
+        let mut nodes = HashMap::new();
+        nodes.insert(root_id.clone(), root);
+        nodes.insert(ns_id.clone(), ns);
+        nodes.insert(a_id, a);
+        let g = ProjectGraph {
+            roots: vec![root_id],
+            nodes,
+            edges: vec![],
+        };
+        let collapsed = HashSet::from([ns_id.clone()]);
+        let layout = layout(&g, &[], &collapsed, label);
+        assert!(layout.rows.contains_key(&ns_id));
+    }
+
+    /// Mirrors `Msg::FocusSet`'s own guard (`App::is_drawn(&id) ||
+    /// App::fold_collapsed.contains(&id)`, see `crate::core::app`) without
+    /// needing a whole `App`: `App::is_drawn` only ever consults
+    /// `App::layers`, and [`crate::graph::layers::drawn_node_ids`] (what
+    /// populates it) is exactly "has at least one file" -- independent of
+    /// children, so this is the same predicate restated over `graph`
+    /// directly. A row [`layout`] emits that this rejects is a row hjkl can
+    /// approach but never actually focus -- issue #21's bug, and precisely
+    /// what [`is_visible`] now keeps out of the layout in the first place.
+    fn focus_set_would_accept(
+        graph: &ProjectGraph,
+        id: &NodeId,
+        collapsed: &HashSet<NodeId>,
+    ) -> bool {
+        collapsed.contains(id)
+            || graph
+                .node(id)
+                .map(|node| !node.files.is_empty())
+                .unwrap_or(false)
+    }
+
+    /// BFS over [`crate::core::focus::move_focus`] (the same function
+    /// `crate::tui::plane_key_msg` dispatches h/j/k/l through) from every
+    /// possible starting row must reach every other row in
+    /// [`PlaneLayout::rows`], and every row it reaches must be one
+    /// `Msg::FocusSet` would actually accept (see
+    /// [`focus_set_would_accept`]) -- issue #21's bug wasn't a hole in
+    /// [`move_focus`]'s own candidate selection (that function's grouped-
+    /// by-y/x-nearest shape is provably fully connected over whatever rows
+    /// [`focus_grid`] hands it), it was [`layout`] emitting a row
+    /// `Msg::FocusSet` could never land on, which turns that row's y-group
+    /// into a wall: `j`/`k` only ever step to the *adjacent* group, so a
+    /// group focus can never enter permanently splits every row past it off
+    /// from every row before it. Exercised over several representative
+    /// shapes: a plain nested namespace, a dense many-sibling shelf-wrap, a
+    /// multi-level-nesting drawn-namespace tree, and (the shape that
+    /// actually reproduces the issue) [`orphan_bearing_fixture`]'s pair of
+    /// childless, file-less namespaces sitting between real rows.
+    #[test]
+    fn every_row_is_reachable_and_focusable_via_hjkl() {
+        use crate::core::focus::{move_focus, Direction};
+
+        let fixtures: Vec<ProjectGraph> = vec![
+            nested_fixture(),
+            wide_shelf_fixture(),
+            multi_level_nesting_fixture(),
+            orphan_bearing_fixture(),
+        ];
+
+        for g in fixtures {
+            let collapsed = HashSet::new();
+            let layout = layout(&g, &[], &collapsed, label);
+            let (layers, rows) = focus_grid(&layout);
+            let all_ids: HashSet<NodeId> = layout.rows.keys().cloned().collect();
+            assert!(!all_ids.is_empty(), "fixture must have at least one row");
+            for id in &all_ids {
+                assert!(
+                    focus_set_would_accept(&g, id, &collapsed),
+                    "{id} has a plane row but FocusSet would reject it as a target"
+                );
+            }
+
+            for start in &all_ids {
+                let mut visited: HashSet<NodeId> = HashSet::from([start.clone()]);
+                let mut queue: VecDeque<NodeId> = VecDeque::from([start.clone()]);
+                while let Some(cur) = queue.pop_front() {
+                    for dir in [
+                        Direction::Left,
+                        Direction::Right,
+                        Direction::Up,
+                        Direction::Down,
+                    ] {
+                        let next = move_focus(&layers, &rows, &cur, dir);
+                        if visited.insert(next.clone()) {
+                            queue.push_back(next);
+                        }
+                    }
+                }
+                let unreached: Vec<&NodeId> =
+                    all_ids.iter().filter(|id| !visited.contains(*id)).collect();
+                assert!(
+                    unreached.is_empty(),
+                    "starting from {start}, hjkl never reaches {unreached:?}"
+                );
+            }
+        }
+    }
+
+    /// A namespace with several equally-wide siblings, forcing
+    /// [`shelf_pack`] to wrap them onto more than one shelf row -- the
+    /// dense-startup-fold-adjacent shape the connectivity property test
+    /// needs (multiple rows genuinely stacked, not everything on one shelf).
+    fn wide_shelf_fixture() -> ProjectGraph {
+        let mut nodes = HashMap::new();
+        let mut child_ids = Vec::new();
+        for i in 0..10 {
+            let cid = format!("wleaf{i}");
+            let (id, node) = leaf(&cid, "AVeryLongLabelNameIndeed", None);
+            nodes.insert(id.clone(), node);
+            child_ids.push(cid);
+        }
+        let child_refs: Vec<&str> = child_ids.iter().map(String::as_str).collect();
+        let (ns_id, ns) = namespace("wns", "Wns", None, &child_refs);
+        nodes.insert(ns_id.clone(), ns);
+        for cid in &child_ids {
+            nodes.get_mut(&NodeId::from(cid.as_str())).unwrap().parent = Some(ns_id.clone());
+        }
+        ProjectGraph {
+            roots: vec![ns_id],
+            nodes,
+            edges: vec![],
+        }
+    }
+
+    /// Three levels of nesting (`top` > `mid` > `leaf`/`deep_leaf`), each
+    /// level itself a *drawn* namespace (keeps a self-row), plus a top-level
+    /// sibling -- exercises box-boundary candidate selection across more
+    /// than one nesting depth at once.
+    fn multi_level_nesting_fixture() -> ProjectGraph {
+        let (top_id, mut top) = namespace("top", "Top", None, &["mid", "sibling"]);
+        top.files = vec![FileRef {
+            path: PathBuf::from("top.rs"),
+            base_blob: None,
+            head_blob: None,
+        }];
+        let (mid_id, mut mid) = namespace("mid", "Mid", Some("top"), &["leaf", "deep"]);
+        mid.files = vec![FileRef {
+            path: PathBuf::from("mid.rs"),
+            base_blob: None,
+            head_blob: None,
+        }];
+        let (leaf_id, leaf_node) = leaf("leaf", "Leaf", Some("mid"));
+        let (deep_id, deep_node) = leaf("deep", "Deep", Some("mid"));
+        let (sibling_id, sibling_node) = leaf("sibling", "Sibling", Some("top"));
+
+        let mut nodes = HashMap::new();
+        nodes.insert(top_id.clone(), top);
+        nodes.insert(mid_id, mid);
+        nodes.insert(leaf_id, leaf_node);
+        nodes.insert(deep_id, deep_node);
+        nodes.insert(sibling_id, sibling_node);
+        ProjectGraph {
+            roots: vec![top_id],
+            nodes,
+            edges: vec![],
+        }
+    }
+
+    /// A wider version of the shape [`orphan_namespace_with_no_files_and_no_children_gets_no_row`]
+    /// targets, sized for the connectivity sweep: two orphan namespaces
+    /// (one a top-level root, one nested two levels deep) sitting between
+    /// real drawn rows on every side, so a regression that turns either
+    /// back into a row would strand every row past it in the global
+    /// y-ordering (see [`focus_grid`]'s doc), not just fail a presence
+    /// check.
+    fn orphan_bearing_fixture() -> ProjectGraph {
+        let (before_id, before) = leaf("before", "Before", None);
+        let (root_orphan_id, root_orphan) = namespace("root_orphan", "RootOrphan", None, &[]);
+        let (mid_id, mid) = namespace("mid2", "Mid2", None, &["inner_orphan", "after_mid"]);
+        let (inner_orphan_id, inner_orphan) =
+            namespace("inner_orphan", "InnerOrphan", Some("mid2"), &[]);
+        let (after_mid_id, after_mid) = leaf("after_mid", "AfterMid", Some("mid2"));
+        let (after_id, after) = leaf("after", "After", None);
+
+        let mut nodes = HashMap::new();
+        nodes.insert(before_id.clone(), before);
+        nodes.insert(root_orphan_id.clone(), root_orphan);
+        nodes.insert(mid_id.clone(), mid);
+        nodes.insert(inner_orphan_id, inner_orphan);
+        nodes.insert(after_mid_id, after_mid);
+        nodes.insert(after_id.clone(), after);
+        ProjectGraph {
+            roots: vec![before_id, root_orphan_id, mid_id, after_id],
+            nodes,
+            edges: vec![],
+        }
     }
 }
