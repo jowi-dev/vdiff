@@ -1,6 +1,9 @@
 [backend]
 provider = "github"
 
+[backend.github]
+repo = "jowi-dev/vdiff"
+
 [work.lanes.vdiff]
 # "." resolves to this repo's own root (only valid in a repo-local
 # .tskmstr.toml -- see resolve_repo_path in tskmstr's src/config/mod.rs), so
@@ -11,3 +14,7 @@ repo = "."
 # origin/HEAD symbolic ref was never set (git remote set-head) has nothing
 # for resolve_base to fall back to, and the lane run fails preflight.
 base_branch = "main"
+# Without this, a lane run falls back to ~/.claude/prompts/vdiff.md, which
+# does not exist. Relative paths resolve against the lane's repo root, so the
+# prompt lives in the repo and is versioned with the code it instructs.
+prompt_file = "prompts/vdiff-lane.md"
