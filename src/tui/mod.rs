@@ -51,7 +51,9 @@
 pub mod highlight;
 pub mod keys;
 pub mod loader;
+pub mod nvim_grid;
 pub mod nvim_handoff;
+pub mod nvim_keys;
 pub mod render;
 
 use std::io;
