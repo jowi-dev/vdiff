@@ -200,7 +200,7 @@ pub struct VdiffApp {
     /// (`None` before the first `OpenFile` in nvim mode, or whenever nvim
     /// mode is off). Demoted to a fallback: `:VdiffDiff`/`d`'s diffsplit
     /// asks nvim what buffer is *actually* current first (see
-    /// [`Self::trigger_vdiff_diff`]/[`nvim_pane::resolve_diffed_path`]) --
+    /// [`Self::trigger_vdiff_diff`]/[`crate::nvim::vdiff_glue::resolve_diffed_path`]) --
     /// this is only consulted when that RPC query can't produce an answer
     /// (timeout, dead session) or reports something that isn't a
     /// diffable real file (an unnamed/scratch buffer). Without it, either
@@ -615,46 +615,43 @@ impl VdiffApp {
 
     /// The diffsplit-against-merge-base flow itself, shared by
     /// `:VdiffDiff` (typed inside nvim) and the nvim-mode `d` binding
-    /// (typed from the graph). Resolves which file to diff from nvim's
-    /// *actual* current buffer first -- `NvimPane::current_buffer_name`
-    /// plus [`nvim_pane::resolve_diffed_path`] -- rather than trusting
-    /// [`Self::nvim_current_file`] blindly: that field is only ever
-    /// written when graph navigation opens a file, so if the user `:e`'d
-    /// or `Ctrl-w w`'d to a different buffer inside nvim itself, the old
-    /// code would diff the file it last opened, not the one actually on
-    /// screen -- a plausible-looking wrong diff. `nvim_current_file` is
-    /// now only a fallback for when that query can't produce a usable
-    /// answer (RPC timeout/dead session, or the current buffer is
+    /// (typed from the graph). Delegates to
+    /// [`crate::nvim::vdiff_glue::trigger_diffsplit`] (via
+    /// [`NvimPane::trigger_diffsplit`]) for the frontend-neutral resolution
+    /// logic -- nvim's *actual* current buffer first, falling back to
+    /// [`Self::nvim_current_file`] only when that query can't produce a
+    /// usable answer (RPC timeout/dead session, or the current buffer is
     /// unnamed/one of this plugin's own `vdiff-base://` scratch buffers --
-    /// see `resolve_diffed_path`'s doc for the full list).
+    /// see [`crate::nvim::vdiff_glue::resolve_diffed_path`]'s doc for the
+    /// full list). `nvim_current_file` is only ever written when graph
+    /// navigation opens a file, so trusting it unconditionally (instead of
+    /// as a fallback) would risk diffing the file last opened that way
+    /// rather than whatever the user `:e`'d or `Ctrl-w w`'d to inside nvim
+    /// itself -- a plausible-looking wrong diff.
     ///
-    /// Reads the resolved path's base content via [`DiffLoader`]'s repo/
-    /// base_oid (already held for the built-in diff pane), then hands it
-    /// to [`NvimPane::diffsplit`]. This works for *any* file in the repo,
-    /// not just ones backing a graph node -- reviewing a file reached by
-    /// navigating inside nvim is still a valid diff request. A missing
-    /// base blob (an added file) reads back `None`/empty content --
-    /// diffing against an empty buffer is the correct, unsurprising
-    /// result, not an error. No-ops with a stderr warning if neither the
-    /// query nor the fallback produced a path (shouldn't happen in
-    /// practice, but the notification path can't assume the glue's state
-    /// didn't move on by the time it's processed).
+    /// The injected closure reads the resolved path's base content via
+    /// [`DiffLoader`]'s repo/base_oid (already held for the built-in diff
+    /// pane). This works for *any* file in the repo, not just ones backing
+    /// a graph node -- reviewing a file reached by navigating inside nvim
+    /// is still a valid diff request. A missing base blob (an added file)
+    /// reads back `None`/empty content -- diffing against an empty buffer
+    /// is the correct, unsurprising result, not an error. Prints a stderr
+    /// warning if neither the query nor the fallback produced a path
+    /// (shouldn't happen in practice, but the notification path can't
+    /// assume the glue's state didn't move on by the time it's processed).
     fn trigger_vdiff_diff(&mut self) {
         let Some(nvim) = &self.nvim else { return };
-        let buf_name = nvim.current_buffer_name();
-        let path = nvim_pane::resolve_diffed_path(buf_name.as_deref(), &self.nvim_cwd)
-            .or_else(|| self.nvim_current_file.clone());
-        let Some(path) = path else {
+        let fallback = self.nvim_current_file.clone();
+        let diff_loader = &self.diff_loader;
+        let sent = nvim.trigger_diffsplit(&self.nvim_cwd, fallback, |path| {
+            diff_loader
+                .repo
+                .base_blob(&diff_loader.base_oid, path)
+                .unwrap_or(None)
+        });
+        if !sent {
             eprintln!("warning: :VdiffDiff requested with no file open in the nvim pane");
-            return;
-        };
-        let base_content = self
-            .diff_loader
-            .repo
-            .base_blob(&self.diff_loader.base_oid, &path)
-            .unwrap_or(None)
-            .unwrap_or_default();
-        nvim.diffsplit(path, base_content);
+        }
     }
 
     /// The nvim-mode input path: hands this frame's raw egui events to the

@@ -7,3 +7,4 @@
 
 pub mod grid;
 pub mod session;
+pub mod vdiff_glue;

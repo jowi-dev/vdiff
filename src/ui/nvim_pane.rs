@@ -142,12 +142,13 @@ impl NvimPane {
     /// `None` on RPC failure (timeout/dead session), same as every other
     /// [`Self::call`]-based query. This is `:VdiffDiff`/`d`'s source of
     /// truth for "what file is actually showing right now" -- see
-    /// [`resolve_diffed_path`] for turning this into a repo-relative path
-    /// (or `None` when the caller should fall back to its cached
-    /// last-known file instead).
+    /// [`crate::nvim::vdiff_glue::resolve_diffed_path`] for turning this
+    /// into a repo-relative path (or `None` when the caller should fall
+    /// back to its cached last-known file instead). Thin wrapper over
+    /// [`crate::nvim::vdiff_glue::current_buffer_name`], which is
+    /// frontend-neutral and reused by the TUI.
     pub fn current_buffer_name(&self) -> Option<String> {
-        self.call("nvim_buf_get_name", vec![Value::from(0)])
-            .and_then(|value| value.as_str().map(str::to_string))
+        crate::nvim::vdiff_glue::current_buffer_name(&self.session, CALL_TIMEOUT)
     }
 
     /// Run one Ex command via [`Self::call`] (rather than the
@@ -173,21 +174,11 @@ impl NvimPane {
     /// at startup. The host-channel global is `vdiff.nvim`'s hook back into
     /// this embedder (see [`crate::nvim::session::HOST_CHANNEL_LUA`]) --
     /// comment capture itself (`:VdiffComment`, the compose UI, writing
-    /// `comments.json`) is that plugin's job now, not this app's.
-    /// Fire-and-forget like [`NvimCmd::Ex`] generally -- a failure here
-    /// (should never happen; these are static, always-valid command
-    /// strings) just means the command/global won't exist this session, not
-    /// a crash.
+    /// `comments.json`) is that plugin's job now, not this app's. Thin
+    /// wrapper over [`crate::nvim::vdiff_glue::register_vdiff_commands`],
+    /// which is frontend-neutral and reused by the TUI.
     pub fn register_vdiff_commands(&self) {
-        self.send(NvimCmd::Ex(
-            crate::nvim::session::VDIFF_DIFF_COMMAND.to_string(),
-        ));
-        self.send(NvimCmd::Ex(
-            crate::nvim::session::VDIFF_DIFF_OFF_COMMAND.to_string(),
-        ));
-        self.send(NvimCmd::ExecLua(
-            crate::nvim::session::HOST_CHANNEL_LUA.to_string(),
-        ));
+        crate::nvim::vdiff_glue::register_vdiff_commands(&self.session);
     }
 
     /// Whether `:VdiffDiff` was invoked in this session since the last
@@ -210,6 +201,29 @@ impl NvimPane {
     /// [`NvimCmd::DiffSplit`].
     pub fn diffsplit(&self, path: PathBuf, base_content: String) {
         self.send(NvimCmd::DiffSplit { path, base_content });
+    }
+
+    /// The diffsplit-against-merge-base flow itself, shared by `:VdiffDiff`
+    /// (typed inside nvim) and the nvim-mode `d` binding (typed from the
+    /// graph) -- see [`crate::nvim::vdiff_glue::trigger_diffsplit`] for the
+    /// full semantics (fallback resolution order, what a missing base blob
+    /// means, and what the returned `bool` signals). `cwd` is the session's
+    /// working directory, used to turn nvim's current-buffer name into a
+    /// repo-relative path; `fallback` is the caller's cached last-known
+    /// file; `base_content_for` loads the resolved path's base content.
+    pub fn trigger_diffsplit(
+        &self,
+        cwd: &Path,
+        fallback: Option<PathBuf>,
+        base_content_for: impl FnOnce(&Path) -> Option<String>,
+    ) -> bool {
+        crate::nvim::vdiff_glue::trigger_diffsplit(
+            &self.session,
+            cwd,
+            CALL_TIMEOUT,
+            fallback,
+            base_content_for,
+        )
     }
 
     /// Delegate the graph pane's `c`-on-focused-node ("architecture"
@@ -513,43 +527,6 @@ pub fn ctrl_w_continuation(key: Key, modifiers: Modifiers) -> Option<String> {
     }
     let c = single_char(key)?;
     Some(format!("<C-w>{c}"))
-}
-
-/// Resolve the repo-relative path `:VdiffDiff`/`d` should diff, from
-/// nvim's actual current-buffer name -- fixes a stale-diff bug where the
-/// glue trusted whatever file it last opened via graph navigation even
-/// after the user `:e`'d or `Ctrl-w w`'d to a different buffer inside
-/// nvim itself.
-///
-/// `buf_name` is [`NvimPane::current_buffer_name`]'s result verbatim:
-/// `None` if that RPC call itself failed (timeout or a dead session --
-/// same "couldn't get an answer" as [`NvimPane::at_boundary`]), `Some`
-/// with whatever `nvim_buf_get_name(0)` returned otherwise (absolute for
-/// a real file, empty for an unnamed buffer, `vdiff-base://<path>` for
-/// this plugin's own diff-base scratch buffers).
-///
-/// Returns `None` -- meaning "the caller should fall back to its cached
-/// last-known file instead, not treat this as an error" -- for:
-/// - an RPC failure (`buf_name` itself `None`),
-/// - an empty name (no buffer, or an unnamed scratch buffer),
-/// - a `vdiff-base://` name (the user ran `:VdiffDiff` while focused in
-///   the base split itself -- that's a request to refresh the file
-///   already showing, not a new one to diff), or
-/// - a name that doesn't resolve under `cwd` at all (edited via an
-///   absolute path outside the repo -- there's no repo-relative
-///   [`crate::graph::model::FileRef`] path for `base_blob` to look up).
-///
-/// Otherwise, `Some` of `name` stripped down to its path relative to
-/// `cwd` -- what `GitRepo::base_blob` expects.
-pub fn resolve_diffed_path(buf_name: Option<&str>, cwd: &Path) -> Option<PathBuf> {
-    let name = buf_name?;
-    if name.is_empty() || name.starts_with("vdiff-base://") {
-        return None;
-    }
-    Path::new(name)
-        .strip_prefix(cwd)
-        .ok()
-        .map(Path::to_path_buf)
 }
 
 /// One decision produced by [`process_nvim_events`] for the eframe glue to
@@ -1119,39 +1096,5 @@ mod tests {
         let (actions, pending) = process_nvim_events(&events, false);
         assert_eq!(actions, vec![]);
         assert!(pending);
-    }
-
-    #[test]
-    fn resolve_diffed_path_rpc_failure_falls_back() {
-        assert_eq!(resolve_diffed_path(None, Path::new("/repo")), None);
-    }
-
-    #[test]
-    fn resolve_diffed_path_empty_name_falls_back() {
-        assert_eq!(resolve_diffed_path(Some(""), Path::new("/repo")), None);
-    }
-
-    #[test]
-    fn resolve_diffed_path_base_scratch_buffer_falls_back() {
-        assert_eq!(
-            resolve_diffed_path(Some("vdiff-base://src/main.rs"), Path::new("/repo")),
-            None
-        );
-    }
-
-    #[test]
-    fn resolve_diffed_path_strips_cwd_prefix() {
-        assert_eq!(
-            resolve_diffed_path(Some("/repo/src/main.rs"), Path::new("/repo")),
-            Some(PathBuf::from("src/main.rs"))
-        );
-    }
-
-    #[test]
-    fn resolve_diffed_path_outside_repo_falls_back() {
-        assert_eq!(
-            resolve_diffed_path(Some("/elsewhere/other.rs"), Path::new("/repo")),
-            None
-        );
     }
 }
