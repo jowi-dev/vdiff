@@ -18,7 +18,7 @@ use vdiff::graph::model::NodeId;
 use vdiff::graph::test_modules::hide_test_modules;
 use vdiff::pipeline::git2_repo::Git2Repo;
 use vdiff::pipeline::{build_graph, PipelineOptions};
-use vdiff::tui::render::draw;
+use vdiff::tui::render::{draw, ScrollOffsets};
 use vdiff::tui::{seed_fold_collapsed_if_dense, ViewMode};
 
 fn main() {
@@ -86,7 +86,7 @@ fn main() {
 
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
     terminal
-        .draw(|frame| draw(frame, &app, None, 0, 0, 0, mode))
+        .draw(|frame| draw(frame, &app, None, ScrollOffsets::default(), mode, None))
         .expect("draw");
     let buffer = terminal.backend().buffer();
     for y in 0..buffer.area.height {

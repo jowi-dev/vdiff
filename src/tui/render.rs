@@ -72,6 +72,19 @@ pub const LEGEND_HEIGHT: u16 = 5;
 /// computing how many lines of content actually fit.
 const FILE_HEADER_HEIGHT: u16 = 1;
 
+/// The three scroll offsets [`draw`] needs, bundled into one argument --
+/// see that function's own doc for why (clippy's `too_many_arguments`, once
+/// `nvim_grid` made it an eighth plain argument). `rail` is the rail view's
+/// own vertical offset; `canvas`/`canvas_x` are the canvas/plane views'
+/// shared vertical/horizontal offsets (see `crate::tui::TuiState::canvas_scroll`'s
+/// doc for why those two views share one pair of fields).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScrollOffsets {
+    pub rail: usize,
+    pub canvas: usize,
+    pub canvas_x: usize,
+}
+
 /// How many lines of file content are visible in a file pane of
 /// `terminal_rows` total rows -- the file pane fills everything above the
 /// legend strip, minus its own header line and the block's top/bottom
@@ -94,25 +107,34 @@ pub fn file_view_visible_rows(terminal_rows: u16) -> usize {
 /// this one frame -- see `crate::tui::TuiState::notice`'s doc for why the
 /// TUI needs this display-only glue state at all (in short: `eprintln!` is
 /// invisible/garbled while the alternate screen owns the terminal).
-/// `rail_scroll`/`canvas_scroll` are the rail view's and the canvas/plane
-/// views' (which share `canvas_scroll` -- see `crate::tui::TuiState::canvas_scroll`'s
-/// doc) current vertical scroll offsets, already clamped by the caller via
-/// [`clamp_scroll`] -- see [`rail_visible_rows`]'s doc for why that
-/// clamping happens in `crate::tui::event_loop` rather than in here.
-/// `canvas_scroll_x` is the canvas/plane views' own horizontal counterpart
-/// (issue #18's auto-pan -- see [`clamp_scroll_x`]'s doc), unused by the
-/// rail view entirely (it has no horizontal scroll at all). `view_mode`
-/// picks which of the three graph screens actually paints (issue #17's maintainer
-/// override -- see [`crate::tui::ViewMode`]'s doc); the one not currently
-/// showing has no rendering cost paid for it at all.
+/// `scroll` bundles the rail view's and the canvas/plane views' (which
+/// share `scroll.canvas` -- see `crate::tui::TuiState::canvas_scroll`'s
+/// doc) current vertical scroll offset plus the canvas/plane views' own
+/// horizontal counterpart (issue #18's auto-pan -- see [`clamp_scroll_x`]'s
+/// doc, unused by the rail view entirely, which has no horizontal scroll at
+/// all) -- see [`ScrollOffsets`]'s own doc for why these three are bundled
+/// into one argument rather than three (clippy's `too_many_arguments`,
+/// tripped the moment `nvim_grid` below was added as an eighth). Already
+/// clamped by the caller via [`clamp_scroll`] -- see [`rail_visible_rows`]'s
+/// doc for why that clamping happens in `crate::tui::event_loop` rather
+/// than in here. `view_mode` picks which of the three graph screens
+/// actually paints (issue #17's maintainer override -- see
+/// [`crate::tui::ViewMode`]'s doc); the one not currently showing has no
+/// rendering cost paid for it at all. `nvim_grid`, when `Some`, is the
+/// embedded nvim session's current grid -- issue #19's nvim-embedding:
+/// whenever the file pane is showing, this paints the live nvim grid (via
+/// [`crate::tui::nvim_grid::render_grid`]) instead of [`draw_file_view`],
+/// cursor drawn only while [`Pane::File`] actually has keyboard focus.
+/// `None` (no session, or a dead one -- the caller degrades to `None`
+/// rather than passing a stale grid) falls back to the hand-rolled viewer
+/// exactly as before.
 pub fn draw(
     frame: &mut Frame,
     app: &App,
     notice: Option<&str>,
-    rail_scroll: usize,
-    canvas_scroll: usize,
-    canvas_scroll_x: usize,
+    scroll: ScrollOffsets,
     view_mode: ViewMode,
+    nvim_grid: Option<&crate::nvim::grid::GridState>,
 ) {
     let area = frame.area();
     let chunks = Layout::default()
@@ -125,7 +147,14 @@ pub fn draw(
     match app.screen {
         Screen::Graph => {
             if app.pane == Pane::File {
-                if let Some(file_view) = &app.file_view {
+                if let Some(grid) = nvim_grid {
+                    crate::tui::nvim_grid::render_grid(
+                        grid,
+                        main_area,
+                        frame.buffer_mut(),
+                        app.pane == Pane::File,
+                    );
+                } else if let Some(file_view) = &app.file_view {
                     draw_file_view(frame, main_area, file_view);
                 } else {
                     frame.render_widget(
@@ -136,20 +165,20 @@ pub fn draw(
             } else {
                 match view_mode {
                     ViewMode::Rail => {
-                        dropped_edges = draw_rail_graph(frame, main_area, app, rail_scroll);
+                        dropped_edges = draw_rail_graph(frame, main_area, app, scroll.rail);
                     }
                     ViewMode::Canvas => {
                         dropped_edges = draw_canvas_graph(
                             frame,
                             main_area,
                             app,
-                            canvas_scroll,
-                            canvas_scroll_x,
+                            scroll.canvas,
+                            scroll.canvas_x,
                         );
                     }
                     ViewMode::Plane => {
                         dropped_edges =
-                            draw_plane_graph(frame, main_area, app, canvas_scroll, canvas_scroll_x);
+                            draw_plane_graph(frame, main_area, app, scroll.canvas, scroll.canvas_x);
                     }
                 }
             }
@@ -1786,7 +1815,20 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, app, notice, rail_scroll, 0, 0, ViewMode::Rail))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    app,
+                    notice,
+                    ScrollOffsets {
+                        rail: rail_scroll,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Rail,
+                    None,
+                )
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let mut out = String::new();
@@ -1838,7 +1880,20 @@ mod tests {
         app.reviewed.insert(NodeId::from("leaf"));
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Rail))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Rail,
+                    None,
+                )
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let dimmed = (0..buffer.area.height).any(|y| {
@@ -2498,7 +2553,20 @@ mod tests {
         let app = app_for(diamond_graph_fixture(), "child");
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Canvas))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Canvas,
+                    None,
+                )
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let mut text = String::new();
@@ -2531,14 +2599,40 @@ mod tests {
 
         let mut terminal_at_zero = Terminal::new(TestBackend::new(width, height)).expect("test");
         terminal_at_zero
-            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Canvas))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Canvas,
+                    None,
+                )
+            })
             .expect("draw");
         let text_at_zero = buffer_text(terminal_at_zero.backend().buffer());
         assert!(text_at_zero.contains("p1"), "p1 should be visible unpanned");
 
         let mut terminal_panned = Terminal::new(TestBackend::new(width, height)).expect("test");
         terminal_panned
-            .draw(|frame| draw(frame, &app, None, 0, 0, 20, ViewMode::Canvas))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 20,
+                    },
+                    ViewMode::Canvas,
+                    None,
+                )
+            })
             .expect("draw");
         let text_panned = buffer_text(terminal_panned.backend().buffer());
         assert!(
@@ -2567,7 +2661,20 @@ mod tests {
         let app = app_for(diamond_graph_fixture(), "child");
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Canvas))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Canvas,
+                    None,
+                )
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let mut text = String::new();
@@ -2628,7 +2735,20 @@ mod tests {
         );
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Canvas))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Canvas,
+                    None,
+                )
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let mut text = String::new();
@@ -2679,7 +2799,20 @@ mod tests {
     ) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, app, None, 0, scroll_y, scroll_x, ViewMode::Plane))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: scroll_y,
+                        canvas_x: scroll_x,
+                    },
+                    ViewMode::Plane,
+                    None,
+                )
+            })
             .expect("draw");
         buffer_text(terminal.backend().buffer())
     }
@@ -2708,7 +2841,20 @@ mod tests {
         let app = app_for_plane(graph, "a");
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Plane))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Plane,
+                    None,
+                )
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let bolded = (0..buffer.area.height).any(|y| {
@@ -2912,7 +3058,20 @@ mod tests {
         let app = app_for_plane(graph, "a");
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Plane))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Plane,
+                    None,
+                )
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
         assert!(
@@ -2932,7 +3091,20 @@ mod tests {
         let app_a = app_for_plane(graph.clone(), "a");
         let mut terminal_a = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
         terminal_a
-            .draw(|frame| draw(frame, &app_a, None, 0, 0, 0, ViewMode::Plane))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app_a,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Plane,
+                    None,
+                )
+            })
             .expect("draw");
         let buffer_a = terminal_a.backend().buffer();
         assert!(!reversed_cells(buffer_a, "a").is_empty());
@@ -2942,7 +3114,20 @@ mod tests {
         app_b.focus = NodeId::from("b");
         let mut terminal_b = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
         terminal_b
-            .draw(|frame| draw(frame, &app_b, None, 0, 0, 0, ViewMode::Plane))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app_b,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Plane,
+                    None,
+                )
+            })
             .expect("draw");
         let buffer_b = terminal_b.backend().buffer();
         assert!(
@@ -2973,7 +3158,20 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Plane))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Plane,
+                    None,
+                )
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
 
@@ -3004,7 +3202,20 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Plane))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Plane,
+                    None,
+                )
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let top_border_style = buffer[(ns1_rect.x as u16, ns1_rect.y as u16)].style();
@@ -3020,7 +3231,20 @@ mod tests {
         let app = app_for(diamond_graph_fixture(), "p1");
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).expect("test backend");
         terminal
-            .draw(|frame| draw(frame, &app, None, 0, 0, 0, ViewMode::Canvas))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Canvas,
+                    None,
+                )
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
         assert!(

@@ -14,7 +14,7 @@ use vdiff::graph::layout::layout;
 use vdiff::graph::model::{NodeId, ProjectGraph};
 #[cfg(any(feature = "gui", feature = "tui"))]
 use vdiff::graph::test_modules::{group_matched_test_modules, hide_test_modules};
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "tui"))]
 use vdiff::nvim::session::nvim_available;
 use vdiff::pipeline::git2_repo::Git2Repo;
 use vdiff::pipeline::pr::{resolve_pr_base_ref, PrCheckout};
@@ -191,6 +191,7 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
                     graph,
                     repo_path,
                     cli.smoke,
+                    cli.nvim,
                     DiffSource { repo, base_oid },
                     review_setup,
                 )
@@ -289,9 +290,17 @@ fn launch_tui(
     graph: ProjectGraph,
     repo_path: &Path,
     smoke: bool,
+    want_nvim: bool,
     diff_source: DiffSource,
     review_setup: ReviewSetup,
 ) -> ExitCode {
+    // Same startup decision as `run_gui`'s (issue #19): on by default,
+    // falling back to the hand-rolled viewers with a stderr warning if
+    // `--no-nvim` wasn't given but no `nvim` binary is on `PATH`.
+    if want_nvim && !nvim_available() {
+        eprintln!("warning: nvim mode is on by default but no `nvim` binary was found on PATH; falling back to the built-in file viewer");
+    }
+    let nvim_enabled = want_nvim && nvim_available();
     let ReviewSetup {
         git_dir,
         branch,
@@ -322,6 +331,7 @@ fn launch_tui(
         repo_root: repo_path.to_path_buf(),
         smoke,
         dense_fold_seeded,
+        nvim_enabled,
     };
 
     match vdiff::tui::run(app, config) {
@@ -343,6 +353,7 @@ fn launch_tui(
     _graph: ProjectGraph,
     _repo_path: &Path,
     _smoke: bool,
+    _want_nvim: bool,
     _diff_source: DiffSource,
     _review_setup: ReviewSetup,
 ) -> ExitCode {

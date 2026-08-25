@@ -54,6 +54,7 @@ pub mod loader;
 pub mod nvim_grid;
 pub mod nvim_handoff;
 pub mod nvim_keys;
+pub mod nvim_pane;
 pub mod render;
 
 use std::io;
@@ -72,10 +73,12 @@ use crate::core::app::{update, App, Cmd, Msg, Pane, Screen};
 use crate::core::focus::{move_focus, Direction};
 use crate::core::rail_view::RailDirection;
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome, Pending};
+use crate::nvim::session::NvimCmd;
 use crate::review::comments::map_comments;
 use crate::review::review_state::ReviewStore;
 use crate::review::store as review_store;
 use loader::TuiLoader;
+use nvim_pane::NvimPane;
 
 /// Which of the three graph screens is showing: the rail-DAG row renderer
 /// (issue #16 phase 2), the semantic-zoom Sugiyama canvas (issue #17/#18),
@@ -117,6 +120,28 @@ const SMOKE_DURATION: Duration = Duration::from_secs(2);
 /// event-driven, not a frame-rate poll -- see the module doc).
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// [`event_loop`]'s poll timeout while an embedded nvim session is alive
+/// (issue #19): [`POLL_INTERVAL`]'s 200ms is well past the ~50ms budget
+/// nvim output (typing echo, async redraws from `:VdiffDiff`, ...) needs to
+/// stay responsive, so this shorter timeout takes over for the duration of
+/// the session instead. A no-op-repaint session (see [`TuiState::nvim`]'s
+/// spawn call) relies entirely on this cadence rather than a dirty flag --
+/// [`event_loop`] already redraws unconditionally every iteration (see the
+/// module doc), so polling this often is sufficient on its own without
+/// adding a second signal for "should I redraw" that would just have to
+/// agree with this one.
+const NVIM_POLL_INTERVAL: Duration = Duration::from_millis(30);
+
+/// [`TuiState::notice`]'s message when the embedded nvim session dies while
+/// the file pane still has focus (see [`event_loop`]'s liveness check) --
+/// mirrors the GUI's `reclaim_focus_from_dead_nvim` fix for the same `ZZ`-
+/// lockup class of bug, but the TUI has no separate `Msg::PaneLeft`-on-death
+/// path outside this notice: unlike the GUI (which can respawn nvim on the
+/// next file open), the TUI deliberately never auto-respawns (see
+/// [`TuiState::nvim`]'s doc) -- once dead, this run falls back to the
+/// hand-rolled viewers for good.
+const NVIM_DIED_NOTICE: &str = "nvim session ended -- falling back to the built-in viewer";
+
 /// Everything [`run`] needs beyond the already-constructed [`App`]: the IO
 /// loader for `Cmd::LoadDiff`/`Cmd::LoadFile`, the review-completion store/
 /// branch to persist [`Cmd::PersistReviewState`] into, the repo root
@@ -138,6 +163,15 @@ pub struct TuiConfig {
     /// before `TuiState` exists, so there's nowhere earlier to set the
     /// notice directly.
     pub dense_fold_seeded: bool,
+    /// Whether to spawn an embedded `nvim --embed` session for the file/
+    /// diff views (issue #19), resolved by the caller (`main`'s
+    /// `launch_tui`) from `--no-nvim`/[`crate::nvim::session::nvim_available`]
+    /// exactly like the GUI's own startup decision. A spawn failure at
+    /// [`run`]-time (missing binary despite this being `true` -- a race
+    /// with `PATH`, or the process failing to start for some other reason)
+    /// falls back to the hand-rolled viewers for the rest of the run, same
+    /// as `false` here.
+    pub nvim_enabled: bool,
 }
 
 /// Owns [`App`] and everything [`TuiConfig`] carried in, driving the
@@ -218,6 +252,18 @@ struct TuiState {
     /// the moment `handle_key` reads it, so a comment target never lingers
     /// into some later, unrelated keypress.
     comment_target: Option<(PathBuf, Option<u32>)>,
+    /// The embedded nvim session (issue #19), if `TuiConfig::nvim_enabled`
+    /// was set and the spawn succeeded -- `None` for the rest of the run
+    /// otherwise (missing binary, or the spawn itself failing), in which
+    /// case every code path in this module falls back to the hand-rolled
+    /// file/diff viewers exactly as before this feature existed. Once
+    /// `Some`, stays `Some` even if the underlying process dies later --
+    /// unlike the GUI, this is deliberately never respawned (see the
+    /// crate's own fallback rule); [`event_loop`]'s liveness check just
+    /// bounces focus back to the graph pane with [`NVIM_DIED_NOTICE`] and
+    /// every subsequent [`handle_key`]/render call treats it as absent via
+    /// [`NvimPane::is_alive`].
+    nvim: Option<NvimPane>,
 }
 
 impl TuiState {
@@ -242,7 +288,25 @@ impl TuiState {
                 Err(message) => self.dispatch(Msg::LoadFailed(message)),
             },
             Cmd::LoadFile(node) => match self.loader.load_file_view(&self.app.graph, &node) {
-                Ok(state) => self.dispatch(Msg::FileLoaded(state)),
+                Ok(state) => {
+                    // Issue #19: mirror the GUI's `VdiffApp::load_file` --
+                    // whenever the embedded session is alive, open the same
+                    // file it just loaded for the hand-rolled viewer
+                    // (same head content, same changed-range marks) so the
+                    // two never disagree about what's showing.
+                    if let Some(nvim) = self.nvim.as_mut() {
+                        if nvim.is_alive() {
+                            if let Some(file) = state.current_file() {
+                                nvim.open_file(
+                                    file.path.clone(),
+                                    Some(1),
+                                    file.changed_ranges.clone(),
+                                );
+                            }
+                        }
+                    }
+                    self.dispatch(Msg::FileLoaded(state));
+                }
                 Err(message) => self.dispatch(Msg::FileLoadFailed(message)),
             },
             Cmd::CommentNode(node) => {
@@ -329,6 +393,52 @@ impl TuiState {
                 ));
             }
         }
+    }
+
+    /// The diffsplit-against-merge-base flow itself (issue #19's `d`
+    /// binding, and `:VdiffDiff` typed inside the embedded session) --
+    /// mirrors the GUI's `VdiffApp::trigger_vdiff_diff` exactly:
+    /// [`NvimPane::trigger_diffsplit`] resolves which file to diff from
+    /// nvim's own current buffer first, falling back to whatever this
+    /// glue's own navigation last opened; `base_content_for` reads the
+    /// resolved path's base blob via [`Self::loader`]'s repo/`base_oid`,
+    /// already held for the built-in diff pane. A no-op if there's no live
+    /// session at all. Warns via [`Self::notice`] (not `eprintln!` -- see
+    /// that field's own doc) if neither query produced a path to diff.
+    fn trigger_nvim_diff(&mut self) {
+        let sent = match &self.nvim {
+            Some(nvim) if nvim.is_alive() => {
+                let repo = self.loader.repo.as_ref();
+                let base_oid = &self.loader.base_oid;
+                nvim.trigger_diffsplit(&self.repo_root, |path| {
+                    repo.base_blob(base_oid, path).unwrap_or(None)
+                })
+            }
+            _ => return,
+        };
+        if !sent {
+            self.notice = Some("warning: no file open in the nvim pane to diff".to_string());
+        }
+    }
+
+    /// The embedded-nvim `d` binding on the graph pane (issue #19,
+    /// mirroring the GUI's `VdiffApp::open_nvim_diff_for_focus`): open the
+    /// focused node's file (same [`Msg::OpenFile`]/`Cmd::LoadFile` path
+    /// `Enter` uses, so the same marks and the same [`NvimPane::open_file`]
+    /// tracking apply) and immediately run [`Self::trigger_nvim_diff`], so
+    /// the result is one keystroke landing directly on the file pane
+    /// already in diff mode against the merge-base version. Guarded by the
+    /// same file-less-row notice `Enter`/the hand-rolled `d` already use --
+    /// see [`node_has_files`]'s doc -- since `Msg::OpenFile` would otherwise
+    /// be a silent no-op on a collapsed namespace row.
+    fn open_diff_in_nvim(&mut self) -> KeyAction {
+        if !node_has_files(&self.app, &self.app.focus) {
+            self.notice = Some(FILE_LESS_ROW_NOTICE.to_string());
+            return KeyAction::Continue;
+        }
+        self.dispatch(Msg::OpenFile);
+        self.trigger_nvim_diff();
+        KeyAction::Continue
     }
 }
 
@@ -490,6 +600,27 @@ pub fn run(app: App, config: TuiConfig) -> io::Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
+    let mut notice = initial_notice(config.dense_fold_seeded);
+    // Issue #19: spawn the embedded session once at startup, mirroring the
+    // GUI's own startup decision (`nvim_available`/`--no-nvim`, already
+    // folded into `config.nvim_enabled` by `main`'s `launch_tui`) -- a spawn
+    // failure here just means `state.nvim` stays `None` for the rest of the
+    // run, same as `nvim_enabled` being `false`. Sized to an arbitrary
+    // starting 80x24, same as the GUI's own initial spawn -- `event_loop`'s
+    // resize-debounce (see `NvimPane::maybe_resize`) sends the real size the
+    // moment the first frame's terminal size is known.
+    let nvim = if config.nvim_enabled {
+        match NvimPane::spawn(&config.repo_root, 80, 24, || {}) {
+            Ok(pane) => Some(pane),
+            Err(err) => {
+                notice = Some(format!("warning: failed to spawn nvim: {err}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut state = TuiState {
         app,
         pending_key: None,
@@ -497,13 +628,14 @@ pub fn run(app: App, config: TuiConfig) -> io::Result<()> {
         review_store: config.review_store,
         review_branch: config.review_branch,
         repo_root: config.repo_root,
-        notice: initial_notice(config.dense_fold_seeded),
+        notice,
         rail_scroll: 0,
         view_mode: ViewMode::default(),
         canvas_scroll: 0,
         canvas_scroll_x: 0,
         canvas_fold_pending: false,
         comment_target: None,
+        nvim,
     };
 
     let result = event_loop(&mut terminal, &mut state, config.smoke);
@@ -623,23 +755,75 @@ fn event_loop(
                 }
             }
         }
+        // Issue #19: liveness/resize/`:VdiffDiff`-drain upkeep for the
+        // embedded session, run once per iteration alongside the existing
+        // viewport-size bookkeeping above -- before this frame's draw, so a
+        // death detected just now already shows the fallback view/notice on
+        // this same frame rather than one iteration late.
+        let nvim_alive = state.nvim.as_ref().is_some_and(NvimPane::is_alive);
+        if nvim_alive {
+            if state.app.pane == Pane::File {
+                let size = terminal.size()?;
+                let cols = size.width;
+                let rows = render::rail_visible_rows(size.height) as u16;
+                if let Some(nvim) = state.nvim.as_mut() {
+                    nvim.maybe_resize(cols, rows);
+                }
+            }
+            let diff_requested = state.nvim.as_ref().is_some_and(NvimPane::take_diff_request);
+            if diff_requested {
+                state.trigger_nvim_diff();
+            }
+        } else if state.nvim.is_some() && state.app.pane == Pane::File {
+            // The fix for the TUI's own `ZZ`-lockup class of bug (mirrors
+            // the GUI's `reclaim_focus_from_dead_nvim`): a session that died
+            // while it still held the file pane must not trap the user
+            // there with no working keys to escape with -- see
+            // `NVIM_DIED_NOTICE`'s doc for why this never tries to
+            // respawn.
+            state.notice = Some(NVIM_DIED_NOTICE.to_string());
+            state.dispatch(Msg::PaneLeft);
+        }
+
+        let nvim_grid = if nvim_alive && state.app.pane == Pane::File {
+            state.nvim.as_ref().map(NvimPane::grid)
+        } else {
+            None
+        };
+        let nvim_grid_guard = nvim_grid.as_ref().and_then(|grid| grid.lock().ok());
+
         terminal.draw(|frame| {
             render::draw(
                 frame,
                 &state.app,
                 state.notice.as_deref(),
-                state.rail_scroll,
-                state.canvas_scroll,
-                state.canvas_scroll_x,
+                render::ScrollOffsets {
+                    rail: state.rail_scroll,
+                    canvas: state.canvas_scroll,
+                    canvas_x: state.canvas_scroll_x,
+                },
                 state.view_mode,
+                nvim_grid_guard.as_deref(),
             )
         })?;
+        drop(nvim_grid_guard);
 
         if smoke && started_at.elapsed() > SMOKE_DURATION {
             return Ok(());
         }
 
-        if !event::poll(POLL_INTERVAL)? {
+        // While the embedded session is alive, poll far more often than
+        // `POLL_INTERVAL` -- see `NVIM_POLL_INTERVAL`'s own doc for why
+        // this alone (no dirty flag) is enough to keep nvim output
+        // responsive without pegging CPU: `--smoke`'s timer above and the
+        // resize/liveness checks above it are cheap enough to run at this
+        // cadence too.
+        let poll_interval = if nvim_alive {
+            NVIM_POLL_INTERVAL
+        } else {
+            POLL_INTERVAL
+        };
+        if !event::poll(poll_interval)? {
             continue;
         }
         match event::read()? {
@@ -706,6 +890,19 @@ fn event_loop(
 fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
     state.notice = None;
 
+    // Issue #19: while the file pane shows a live embedded session, every
+    // key is nvim's (with the `Ctrl-w h`/`Ctrl-w l` boundary chord the one
+    // exception routed through `at_boundary` instead of a raw forward) --
+    // see `nvim_pane::route_key`'s doc. This runs *before* the `q`-quits
+    // check and every other global handler below, so `q`/`Ctrl-e`/`c` type
+    // into nvim rather than quitting/handing off whenever it's alive; once
+    // it's dead (or the file pane isn't showing), `route_key` reports
+    // `HandleNormally` and every one of those keeps its pre-#19 meaning.
+    let nvim_alive = state.nvim.as_ref().is_some_and(NvimPane::is_alive);
+    if let Some(action) = handle_nvim_routed_key(state, key, nvim_alive) {
+        return action;
+    }
+
     if key.code == KeyCode::Char('q') && state.app.picker.is_none() {
         return KeyAction::Quit;
     }
@@ -724,6 +921,18 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
         state.view_mode = state.view_mode.next();
         state.canvas_fold_pending = false;
         return KeyAction::Continue;
+    }
+
+    if input == KeyInput::Char('d')
+        && nvim_pane::should_open_diff_in_nvim(
+            nvim_alive,
+            state.app.screen,
+            state.app.pane,
+            state.app.picker.is_some(),
+            state.pending_key.is_some(),
+        )
+    {
+        return state.open_diff_in_nvim();
     }
 
     match state.view_mode {
@@ -771,6 +980,71 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
         return KeyAction::EditInNvim { path, line };
     }
     KeyAction::Continue
+}
+
+/// Execute [`nvim_pane::route_key`]'s decision for `key`, given whether the
+/// embedded session is alive right now -- the impure half of that pure
+/// decision (an `at_boundary` RPC round trip for a completed `Ctrl-w h`/
+/// `Ctrl-w l`, and the actual `NvimCmd::Input` sends), kept as thin as
+/// possible around it, mirroring how `crate::ui::eframe_app::VdiffApp::
+/// execute_nvim_action` wraps the GUI's own `NvimAction`. Returns `None`
+/// for [`nvim_pane::KeyRoute::HandleNormally`] -- the caller falls through
+/// to every existing `handle_key` branch unchanged in that case -- and
+/// `Some(KeyAction::Continue)` for every other route, since none of them
+/// ever quit or hand off to a real `nvim` (that's `should_edit_in_nvim`'s
+/// territory, only reachable once this returns `None`).
+fn handle_nvim_routed_key(
+    state: &mut TuiState,
+    key: KeyEvent,
+    nvim_alive: bool,
+) -> Option<KeyAction> {
+    let ctrl_w_pending = state
+        .nvim
+        .as_ref()
+        .is_some_and(nvim_pane::NvimPane::ctrl_w_pending);
+    let route = nvim_pane::route_key(state.app.pane, nvim_alive, ctrl_w_pending, &key);
+    match route {
+        nvim_pane::KeyRoute::HandleNormally => return None,
+        nvim_pane::KeyRoute::Consumed => {
+            if let Some(nvim) = state.nvim.as_mut() {
+                nvim.set_ctrl_w_pending(false);
+            }
+        }
+        nvim_pane::KeyRoute::ArmCtrlW => {
+            if let Some(nvim) = state.nvim.as_mut() {
+                nvim.set_ctrl_w_pending(true);
+            }
+        }
+        nvim_pane::KeyRoute::ForwardToNvim(seq) => {
+            if let Some(nvim) = state.nvim.as_mut() {
+                nvim.set_ctrl_w_pending(false);
+                nvim.send(NvimCmd::Input(seq));
+            }
+        }
+        nvim_pane::KeyRoute::CtrlWBoundary {
+            dir,
+            hop_left,
+            forward_seq,
+        } => {
+            if let Some(nvim) = state.nvim.as_mut() {
+                nvim.set_ctrl_w_pending(false);
+            }
+            let at_boundary = state
+                .nvim
+                .as_ref()
+                .is_some_and(|nvim| nvim.at_boundary(dir));
+            if at_boundary {
+                if hop_left {
+                    state.dispatch(Msg::PaneLeft);
+                }
+                // At the right boundary already: nothing further right to
+                // hop to -- there's no pane past the file pane.
+            } else if let Some(nvim) = state.nvim.as_ref() {
+                nvim.send(NvimCmd::Input(forward_seq.to_string()));
+            }
+        }
+    }
+    Some(KeyAction::Continue)
 }
 
 /// The notice shown when `Enter`/`d` on a collapsed namespace row is a
@@ -1047,6 +1321,7 @@ mod tests {
             canvas_scroll_x: 0,
             canvas_fold_pending: false,
             comment_target: None,
+            nvim: None,
         }
     }
 
@@ -1160,10 +1435,13 @@ mod tests {
                     frame,
                     &state.app,
                     state.notice.as_deref(),
-                    state.rail_scroll,
-                    state.canvas_scroll,
-                    state.canvas_scroll_x,
+                    render::ScrollOffsets {
+                        rail: state.rail_scroll,
+                        canvas: state.canvas_scroll,
+                        canvas_x: state.canvas_scroll_x,
+                    },
                     state.view_mode,
+                    None,
                 )
             })
             .expect("draw");
