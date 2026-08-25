@@ -125,16 +125,7 @@ impl NvimPane {
     /// trap keyboard focus on this pane, so when in doubt, let the user
     /// out.
     pub fn at_boundary(&self, dir: &str) -> bool {
-        let winnr = |args: Vec<Value>| {
-            self.call(
-                "nvim_call_function",
-                vec![Value::from("winnr"), Value::Array(args)],
-            )
-        };
-        match (winnr(vec![]), winnr(vec![Value::from(dir)])) {
-            (Some(here), Some(there)) => here == there,
-            _ => true,
-        }
+        crate::nvim::vdiff_glue::at_boundary(&self.session, dir, CALL_TIMEOUT)
     }
 
     /// The current buffer's name, straight from nvim (`nvim_buf_get_name`)

@@ -85,6 +85,32 @@ pub fn resolve_diffed_path(buf_name: Option<&str>, cwd: &Path) -> Option<PathBuf
         .map(Path::to_path_buf)
 }
 
+/// Whether the current window is already at nvim's split boundary in
+/// direction `dir` (`"h"` or `"l"`) -- i.e. `winnr()` and `winnr(dir)` agree
+/// there's nowhere further to move. Used to decide whether a `Ctrl-w h`/
+/// `Ctrl-w l` (or the arrow-key aliases) should hop out to the embedder's
+/// own graph pane (at the boundary) or forward into nvim's own split
+/// navigation (not at the boundary, nvim has internal splits to move
+/// between). On *any* failure to get a straight answer -- timeout, RPC
+/// error, dead session -- conservatively reports `true` ("at boundary"): a
+/// wedged-but-not-dead nvim must never be able to trap keyboard focus, so
+/// when in doubt, let the user out. Frontend-neutral (moved out of the GUI's
+/// `crate::ui::nvim_pane::NvimPane`, which now wraps this) so the TUI can
+/// reuse it for its own `Ctrl-w h`/`Ctrl-w l` chord.
+pub fn at_boundary(session: &NvimSession, dir: &str, timeout: Duration) -> bool {
+    let winnr = |args: Vec<Value>| {
+        session.call(
+            "nvim_call_function",
+            vec![Value::from("winnr"), Value::Array(args)],
+            timeout,
+        )
+    };
+    match (winnr(vec![]), winnr(vec![Value::from(dir)])) {
+        (Some(here), Some(there)) => here == there,
+        _ => true,
+    }
+}
+
 /// [`resolve_diffed_path`], falling back to `fallback` (the caller's
 /// cached last-known file, e.g. the GUI's `nvim_current_file`) whenever
 /// that resolves to `None`. Split out from [`trigger_diffsplit`] as its own
