@@ -1579,6 +1579,212 @@ mod tests {
         );
     }
 
+    /// Reproduces the plane-view hjkl soft-lock from the `DynamicBids` /
+    /// `BidConnectors` screenshot report: `App` (no files) -> `PartnerAccounts`
+    /// (drawn, a real backing file) -> `BidConnectors` (a synthetic,
+    /// file-less namespace box) -> `DynamicBids` (drawn) and `DynamicBidsTest`
+    /// (drawn, `is_test_module` via its `Test`-suffixed name, and
+    /// [`crate::graph::test_modules::tested_node_id`]-matched to `DynamicBids`
+    /// since they're same-root siblings named `DynamicBids`/`DynamicBidsTest`)
+    /// -- plus `Partners`, a sibling of `BidConnectors` standing in for "the
+    /// rows below" the user expected `j` to reach.
+    ///
+    /// This is a *second*, distinct mechanism from issue #21 (fixed in
+    /// `crate::graph::plane::is_visible`): [`render::build_plane_view`] feeds
+    /// [`crate::graph::plane::layout`] `app.graph` -- the full, unfiltered
+    /// graph -- rather than `App::visible_graph()`. Once `show_tests` is on,
+    /// `App::visible_graph` (and therefore `App::layers`, which
+    /// `App::is_drawn`/`Msg::FocusSet`'s guard consults) runs matched test
+    /// modules through `group_matched_test_modules`, pruning `DynamicBidsTest`
+    /// out entirely (it's drawn as an attached strip on `DynamicBids`'s own
+    /// box instead of a standalone row) -- but `plane::layout` never sees that
+    /// pruning, so `DynamicBidsTest` still gets a full row in the plane
+    /// layout and `move_focus` still steps onto it. `Msg::FocusSet` then
+    /// rejects that target (not `is_drawn`, not `fold_collapsed`), silently
+    /// leaving focus exactly where it started -- indistinguishable, from the
+    /// keyboard, from hjkl having no candidate at all.
+    fn state_with_matched_test_module_in_a_nested_box() -> TuiState {
+        use crate::graph::model::{FileRef, GitStatus, ModuleNode};
+        use std::path::PathBuf as StdPathBuf;
+
+        let app_ns = NodeId::from("app");
+        let partner_accounts = NodeId::from("partner_accounts");
+        let bid_connectors = NodeId::from("bid_connectors");
+        let dynamic_bids = NodeId::from("dynamic_bids");
+        let dynamic_bids_test = NodeId::from("dynamic_bids_test");
+        let partners = NodeId::from("partners");
+
+        let file = |path: &str| FileRef {
+            path: StdPathBuf::from(path),
+            base_blob: Some("b".to_string()),
+            head_blob: Some("h".to_string()),
+        };
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            app_ns.clone(),
+            ModuleNode {
+                id: app_ns.clone(),
+                display_name: "App".to_string(),
+                parent: None,
+                children: vec![partner_accounts.clone()],
+                status: GitStatus::Unchanged,
+                files: vec![],
+            },
+        );
+        nodes.insert(
+            partner_accounts.clone(),
+            ModuleNode {
+                id: partner_accounts.clone(),
+                display_name: "PartnerAccounts".to_string(),
+                parent: Some(app_ns.clone()),
+                children: vec![bid_connectors.clone(), partners.clone()],
+                status: GitStatus::Unchanged,
+                files: vec![file("partner_accounts.ex")],
+            },
+        );
+        nodes.insert(
+            bid_connectors.clone(),
+            ModuleNode {
+                id: bid_connectors.clone(),
+                display_name: "BidConnectors".to_string(),
+                parent: Some(partner_accounts.clone()),
+                children: vec![dynamic_bids.clone(), dynamic_bids_test.clone()],
+                status: GitStatus::Unchanged,
+                files: vec![],
+            },
+        );
+        nodes.insert(
+            dynamic_bids.clone(),
+            ModuleNode {
+                id: dynamic_bids.clone(),
+                display_name: "DynamicBids".to_string(),
+                parent: Some(bid_connectors.clone()),
+                children: vec![],
+                status: GitStatus::Modified,
+                files: vec![file("dynamic_bids.ex")],
+            },
+        );
+        nodes.insert(
+            dynamic_bids_test.clone(),
+            ModuleNode {
+                id: dynamic_bids_test.clone(),
+                display_name: "DynamicBidsTest".to_string(),
+                parent: Some(bid_connectors.clone()),
+                children: vec![],
+                status: GitStatus::Modified,
+                files: vec![file("dynamic_bids_test.exs")],
+            },
+        );
+        nodes.insert(
+            partners.clone(),
+            ModuleNode {
+                id: partners.clone(),
+                display_name: "Partners".to_string(),
+                parent: Some(partner_accounts.clone()),
+                children: vec![],
+                status: GitStatus::Modified,
+                files: vec![file("partners.ex")],
+            },
+        );
+
+        let graph = ProjectGraph {
+            roots: vec![app_ns],
+            nodes,
+            edges: vec![],
+        };
+        let layers = crate::graph::layers::assign_layers(
+            &crate::graph::test_modules::hide_test_modules(&graph).0,
+        );
+
+        let mut state = state_fixture();
+        state.app.graph = graph;
+        state.app.layers = layers;
+        state.app.focus = dynamic_bids;
+        state
+    }
+
+    #[test]
+    fn plane_mode_hjkl_is_not_soft_locked_by_a_matched_test_module_row() {
+        use crate::core::focus::{move_focus, Direction};
+        use std::collections::VecDeque;
+
+        let mut state = state_with_matched_test_module_in_a_nested_box();
+        let dynamic_bids = NodeId::from("dynamic_bids");
+        let dynamic_bids_test = NodeId::from("dynamic_bids_test");
+        let partners = NodeId::from("partners");
+
+        // Turn tests on: `DynamicBidsTest` is now drawn as a strip on
+        // `DynamicBids`'s own box, not a standalone `App::layers` row.
+        handle_key(&mut state, press('t'));
+        assert!(state.app.show_tests);
+        assert!(
+            !state
+                .app
+                .layers
+                .iter()
+                .any(|layer| layer.contains(&dynamic_bids_test)),
+            "a matched test module must not be `is_drawn` (present in `App::layers`) \
+             once grouped into a strip"
+        );
+        assert_eq!(
+            state.app.focus, dynamic_bids,
+            "DynamicBids is still drawn, so toggling tests must not reseat focus off it"
+        );
+
+        // Before the fix, `build_plane_view` fed `plane::layout` the raw
+        // `app.graph` -- `dynamic_bids_test` (real files, so `is_visible`
+        // accepted it) still got a full plane row despite being pruned from
+        // `app.layers`, so it must be entirely absent from the plane layout
+        // now that `build_plane_view` walks `App::visible_graph()` instead.
+        let (layers, rows) = render::plane_focus_grid(&state.app);
+        let all_rows: std::collections::HashSet<NodeId> =
+            rows.iter().flatten().map(|(id, _)| id.clone()).collect();
+        assert!(
+            !all_rows.contains(&dynamic_bids_test),
+            "a matched-and-grouped test module must not get its own plane row \
+             once it's drawn as a strip instead"
+        );
+        assert!(
+            all_rows.contains(&dynamic_bids),
+            "sanity: DynamicBids itself must still have a plane row"
+        );
+
+        // BFS over `move_focus` (the same function `plane_key_msg` dispatches
+        // hjkl through) from `dynamic_bids` must reach every other plane row,
+        // in particular `partners` -- the "row below" the bug report expected
+        // `j` to reach. Before the fix this could soft-lock on
+        // `dynamic_bids_test`'s now-nonexistent row's old y-slot the same way
+        // issue #21 soft-locked on an unfocusable row.
+        let mut visited: std::collections::HashSet<NodeId> =
+            std::collections::HashSet::from([dynamic_bids.clone()]);
+        let mut queue: VecDeque<NodeId> = VecDeque::from([dynamic_bids.clone()]);
+        while let Some(cur) = queue.pop_front() {
+            for dir in [
+                Direction::Left,
+                Direction::Right,
+                Direction::Up,
+                Direction::Down,
+            ] {
+                let next = move_focus(&layers, &rows, &cur, dir);
+                if visited.insert(next.clone()) {
+                    queue.push_back(next);
+                }
+            }
+        }
+        assert!(
+            visited.contains(&partners),
+            "hjkl starting from DynamicBids must be able to reach Partners, \
+             not soft-lock on DynamicBids forever"
+        );
+
+        // And a real keypress reaches it too, not just `move_focus` in the
+        // abstract.
+        let key = plane_key_stepping_from_to(&state, &dynamic_bids, &partners);
+        handle_key(&mut state, press(key));
+        assert_eq!(state.app.focus, partners);
+    }
+
     #[test]
     fn an_unrelated_key_after_z_clears_the_pending_chord() {
         let mut state = state_with_layered_graph("leaf");

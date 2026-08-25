@@ -1009,16 +1009,32 @@ pub struct PlaneView {
 }
 
 /// Build [`PlaneView`] from `app`'s current fold state: [`plane::layout`]
-/// over `app.graph`/`app.layers`/`app.fold_collapsed`, with
+/// over [`App::visible_graph`]/`app.layers`/`app.fold_collapsed`, with
 /// [`plane_leaf_label`] supplying each leaf/collapsed row's exact text (so
 /// this view's widths and content agree with the rail/canvas views' own
 /// badges), then [`plane_edges::route_edges`] over the result using
 /// [`rail_view::collapse_edges`]'s fold-aware edge list -- the same edge set
 /// [`build_canvas_view`] routes.
+///
+/// [`plane::layout`] gets `App::visible_graph()`, not the raw `app.graph`,
+/// deliberately: `plane::layout`'s own `is_visible`/`focus_set_would_accept`
+/// check is only a correct mirror of `Msg::FocusSet`'s guard (`App::is_drawn`,
+/// which consults `app.layers`) when it's walking the *same* graph
+/// `app.layers` was built from. `app.layers` is always derived from
+/// `App::visible_graph()` (see that method's doc -- it prunes hidden test
+/// modules, or groups matched ones into strips, depending on
+/// `App::show_tests`), so feeding `plane::layout` the raw `app.graph`
+/// instead let a matched-but-grouped test module (real files, so
+/// `is_visible` still accepted it) keep a full plane row that
+/// `Msg::FocusSet` would then reject as a target -- hjkl could walk right up
+/// to that row and permanently soft-lock there, indistinguishable from no
+/// candidate existing at all (same symptom as issue #21, a second distinct
+/// cause).
 pub fn build_plane_view(app: &App) -> PlaneView {
-    let raw_rows = rail_view::visible_rows(&app.graph, &app.layers, &app.fold_collapsed);
-    let labels = rail_view::disambiguated_labels(&app.graph, &raw_rows);
-    let layout = plane::layout(&app.graph, &app.layers, &app.fold_collapsed, |id| {
+    let visible_graph = app.visible_graph();
+    let raw_rows = rail_view::visible_rows(&visible_graph, &app.layers, &app.fold_collapsed);
+    let labels = rail_view::disambiguated_labels(&visible_graph, &raw_rows);
+    let layout = plane::layout(&visible_graph, &app.layers, &app.fold_collapsed, |id| {
         plane_leaf_label(app, id, &labels)
     });
     let edges = rail_view::collapse_edges(&app.graph, &app.graph.edges, &app.fold_collapsed);

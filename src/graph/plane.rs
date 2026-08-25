@@ -930,6 +930,94 @@ mod tests {
         assert!(layout.rows.contains_key(&ns_id));
     }
 
+    /// Reproduces a mismatch [`is_visible`]'s issue-#21 fix does NOT cover:
+    /// `crate::tui::render::build_plane_view` calls this module's [`layout`]
+    /// with `app.graph` (the full, *un-test-pruned* graph -- see
+    /// `App::graph`'s own doc, "never changes -- it's always the full,
+    /// focus-filtered graph") but with `app.layers`, which is instead
+    /// derived from `App::visible_graph()` -- `hide_test_modules`'s pruned
+    /// graph when `show_tests` is off (the default), or
+    /// `group_matched_test_modules`'s pruned graph when it's on (see
+    /// `crate::core::app::toggle_tests`). Both prune functions delegate to
+    /// [`crate::graph::filter::prune`], which deletes the matched test node
+    /// from the graph's `nodes` map outright -- so a matched test module is
+    /// simply absent from `app.layers` (and never in `App::fold_collapsed`
+    /// either). But [`is_visible`]/[`build_item`] only ever consult the
+    /// `graph` argument's own `files`/`children` -- a *separate*, unpruned
+    /// copy in this call shape -- so a test module with a backing file still
+    /// reads as visible and gets an ordinary leaf row here. That row's id
+    /// fails `Msg::FocusSet`'s guard (`App::is_drawn`, which only consults
+    /// `app.layers`) exactly the way issue #21's orphan-namespace row did,
+    /// walling off every row past it in [`focus_grid`]'s single global
+    /// y-ordering -- but `is_visible`'s fix, which only ever reasons about
+    /// one `graph` argument, cannot see this: the bug isn't in what `layout`
+    /// computes from its inputs, it's that its two structural inputs
+    /// (`graph`, `layers`) come from two different prune passes over the
+    /// same underlying graph at the real call site. This test models that
+    /// exact two-graph split without needing `crate::core::app::App` at
+    /// all: `layers_fixture_from` (test-pruned) stands in for `app.layers`,
+    /// `full` (unpruned) stands in for `app.graph`.
+    #[test]
+    fn test_module_pruned_from_layers_but_not_from_graph_gets_an_unfocusable_row() {
+        // `ns` (a drawn namespace with its own file, e.g. `BidConnectors`)
+        // contains `real` (e.g. `DynamicBids`) and `real_test` (e.g.
+        // `DynamicBidsCustomPipelineTest` -- a matched/hidden test module:
+        // present with a backing file in the *full* graph, but that's the
+        // one piece of information `App::visible_graph()`'s test-hiding
+        // pass strips before `app.layers` is computed from it).
+        let (ns_id, mut ns) = namespace("ns", "BidConnectors", None, &["real", "real_test"]);
+        ns.files = vec![FileRef {
+            path: PathBuf::from("ns.rs"),
+            base_blob: None,
+            head_blob: None,
+        }];
+        let (real_id, real) = leaf("real", "DynamicBids", Some("ns"));
+        let (test_id, test_node) = leaf("real_test", "DynamicBidsCustomPipelineTest", Some("ns"));
+
+        let mut nodes = HashMap::new();
+        nodes.insert(ns_id.clone(), ns);
+        nodes.insert(real_id.clone(), real);
+        nodes.insert(test_id.clone(), test_node);
+        let full_graph = ProjectGraph {
+            roots: vec![ns_id.clone()],
+            nodes,
+            edges: vec![],
+        };
+
+        // What `App::layers` would actually hold: `assign_layers` run over
+        // `hide_test_modules`'s pruned graph, i.e. `real_test` never
+        // appears in any layer (mirrors `App::is_drawn`'s own predicate).
+        let (test_pruned_graph, hidden_count) =
+            crate::graph::test_modules::hide_test_modules(&full_graph);
+        assert_eq!(hidden_count, 1, "the fixture's one test module was pruned");
+        let layers_like_app = crate::graph::layers::assign_layers(&test_pruned_graph);
+        let is_drawn_per_app_layers =
+            |id: &NodeId| -> bool { layers_like_app.iter().any(|layer| layer.contains(id)) };
+        assert!(
+            !is_drawn_per_app_layers(&test_id),
+            "sanity: the test module must be absent from the app.layers stand-in"
+        );
+
+        // The real call shape: `layout` gets the *full*, unpruned graph
+        // (standing in for `app.graph`) paired with the test-pruned layers
+        // (standing in for `app.layers`) -- exactly `build_plane_view`'s
+        // `plane::layout(&app.graph, &app.layers, ...)` call.
+        let layout = layout(&full_graph, &layers_like_app, &HashSet::new(), label);
+
+        assert!(
+            layout.rows.contains_key(&test_id),
+            "the test module still gets an ordinary plane row from the unpruned graph"
+        );
+        assert!(
+            !is_drawn_per_app_layers(&test_id),
+            "...but Msg::FocusSet's guard (App::is_drawn via app.layers) would reject that same id"
+        );
+        // This is precisely the unfocusable-row shape: a row `layout`
+        // happily emits that `Msg::FocusSet` can never actually land focus
+        // on, because its two inputs disagree about whether `real_test`
+        // exists at all.
+    }
+
     /// Mirrors `Msg::FocusSet`'s own guard (`App::is_drawn(&id) ||
     /// App::fold_collapsed.contains(&id)`, see `crate::core::app`) without
     /// needing a whole `App`: `App::is_drawn` only ever consults
