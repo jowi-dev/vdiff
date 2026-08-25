@@ -1,9 +1,12 @@
 //! `Ctrl-e` on the file pane: lazygit-style alternate-screen handoff to a
 //! real `nvim +<line> <file>` process, not an embedded `nvim --embed`
-//! session. The GUI's embedded grid (see `crate::nvim`) is deliberately
-//! out of scope for the TUI's phase 1 (issue #16): there's no
-//! `ext_linegrid` rendering here, no RPC session kept alive across frames --
-//! just "get out of the way, run the user's real editor, come back."
+//! session. This predates issue #19's embedded-nvim file/diff panes (see
+//! `crate::tui`'s module doc and `crate::tui::nvim_pane`) and is now the
+//! fallback path only, reached whenever there's no live embedded session
+//! to forward keys to (`--no-nvim`, no `nvim` on `PATH`, a failed spawn,
+//! or a session that died mid-run) -- there's no `ext_linegrid` rendering
+//! here, no RPC session kept alive across frames, just "get out of the
+//! way, run the user's real editor, come back."
 //!
 //! [`suspend_and_run`] leaves the alternate screen and disables raw mode
 //! (so `nvim` gets a normal terminal to draw into, exactly like `lazygit`

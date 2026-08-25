@@ -56,8 +56,9 @@ vdiff --base main      # diff against a specific ref instead of the detected def
 vdiff --tui            # terminal UI instead: a nested 2D graph of the whole change set
 ```
 
-The terminal UI (`--tui`) reuses the same diff/file panes as the GUI, but
-its graph screen has three interchangeable views, cycled with backtick
+The terminal UI (`--tui`) reuses the same diff/file panes as the GUI --
+including the embedded Neovim, on the same `--no-nvim` opt-out -- but its
+graph screen has three interchangeable views, cycled with backtick
 (`` ` ``) in `plane -> canvas -> rail -> plane` order -- all three share the
 same fold-by-namespace "zoom out" mechanic (`h`/`l` in rail mode, `zc`/`zo`
 in canvas/plane mode) and every other binding (`gd`/`gr`, `gt`, `t`, `v`,
@@ -78,9 +79,12 @@ in canvas/plane mode) and every other binding (`gd`/`gr`, `gt`, `t`, `v`,
   namespace directly (no `z` chord).
 
 All three keep vdiff's change sets (usually 15-40 visible modules) readable
-without folding anything by default. It has no embedded Neovim grid;
-`Ctrl-e` on the file pane instead suspends the TUI and hands off to a real
-`nvim` process (lazygit-style), resuming when it exits.
+without folding anything by default. The hand-rolled read-only file viewer
+and unified/side-by-side diff screen, plus `Ctrl-e`'s suspend-and-run
+handoff to a real `nvim` process (lazygit-style, resuming when it exits),
+only come into play as a fallback -- when `--no-nvim` was given, no `nvim`
+binary is on `PATH`, the embedded session failed to spawn, or it died
+mid-run (no auto-respawn; a notice says so).
 
 `--pr <url>` (reviewing a GitHub PR directly) is on the roadmap, not
 available yet.

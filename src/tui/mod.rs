@@ -38,9 +38,15 @@
 //! independent of) the GUI's `crate::ui::eframe_app::DiffLoader`, the
 //! rendering itself ([`render`]), a direct `syntect` ->
 //! `ratatui::style::Style` mapping ([`highlight`]) since there's no
-//! `egui_extras` to route through here, and the lazygit-style real-`nvim`
-//! alternate-screen handoff ([`nvim_handoff`]) -- no embedded `nvim --embed`/
-//! `ext_linegrid` grid; that stays GUI-only.
+//! `egui_extras` to route through here, and (issue #19) an embedded
+//! `nvim --embed`/`ext_linegrid` session ([`nvim_grid`]/[`nvim_pane`])
+//! painted into the file pane exactly like the GUI's, on by default with
+//! the same `--no-nvim`/missing-binary fallback decision as
+//! `crate::main::launch_tui` documents. The lazygit-style real-`nvim`
+//! alternate-screen handoff ([`nvim_handoff`]) predates that and is now the
+//! fallback path only: it still runs `Ctrl-e`/`c`, but only when there is
+//! no live embedded session (`--no-nvim`, no `nvim` on `PATH`, a failed
+//! spawn, or a session that died mid-run -- see [`TuiState::nvim`]'s doc).
 //!
 //! Event-driven, not per-frame polled: [`event_loop`] blocks on
 //! `crossterm::event::poll` and only redraws on an actual state change (a
