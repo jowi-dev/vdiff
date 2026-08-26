@@ -701,25 +701,36 @@ fn expand_focused_namespace(mut app: App) -> (App, Cmd) {
         return (app, Cmd::None);
     }
     let namespace = app.focus.clone();
+    // Walk `App::visible_graph()`, not `app.graph` -- `app.graph` is the
+    // raw, never-test-pruned graph (see its own doc), so a name-first child
+    // that's actually a hidden test module (`App::show_tests == false`,
+    // the default) would still be found there and picked as the re-collapse/
+    // reseat target below. That id then has no row anywhere: it's absent
+    // from `App::layers` (`is_drawn` false -- `assign_layers` runs over the
+    // test-hidden graph) and isn't in `fold_collapsed` either, which is
+    // exactly the shape every hjkl/rail-move path treats as "not found" --
+    // a silent, permanent focus lockout (found in review: expanding a
+    // namespace whose first child alphabetically is a test module loses the
+    // cursor entirely, recoverable only by re-collapsing). `visible_graph()`
+    // has already pruned those children out of `children`/`node` lookups
+    // entirely, so this walk can only ever land on something `is_drawn`/
+    // `fold_collapsed` actually accepts.
+    let visible = app.visible_graph();
     // Reveal exactly one level: re-collapse every immediate child that is
     // itself a namespace (has children of its own), so `namespace`'s direct
     // leaf modules become visible while grandchildren stay hidden behind a
     // freshly-collapsed child-namespace row. See `Msg::ExpandFocusedNamespace`'s
     // doc for why a flat "reveal everything" expand is unusable on a dense
     // change set.
-    if let Some(children) = app.graph.node(&namespace).map(|n| n.children.clone()) {
+    if let Some(children) = visible.node(&namespace).map(|n| n.children.clone()) {
         for child in children {
-            if app
-                .graph
-                .node(&child)
-                .is_some_and(|c| !c.children.is_empty())
-            {
+            if visible.node(&child).is_some_and(|c| !c.children.is_empty()) {
                 app.fold_collapsed.insert(child);
             }
         }
     }
     if let Some(reseated) =
-        rail_view::first_visible_descendant(&app.graph, &namespace, &app.fold_collapsed)
+        rail_view::first_visible_descendant(&visible, &namespace, &app.fold_collapsed)
     {
         app.focus = reseated;
     }
@@ -2315,6 +2326,118 @@ mod tests {
         assert!(app.fold_collapsed.is_empty());
         assert_eq!(app.focus, NodeId::from("leaf1"), "name-first leaf child");
         assert_eq!(cmd, Cmd::None);
+    }
+
+    /// Reproduces the "cursor lost entirely" bug found in review after
+    /// 331621c: `outer` (namespace, collapsed) contains two children,
+    /// `AaaTest` (a test module -- `is_test_module` matches on the
+    /// `Test`-suffixed display name) and `BReal` (an ordinary leaf).
+    /// `AaaTest` sorts first by name, so `first_visible_descendant`'s
+    /// name-first walk picks it -- but `App::visible_graph()` (what
+    /// `App::show_tests == false`, the default, actually draws) prunes
+    /// `AaaTest` out entirely. Before the fix, `expand_focused_namespace`
+    /// called `rail_view::first_visible_descendant(&app.graph, ...)` --
+    /// `app.graph` is the raw, never-test-pruned graph (see its own doc),
+    /// so the walk still finds `AaaTest` there and re-seats `App::focus`
+    /// onto it. `AaaTest` then has no row in `App::layers` (`is_drawn`
+    /// false, per `assign_layers` over the test-hidden graph) and isn't in
+    /// `fold_collapsed` either -- exactly the id shape every hjkl/rail-move
+    /// path (`move_focus`, `rail_focus_move`) treats as "not found",
+    /// silently no-opping in every direction and leaving no row anywhere
+    /// matching `App::focus`, i.e. a total, permanent lockout with no key
+    /// able to recover it (the report's only escape was `zc`, which
+    /// re-collapses `outer` and thus re-seats focus back onto `outer`
+    /// itself via the central fold remap in `update`).
+    #[test]
+    fn expand_focused_namespace_skips_a_name_first_test_module_child() {
+        let outer = NodeId::from("outer");
+        let test_child = NodeId::from("aaa_test");
+        let real_child = NodeId::from("b_real");
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            outer.clone(),
+            ModuleNode {
+                id: outer.clone(),
+                display_name: "outer".to_string(),
+                parent: None,
+                children: vec![test_child.clone(), real_child.clone()],
+                status: GitStatus::Unchanged,
+                files: vec![],
+            },
+        );
+        nodes.insert(
+            test_child.clone(),
+            ModuleNode {
+                id: test_child.clone(),
+                display_name: "AaaTest".to_string(),
+                parent: Some(outer.clone()),
+                children: vec![],
+                status: GitStatus::Unchanged,
+                files: vec![crate::graph::model::FileRef {
+                    path: PathBuf::from("test/aaa_test.rs"),
+                    base_blob: Some("b".to_string()),
+                    head_blob: Some("h".to_string()),
+                }],
+            },
+        );
+        nodes.insert(
+            real_child.clone(),
+            ModuleNode {
+                id: real_child.clone(),
+                display_name: "BReal".to_string(),
+                parent: Some(outer.clone()),
+                children: vec![],
+                status: GitStatus::Unchanged,
+                files: vec![crate::graph::model::FileRef {
+                    path: PathBuf::from("lib/b_real.rs"),
+                    base_blob: Some("b".to_string()),
+                    head_blob: Some("h".to_string()),
+                }],
+            },
+        );
+        let graph = ProjectGraph {
+            roots: vec![outer.clone()],
+            nodes,
+            edges: vec![],
+        };
+
+        // `show_tests` is false (the default) -- `layers`/`rows` are built
+        // from the test-hidden graph, mirroring `build_initial_app`.
+        let visible = hide_test_modules(&graph).0;
+        let result = crate::graph::layout::layout(&visible);
+        let rows = crate::graph::layout::rows_with_x_centers(&result);
+        let mut app = App {
+            graph,
+            layers: result.layers,
+            rows,
+            focus: outer.clone(),
+            screen: Screen::Graph,
+            diff: None,
+            picker: None,
+            show_tests: false,
+            file_view: None,
+            pane: Pane::Graph,
+            viewport_rows: 20,
+            reviewed: HashSet::new(),
+            findings: HashMap::new(),
+            comments: HashMap::new(),
+            fold_collapsed: HashSet::new(),
+        };
+        app.fold_collapsed.insert(outer.clone());
+
+        let (app, _) = update(app, Msg::ExpandFocusedNamespace);
+
+        assert_eq!(
+            app.focus,
+            NodeId::from("b_real"),
+            "must skip the test-pruned name-first child and land on the real one"
+        );
+        assert!(
+            app.is_drawn(&app.focus) || app.fold_collapsed.contains(&app.focus),
+            "post-expand focus {:?} has no row anywhere -- hjkl/rail-move is locked out",
+            app.focus
+        );
     }
 
     #[test]
