@@ -218,47 +218,13 @@ impl NvimPane {
     }
 
     /// Delegate the graph pane's `c`-on-focused-node ("architecture"
-    /// comment) binding to `vdiff.nvim`, the standalone plugin that now
-    /// owns comment capture entirely (compose UI, writing `comments.json`,
-    /// rendering comment extmarks). Runs
-    /// `pcall(require, 'vdiff')`/`v.comment_range(1, 1, {node = node})` via
-    /// `nvim_exec_lua`, blocking (see [`Self::call`]) for the chunk's `true`/
-    /// `false` return so the caller can tell "the plugin handled it" from
-    /// "no such plugin loaded" -- there's no other signal available since
-    /// the plugin owns the compose flow's UI and eventual save entirely on
-    /// its own side now. Returns `false` for a `require` failure, a
-    /// `comment_range`-less `vdiff` module, or an RPC error/timeout alike --
-    /// callers only need "delegated successfully or not", not which of
-    /// those it was.
+    /// comment) binding to `vdiff.nvim` -- see
+    /// [`crate::nvim::vdiff_glue::delegate_comment_node`] for the full
+    /// semantics (what `nvim_exec_lua` chunk runs, and what the returned
+    /// `bool` signals).
     pub fn delegate_comment_node(&self, node: &str) -> bool {
-        let escaped_node = lua_string_literal(node);
-        let chunk = format!(
-            "local ok, v = pcall(require, 'vdiff'); if ok and v.comment_range then v.comment_range(1, 1, {{node = {escaped_node}}}); return true else return false end"
-        );
-        matches!(
-            self.call(
-                "nvim_exec_lua",
-                vec![Value::from(chunk), Value::Array(vec![])]
-            ),
-            Some(Value::Boolean(true))
-        )
+        crate::nvim::vdiff_glue::delegate_comment_node(&self.session, node, CALL_TIMEOUT)
     }
-}
-
-/// Quote `s` as a Lua single-quoted string literal, escaping backslashes,
-/// single quotes, and newlines -- used to splice a vdiff `NodeId` into the
-/// small Lua chunk [`NvimPane::delegate_comment_node`] builds by hand rather
-/// than sending it as an `nvim_exec_lua` vararg (that call's argument is
-/// fixed by the caller, not resolved on the Lua side, so there's no varargs
-/// plumbing to reuse). vdiff `NodeId`s are not attacker-controlled input,
-/// but escaping this cheaply is one line and removes any need to reason
-/// about it.
-fn lua_string_literal(s: &str) -> String {
-    let escaped = s
-        .replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace('\n', "\\n");
-    format!("'{escaped}'")
 }
 
 /// The message shown in place of the grid once nvim has exited (`ZZ`, `:q`,

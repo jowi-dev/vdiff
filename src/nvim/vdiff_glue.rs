@@ -176,6 +176,55 @@ pub fn trigger_diffsplit(
     true
 }
 
+/// Delegate a frontend's "comment on this node" binding (the GUI's
+/// graph-pane `c`-on-focused-node, and eventually the TUI's own) to
+/// `vdiff.nvim`, the standalone plugin that owns comment capture entirely
+/// (compose UI, writing `comments.json`, rendering comment extmarks). Runs
+/// `pcall(require, 'vdiff')`/`v.comment_range(1, 1, {node = node})` via
+/// `nvim_exec_lua`, blocking (see [`NvimSession::call`]) for the chunk's
+/// `true`/`false` return so the caller can tell "the plugin handled it" from
+/// "no such plugin loaded" -- there's no other signal available since the
+/// plugin owns the compose flow's UI and eventual save entirely on its own
+/// side now. Returns `false` for a `require` failure, a `comment_range`-less
+/// `vdiff` module, or an RPC error/timeout alike -- callers only need
+/// "delegated successfully or not", not which of those it was.
+pub fn delegate_comment_node(session: &NvimSession, node: &str, timeout: Duration) -> bool {
+    matches!(
+        session.call(
+            "nvim_exec_lua",
+            vec![Value::from(comment_range_chunk(node)), Value::Array(vec![]),],
+            timeout,
+        ),
+        Some(Value::Boolean(true))
+    )
+}
+
+/// The Lua chunk [`delegate_comment_node`] hands to `nvim_exec_lua`, split
+/// out as its own pure function so it's unit-testable without a spawned
+/// session.
+fn comment_range_chunk(node: &str) -> String {
+    let escaped_node = lua_string_literal(node);
+    format!(
+        "local ok, v = pcall(require, 'vdiff'); if ok and v.comment_range then v.comment_range(1, 1, {{node = {escaped_node}}}); return true else return false end"
+    )
+}
+
+/// Quote `s` as a Lua single-quoted string literal, escaping backslashes,
+/// single quotes, and newlines -- used to splice a vdiff `NodeId` into the
+/// small Lua chunk [`comment_range_chunk`] builds by hand rather than
+/// sending it as an `nvim_exec_lua` vararg (that call's argument is fixed by
+/// the caller, not resolved on the Lua side, so there's no varargs plumbing
+/// to reuse). vdiff `NodeId`s are not attacker-controlled input, but
+/// escaping this cheaply is one line and removes any need to reason about
+/// it.
+fn lua_string_literal(s: &str) -> String {
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n");
+    format!("'{escaped}'")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +305,40 @@ mod tests {
             resolve_diffed_path_with_fallback(None, Path::new("/repo"), None),
             None
         );
+    }
+
+    #[test]
+    fn lua_string_literal_wraps_plain_string_in_single_quotes() {
+        assert_eq!(lua_string_literal("abc"), "'abc'");
+    }
+
+    #[test]
+    fn lua_string_literal_escapes_backslashes() {
+        assert_eq!(lua_string_literal("a\\b"), "'a\\\\b'");
+    }
+
+    #[test]
+    fn lua_string_literal_escapes_single_quotes() {
+        assert_eq!(lua_string_literal("it's"), "'it\\'s'");
+    }
+
+    #[test]
+    fn lua_string_literal_escapes_newlines() {
+        assert_eq!(lua_string_literal("a\nb"), "'a\\nb'");
+    }
+
+    #[test]
+    fn comment_range_chunk_pcall_requires_vdiff() {
+        assert!(comment_range_chunk("node-1").contains("pcall(require, 'vdiff')"));
+    }
+
+    #[test]
+    fn comment_range_chunk_calls_comment_range_with_the_node() {
+        assert!(comment_range_chunk("node-1").contains("v.comment_range(1, 1, {node = 'node-1'})"));
+    }
+
+    #[test]
+    fn comment_range_chunk_escapes_a_node_id_containing_a_single_quote() {
+        assert!(comment_range_chunk("it's").contains("{node = 'it\\'s'}"));
     }
 }
