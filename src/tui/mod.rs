@@ -437,17 +437,18 @@ impl TuiState {
 
     /// Reload `<git_dir>/vdiff/comments.json` and remap it onto
     /// `App::comments`, replacing it wholesale -- the TUI's counterpart of
-    /// `crate::ui::eframe_app::VdiffApp::reload_comments`, run on resume
-    /// from *any* `nvim` handoff (`Ctrl-e` or the `c` comment flow, both via
-    /// [`KeyAction::EditInNvim`]) rather than driven by a live RPC
-    /// notification the way the GUI's embedded session can -- the TUI has
-    /// no embedded session to notify it, so reload-on-resume is the
-    /// simplest thing that actually shows a captured comment's badge
-    /// without a restart (see the issue's own note that "the GUI has live
-    /// refresh; reload-on-resume is enough here"). A read/parse failure is
-    /// logged via [`Self::notice`] (not `eprintln!` -- see that field's
-    /// doc) and leaves the previous badges in place rather than clearing
-    /// them, mirroring the GUI's own failure handling.
+    /// `crate::ui::eframe_app::VdiffApp::reload_comments`, run from two
+    /// triggers. The live one (issue #20): [`event_loop`]'s
+    /// `vdiff_comment_saved` drain, fired once `vdiff.nvim` saves a comment
+    /// composed inside the embedded session, mirroring the GUI's own
+    /// `poll_comment_saved`. The fallback one (issue #17): resume from *any*
+    /// `nvim` handoff (`Ctrl-e` or the `c` comment flow when there's no
+    /// embedded session to delegate to, both via [`KeyAction::EditInNvim`]),
+    /// since a suspended `nvim` process has no RPC channel to notify this
+    /// app over while it's running. A read/parse failure is logged via
+    /// [`Self::notice`] (not `eprintln!` -- see that field's doc) and leaves
+    /// the previous badges in place rather than clearing them, mirroring the
+    /// GUI's own failure handling.
     fn reload_comments(&mut self) {
         let git_dir = self.loader.repo.git_dir();
         match review_store::load(&git_dir) {
@@ -918,7 +919,8 @@ fn event_loop(
             }
         }
         // Issue #19: liveness/resize/`:VdiffDiff`-drain upkeep for the
-        // embedded session, run once per iteration alongside the existing
+        // embedded session (issue #20 adds the `vdiff_comment_saved` drain
+        // below), run once per iteration alongside the existing
         // viewport-size bookkeeping above -- before this frame's draw, so a
         // death detected just now already shows the fallback view/notice on
         // this same frame rather than one iteration late.
@@ -946,6 +948,19 @@ fn event_loop(
             let diff_requested = state.nvim.as_ref().is_some_and(NvimPane::take_diff_request);
             if diff_requested {
                 state.trigger_nvim_diff();
+            }
+            // Issue #20's `vdiff_comment_saved` drain, the TUI counterpart
+            // of the GUI's `VdiffApp::poll_comment_saved`: a comment
+            // composed through `vdiff.nvim` inside this embedded session
+            // fires that rpcnotify, and reloading right here means the
+            // badge shows up on this same frame rather than waiting for a
+            // handoff-resume or some other reload to catch up.
+            if state
+                .nvim
+                .as_ref()
+                .is_some_and(NvimPane::take_comment_saved)
+            {
+                state.reload_comments();
             }
         } else if state.nvim.is_some() && state.app.pane == Pane::File {
             // The fix for the TUI's own `ZZ`-lockup class of bug (mirrors
