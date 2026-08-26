@@ -337,27 +337,7 @@ impl TuiState {
                 }
                 Err(message) => self.dispatch(Msg::FileLoadFailed(message)),
             },
-            Cmd::CommentNode(node) => {
-                // The TUI has no embedded nvim session/compose-UI to run a
-                // comment prompt through the way the GUI's
-                // `crate::ui::eframe_app::VdiffApp::comment_node` does via
-                // the embedded `vdiff.nvim`. Instead (issue #17's companion
-                // fix): hand off to the user's own real `nvim` at the
-                // node's first backing file, same suspend/resume as
-                // `Ctrl-e` (see `nvim_handoff`), so `:VdiffComment` there
-                // captures the comment through the normal flow. `handle_key`
-                // reads this back out via [`Self::comment_target`] right
-                // after this dispatch returns and turns it into
-                // `KeyAction::EditInNvim` -- `execute` itself has no
-                // `Terminal` to suspend/resume with (see `handle_key`'s own
-                // doc on why that split exists already for `Ctrl-e`).
-                match self.comment_nvim_target(&node) {
-                    Some(target) => self.comment_target = Some(target),
-                    None => {
-                        self.notice = Some(FILE_LESS_ROW_NOTICE.to_string());
-                    }
-                }
-            }
+            Cmd::CommentNode(node) => self.comment_node(&node),
             Cmd::PersistReviewState => self.persist_review_state(),
         }
     }
@@ -368,11 +348,67 @@ impl TuiState {
         let git_dir = self.loader.repo.git_dir();
         if let Err(err) = review_store::save_review_state(&git_dir, &self.review_store) {
             // See `Self::notice`'s doc: `eprintln!` would be invisible here,
-            // same reason as `Cmd::CommentNode`'s note above.
+            // same reason every other notice in this file goes through this
+            // field instead.
             self.notice = Some(format!(
                 "warning: failed to save {}: {err}",
                 review_store::review_state_path(&git_dir).display()
             ));
+        }
+    }
+
+    /// `Cmd::CommentNode(node)`: the graph pane's `c` binding on `node`
+    /// (issue #20, mirroring the GUI's `crate::ui::eframe_app::VdiffApp::
+    /// comment_node`). `node` is the focus at the time `c` was pressed (see
+    /// `core/app.rs`'s `Msg::CommentNode` dispatch), the same node
+    /// `Msg::OpenFile` below would open -- so opening the focused node's
+    /// file first and then delegating to `vdiff.nvim` always lands on the
+    /// file the user meant to comment on.
+    ///
+    /// Routes via [`nvim_pane::route_comment`]: a file-less node (a
+    /// collapsed namespace row) always gets [`FILE_LESS_ROW_NOTICE`],
+    /// regardless of whether a session exists. Otherwise, with no embedded
+    /// session this run, falls back to the pre-existing suspend/resume
+    /// handoff (issue #17) exactly as before -- `handle_key` reads
+    /// [`Self::comment_target`] back out right after this dispatch returns
+    /// and turns it into `KeyAction::EditInNvim`; `execute` itself has no
+    /// `Terminal` to suspend/resume with (see `handle_key`'s own doc on why
+    /// that split exists already for `Ctrl-e`). With a session present,
+    /// mirrors [`Self::open_diff_in_nvim`]'s shape: open the node's file
+    /// (`Msg::OpenFile`'s `Cmd::LoadFile` respawns a dead session via
+    /// [`Self::ensure_nvim_session`]), and if that respawn still leaves no
+    /// live session, fall back to the same suspend/resume handoff rather
+    /// than silently doing nothing. Once a live session is confirmed,
+    /// delegate the actual comment-compose flow to `vdiff.nvim` via
+    /// [`NvimPane::delegate_comment_node`] -- this app owns no compose UI or
+    /// `comments.json` writing of its own; that all lives in the plugin,
+    /// which loads inside the embedded session automatically since it runs
+    /// the user's own nvim config. If delegation reports `false` (the
+    /// plugin isn't installed, or the module has no `comment_range`),
+    /// surfaces [`MISSING_COMMENT_PLUGIN_NOTICE`] instead.
+    fn comment_node(&mut self, node: &crate::graph::model::NodeId) {
+        let node_has_files = node_has_files(&self.app, node);
+        match nvim_pane::route_comment(node_has_files, self.nvim.is_some()) {
+            nvim_pane::CommentRoute::FileLessNotice => {
+                self.notice = Some(FILE_LESS_ROW_NOTICE.to_string());
+            }
+            nvim_pane::CommentRoute::Handoff => {
+                self.comment_target = self.comment_nvim_target(node);
+            }
+            nvim_pane::CommentRoute::Nvim => {
+                self.dispatch(Msg::OpenFile);
+                if !self.nvim.as_ref().is_some_and(NvimPane::is_alive) {
+                    self.comment_target = self.comment_nvim_target(node);
+                    return;
+                }
+                let delegated = self
+                    .nvim
+                    .as_ref()
+                    .is_some_and(|nvim| nvim.delegate_comment_node(&node.to_string()));
+                if !delegated {
+                    self.notice = Some(MISSING_COMMENT_PLUGIN_NOTICE.to_string());
+                }
+            }
         }
     }
 
@@ -383,9 +419,13 @@ impl TuiState {
     /// this just opens at the top and lets `:VdiffComment` in the user's
     /// real `nvim` do the rest. `None` if `node` has no backing files (a
     /// collapsed namespace row's own id) or isn't in the graph at all --
-    /// [`Self::execute`] falls back to [`FILE_LESS_ROW_NOTICE`] in that
-    /// case, the same notice `handle_key`'s `Enter`/`d` guards already use
-    /// for the same underlying reason.
+    /// [`Self::comment_node`] only reaches this via
+    /// [`nvim_pane::CommentRoute::Handoff`] (no session) or a failed
+    /// mid-flow respawn under [`nvim_pane::CommentRoute::Nvim`], both of
+    /// which already know `node` has files from
+    /// [`nvim_pane::route_comment`]'s guard, so `None` is unreachable in
+    /// practice there; it stays `Option` rather than `unwrap`ing because
+    /// this is also called with no such guarantee anywhere else.
     fn comment_nvim_target(
         &self,
         node: &crate::graph::model::NodeId,
@@ -1190,6 +1230,15 @@ fn handle_nvim_routed_key(
 /// [`TuiState::notice`]'s doc already solves for `Cmd::CommentNode`.
 const FILE_LESS_ROW_NOTICE: &str = "collapsed namespace has no files -- expand with l";
 
+/// [`TuiState::notice`]'s message when [`TuiState::comment_node`] delegates
+/// to a live embedded session (issue #20) but `vdiff.nvim` isn't loaded
+/// there -- the TUI counterpart of the GUI's one-shot `eprintln!` in
+/// `crate::ui::eframe_app::VdiffApp::comment_node`, but a notice rather than
+/// `eprintln!` since the alternate screen swallows stderr the same way
+/// every other notice in this file already accounts for.
+const MISSING_COMMENT_PLUGIN_NOTICE: &str =
+    "vdiff: commenting requires the vdiff.nvim plugin (github.com/jowi-dev/vdiff.nvim)";
+
 /// Whether `id` has at least one backing file -- mirrors
 /// `crate::core::app`'s own `has_files` guard on `Msg::OpenFile`/
 /// `Msg::OpenDiff` exactly (duplicated rather than exported from `core`,
@@ -1490,6 +1539,21 @@ mod tests {
             }
             other => panic!("expected an nvim handoff, got a different action: {other:?}"),
         }
+    }
+
+    /// Locks in that routing `c` through [`nvim_pane::route_comment`] (issue
+    /// #20) didn't disturb the pre-existing fallback: with no embedded
+    /// session (`state_fixture`/`state_with_namespace_focus`'s `nvim: None`)
+    /// this must still resolve to [`nvim_pane::CommentRoute::Handoff`] and
+    /// nothing else -- in particular, no [`TuiState::notice`], since a
+    /// notice here would mean the routing accidentally fell into
+    /// `CommentRoute::Nvim`'s delegation-failure path instead of the plain
+    /// handoff.
+    #[test]
+    fn pressing_c_with_no_nvim_session_sets_no_notice() {
+        let mut state = state_with_namespace_focus("leaf");
+        handle_key(&mut state, press('c'));
+        assert_eq!(state.notice, None);
     }
 
     /// Issue #17's companion fix: `c` on the file pane (not just the graph

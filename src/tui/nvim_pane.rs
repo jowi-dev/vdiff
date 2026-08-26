@@ -147,6 +147,20 @@ impl NvimPane {
         self.session.take_diff_request()
     }
 
+    /// Whether `vdiff.nvim` saved a comment in this session since the last
+    /// call -- see [`NvimSession::take_comment_saved`].
+    pub fn take_comment_saved(&self) -> bool {
+        self.session.take_comment_saved()
+    }
+
+    /// Delegate the graph pane's `c`-on-focused-node ("architecture"
+    /// comment) binding to `vdiff.nvim` -- see
+    /// [`vdiff_glue::delegate_comment_node`] for the full semantics (what
+    /// `nvim_exec_lua` chunk runs, and what the returned `bool` signals).
+    pub fn delegate_comment_node(&self, node: &str) -> bool {
+        vdiff_glue::delegate_comment_node(&self.session, node, CALL_TIMEOUT)
+    }
+
     /// The diffsplit-against-merge-base flow -- see
     /// [`vdiff_glue::trigger_diffsplit`] for the full semantics.
     /// [`Self::current_file`] is the fallback consulted only when nvim's
@@ -323,6 +337,44 @@ pub fn should_open_diff_in_nvim(
         && pane == Pane::Graph
         && !picker_open
         && !chord_pending
+}
+
+/// One decision [`route_comment`] produces for the graph pane's `c`
+/// (comment on the focused node) binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentRoute {
+    /// Delegate the compose flow to `vdiff.nvim` via
+    /// [`NvimPane::delegate_comment_node`].
+    Nvim,
+    /// Suspend/resume out to the user's own real `nvim` (issue #17's
+    /// handoff), the only option when this run has no embedded session at
+    /// all.
+    Handoff,
+    /// The focused node has no backing files -- the same file-less-row
+    /// notice `Enter`/`d` already use.
+    FileLessNotice,
+}
+
+/// The routing decision for `c` on the focused node, given whether it has
+/// backing files and whether this run has an embedded session at all. Pure,
+/// mirroring [`should_open_diff_in_nvim`]'s shape exactly.
+///
+/// `nvim_present` is deliberately *presence*, not liveness, for the same
+/// reason [`should_open_diff_in_nvim`] treats its own `nvim_present` that
+/// way: `c` is one of the keys that opens the file pane (via
+/// `Msg::OpenFile`), so a session the user quit out of is respawned at that
+/// point (see [`respawn_needed`]) rather than this decision permanently
+/// downgrading the rest of the run to the suspend/resume handoff. The
+/// caller falls back to the handoff anyway if that respawn fails.
+pub fn route_comment(node_has_files: bool, nvim_present: bool) -> CommentRoute {
+    if !node_has_files {
+        return CommentRoute::FileLessNotice;
+    }
+    if nvim_present {
+        CommentRoute::Nvim
+    } else {
+        CommentRoute::Handoff
+    }
 }
 
 #[cfg(test)]
@@ -591,5 +643,27 @@ mod tests {
             false,
             true,
         ));
+    }
+
+    // -- route_comment: graph pane's `c` on a focused node ------------------
+
+    #[test]
+    fn a_file_less_node_always_routes_to_the_notice_with_nvim_present() {
+        assert_eq!(route_comment(false, true), CommentRoute::FileLessNotice);
+    }
+
+    #[test]
+    fn a_file_less_node_always_routes_to_the_notice_without_nvim() {
+        assert_eq!(route_comment(false, false), CommentRoute::FileLessNotice);
+    }
+
+    #[test]
+    fn a_node_with_files_routes_to_nvim_when_a_session_is_present() {
+        assert_eq!(route_comment(true, true), CommentRoute::Nvim);
+    }
+
+    #[test]
+    fn a_node_with_files_routes_to_the_handoff_when_theres_no_session() {
+        assert_eq!(route_comment(true, false), CommentRoute::Handoff);
     }
 }
