@@ -119,6 +119,35 @@ zoom is a 2D-canvas-only concept):
 | `zc` `zo`| Collapse/expand the focused namespace (plane/canvas only)       |
 | `h` `l`  | Collapse/expand the focused row's namespace (rail only)         |
 
+## Tuning your Neovim config for the review pane
+
+The embedded session runs your own config, chrome and all — and a context
+panel or file tree that earns its columns while you're writing code usually
+just squeezes the diff while you're reading one. Two ways to turn things off
+inside vdiff without touching how you edit normally:
+
+```sh
+vdiff --nvim-cmd ContextPanelHide   # one Ex command per flag, repeatable
+```
+
+Or, from your own config, key off the session vdiff announces once it has
+finished setting up (`vim.g.vdiff` is also set, for anything that just wants
+to check). This one is the more reliable of the two if a plugin re-opens its
+window later in the session — you can hide it whenever you need to, not just
+once at startup:
+
+```lua
+vim.api.nvim_create_autocmd("User", {
+  pattern = "VdiffSessionStart",
+  callback = function()
+    vim.cmd("ContextPanelHide")
+  end,
+})
+```
+
+Both run again after every respawn, so quitting a file's session and opening
+the next one doesn't bring the chrome back.
+
 ## Review comments
 
 vdiff itself doesn't capture comments — that's the job of a companion

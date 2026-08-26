@@ -1,6 +1,7 @@
 //! Frontend-neutral glue between an [`NvimSession`] and the
 //! `:VdiffDiff`/`d` diffsplit-against-merge-base flow: registering the
-//! `:VdiffDiff`/`:VdiffDiffOff` commands and the host-channel global,
+//! `:VdiffDiff`/`:VdiffDiffOff` commands, the host-channel global and the
+//! `User VdiffSessionStart` hook a user's own config can key off,
 //! reading the session's actual current buffer, resolving that (or a
 //! caller-supplied fallback) down to a repo-relative path, and sending the
 //! resulting [`NvimCmd::DiffSplit`]. None of this touches egui/eframe or
@@ -16,13 +17,17 @@ use std::time::Duration;
 use rmpv::Value;
 
 use crate::nvim::session::{
-    NvimCmd, NvimSession, HOST_CHANNEL_LUA, VDIFF_DIFF_COMMAND, VDIFF_DIFF_OFF_COMMAND,
+    NvimCmd, NvimSession, HOST_CHANNEL_LUA, SESSION_START_LUA, VDIFF_DIFF_COMMAND,
+    VDIFF_DIFF_OFF_COMMAND,
 };
 
-/// Register `:VdiffDiff`/`:VdiffDiffOff` and set `vim.g.vdiff_host_channel`
-/// in `session` -- fresh children (initial spawn, and every respawn) start
-/// with no user commands or globals at all, so this has to run every time a
-/// session comes up, not just once at startup. The host-channel global is
+/// Register `:VdiffDiff`/`:VdiffDiffOff`, set `vim.g.vdiff_host_channel`,
+/// and announce the session to the user's own config
+/// ([`SESSION_START_LUA`]) in `session` -- fresh children (initial spawn,
+/// and every respawn) start with no user commands or globals at all, so
+/// this has to run every time a session comes up, not just once at
+/// startup, and a `User VdiffSessionStart` hook fires once per session for
+/// the same reason. The host-channel global is
 /// `vdiff.nvim`'s hook back into this embedder (see [`HOST_CHANNEL_LUA`]) --
 /// comment capture itself (`:VdiffComment`, the compose UI, writing
 /// `comments.json`) is that plugin's job, not this app's. Fire-and-forget
@@ -33,6 +38,10 @@ pub fn register_vdiff_commands(session: &NvimSession) {
     session.send(NvimCmd::Ex(VDIFF_DIFF_COMMAND.to_string()));
     session.send(NvimCmd::Ex(VDIFF_DIFF_OFF_COMMAND.to_string()));
     session.send(NvimCmd::ExecLua(HOST_CHANNEL_LUA.to_string()));
+    // Last, so anything hooking `User VdiffSessionStart` can already rely
+    // on the commands and the host channel above existing -- see
+    // [`SESSION_START_LUA`].
+    session.send(NvimCmd::ExecLua(SESSION_START_LUA.to_string()));
 }
 
 /// The current buffer's name, straight from nvim (`nvim_buf_get_name`) --
