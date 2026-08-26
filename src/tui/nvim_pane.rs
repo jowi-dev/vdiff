@@ -74,6 +74,28 @@ impl NvimPane {
         })
     }
 
+    /// Run one `--nvim-cmd` Ex command in this session, blocking up to
+    /// [`CALL_TIMEOUT`] for nvim's reply -- the TUI's counterpart of
+    /// `crate::ui::nvim_pane::NvimPane::run_init_command`, and a
+    /// [`NvimSession::call`] rather than a fire-and-forget
+    /// [`NvimCmd::Ex`] for the same reason: these are *user*-supplied
+    /// commands (a typo'd `:ContextWindowHide`, a command from a plugin
+    /// that isn't installed), so the caller needs to be able to surface the
+    /// failure instead of leaving the user wondering why nothing happened.
+    /// `Err` carries a ready-to-display message.
+    pub fn run_init_command(&self, command: &str) -> Result<(), String> {
+        match self.session.call(
+            "nvim_command",
+            vec![rmpv::Value::from(command)],
+            CALL_TIMEOUT,
+        ) {
+            Some(_) => Ok(()),
+            None => Err(format!(
+                "nvim-cmd '{command}' failed or timed out (no response within {CALL_TIMEOUT:?})"
+            )),
+        }
+    }
+
     /// Whether the underlying session still believes `nvim` is alive (see
     /// [`NvimSession::is_alive`]).
     pub fn is_alive(&self) -> bool {
@@ -260,23 +282,43 @@ pub fn route_key(pane: Pane, nvim_alive: bool, ctrl_w_pending: bool, key: &KeyEv
     }
 }
 
+/// Whether a fresh session needs spawning before the file pane is handed
+/// to nvim: this run has one (nvim mode is on and the initial spawn
+/// succeeded) but the process behind it is gone -- the user `ZZ`'d or
+/// `:q`'d out of it. Pure counterpart of `TuiState::ensure_nvim_session`,
+/// which does the actual respawn; `false` when there was never a session
+/// to begin with (`--no-nvim`, no binary, a failed initial spawn), since
+/// that's this run's standing decision to use the built-in viewers rather
+/// than a session to recover.
+pub fn respawn_needed(present: bool, alive: bool) -> bool {
+    present && !alive
+}
+
 /// Whether the graph pane's `d` binding should open the focused node's file
 /// in nvim plus its diffsplit (the GUI's nvim-mode `d`), instead of
 /// dispatching the hand-rolled `Msg::OpenDiff` full-screen diff view: nvim
-/// alive, on [`crate::core::app::Screen::Graph`]/[`Pane::Graph`] (never
+/// present, on [`crate::core::app::Screen::Graph`]/[`Pane::Graph`] (never
 /// [`Pane::File`] -- that's [`route_key`]'s territory, where `d` forwards to
 /// nvim as `dd`/etc. instead), with no picker or chord mid-flight (so `gd`'s
 /// `d`, or any other multi-key sequence ending in `d`, is untouched). Pure
 /// given the caller's already-extracted state, mirroring the GUI's
 /// `VdiffApp::should_open_nvim_diff` exactly.
+///
+/// `nvim_present` is deliberately *presence*, not liveness (unlike
+/// [`route_key`]'s `nvim_alive`, which must stay liveness -- a dead session
+/// may never swallow a keypress): `d` is one of the two keys that opens the
+/// file pane, so a session the user quit out of is respawned at that point
+/// (see [`respawn_needed`]) rather than permanently downgrading the rest of
+/// the run to the built-in diff view. The caller falls back to the
+/// hand-rolled view anyway if that respawn fails.
 pub fn should_open_diff_in_nvim(
-    nvim_alive: bool,
+    nvim_present: bool,
     screen: crate::core::app::Screen,
     pane: Pane,
     picker_open: bool,
     chord_pending: bool,
 ) -> bool {
-    nvim_alive
+    nvim_present
         && screen == crate::core::app::Screen::Graph
         && pane == Pane::Graph
         && !picker_open
@@ -477,10 +519,27 @@ mod tests {
         assert_eq!(route, KeyRoute::ForwardToNvim("<C-w><C-w>".to_string()));
     }
 
-    // -- should_open_diff_in_nvim: d-interception on/off by aliveness ------
+    // -- respawn_needed -----------------------------------------------------
 
     #[test]
-    fn d_is_intercepted_on_the_graph_pane_when_nvim_is_alive() {
+    fn a_dead_session_needs_a_respawn() {
+        assert!(respawn_needed(true, false));
+    }
+
+    #[test]
+    fn a_live_session_needs_no_respawn() {
+        assert!(!respawn_needed(true, true));
+    }
+
+    #[test]
+    fn a_run_with_no_session_at_all_never_respawns() {
+        assert!(!respawn_needed(false, false));
+    }
+
+    // -- should_open_diff_in_nvim: d-interception on/off by presence -------
+
+    #[test]
+    fn d_is_intercepted_on_the_graph_pane_when_nvim_is_present() {
         assert!(should_open_diff_in_nvim(
             true,
             crate::core::app::Screen::Graph,
@@ -491,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn d_is_not_intercepted_when_nvim_is_dead() {
+    fn d_is_not_intercepted_when_this_run_has_no_nvim_session() {
         assert!(!should_open_diff_in_nvim(
             false,
             crate::core::app::Screen::Graph,

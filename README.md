@@ -83,8 +83,10 @@ without folding anything by default. The hand-rolled read-only file viewer
 and unified/side-by-side diff screen, plus `Ctrl-e`'s suspend-and-run
 handoff to a real `nvim` process (lazygit-style, resuming when it exits),
 only come into play as a fallback -- when `--no-nvim` was given, no `nvim`
-binary is on `PATH`, the embedded session failed to spawn, or it died
-mid-run (no auto-respawn; a notice says so).
+binary is on `PATH`, or the embedded session failed to spawn. Quitting the
+embedded session (`ZZ`, `:q`) is not one of those cases: it returns you to
+the graph, and the next `Enter`/`d` spawns a fresh session (re-running any
+`--nvim-cmd` commands) rather than downgrading the rest of the run.
 
 `--pr <url>` (reviewing a GitHub PR directly) is on the roadmap, not
 available yet.

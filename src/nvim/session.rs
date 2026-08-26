@@ -516,7 +516,9 @@ pub const VDIFF_DIFF_OFF_COMMAND: &str = "command! -bar VdiffDiffOff diffoff! <b
 /// pile-up) or opens a new vertical split left of the current window and
 /// puts it there. `diffthis` in both windows afterward turns on real nvim
 /// diff mode (native `]c`/`[c`, folds, inline highlights) between them.
-/// Cursor ends back in the original (real-file) window.
+/// Cursor ends back in the original (real-file) window, and the two diff
+/// windows are then explicitly sized 50/50 -- see the chunk's own comment
+/// on why that can't be left to nvim's `vsplit` default.
 const DIFF_SPLIT_LUA: &str = r##"
 local path, content = ...
 local bufname = "vdiff-base://" .. path
@@ -556,9 +558,29 @@ else
   vim.cmd("leftabove vsplit")
   vim.api.nvim_win_set_buf(0, buf)
 end
+local base_win = vim.api.nvim_get_current_win()
 vim.cmd("diffthis")
 vim.api.nvim_set_current_win(original_win)
 vim.cmd("diffthis")
+
+-- Split the two diff windows down the middle, *after* the cursor is back
+-- in the real-file window: entering a window is what applies 'winwidth'
+-- (and 'equalalways' only rebalances at split time), so a config with a
+-- generous `winwidth` -- or a session whose UI was still at its 80-column
+-- startup size when the split was made and only got resized to the real
+-- pane width afterwards -- ends up giving nearly the whole pane to
+-- whichever window was current and squeezing the base down to a sliver.
+-- Setting both widths explicitly here is the only placement that survives
+-- both, and a 50/50 side-by-side is the only ratio that makes sense for a
+-- diff. Guarded/`pcall`ed rather than assumed: `winminwidth` can refuse
+-- the shrink, and neither a rejected resize nor a window that vanished
+-- under us (an autocommand closing it) is worth failing the whole chunk
+-- over -- the diff itself is already on screen by this point.
+if vim.api.nvim_win_is_valid(base_win) and base_win ~= original_win then
+  local total = vim.api.nvim_win_get_width(base_win)
+    + vim.api.nvim_win_get_width(original_win)
+  pcall(vim.api.nvim_win_set_width, base_win, math.floor(total / 2))
+end
 "##;
 
 /// Send [`NvimCmd::DiffSplit`] as one `nvim_exec_lua(DIFF_SPLIT_LUA, [path,

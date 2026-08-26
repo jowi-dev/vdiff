@@ -192,6 +192,7 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
                     repo_path,
                     cli.smoke,
                     cli.nvim,
+                    cli.nvim_cmd.clone(),
                     DiffSource { repo, base_oid },
                     review_setup,
                 )
@@ -284,13 +285,17 @@ fn launch_gui(
 /// the same way [`launch_gui`] is: `vdiff::tui` only exists behind the
 /// `tui` feature, so `diff_source` stays a plain [`DiffSource`] at this
 /// call site rather than already being wrapped in
-/// `crate::tui::loader::TuiLoader`.
+/// `crate::tui::loader::TuiLoader`. `nvim_cmd` is `--nvim-cmd`'s Ex
+/// commands, honored here exactly as [`run_gui`] honors them (run after the
+/// initial attach and after every respawn); ignored when nvim mode isn't
+/// active.
 #[cfg(feature = "tui")]
 fn launch_tui(
     graph: ProjectGraph,
     repo_path: &Path,
     smoke: bool,
     want_nvim: bool,
+    nvim_cmd: Vec<String>,
     diff_source: DiffSource,
     review_setup: ReviewSetup,
 ) -> ExitCode {
@@ -332,6 +337,7 @@ fn launch_tui(
         smoke,
         dense_fold_seeded,
         nvim_enabled,
+        nvim_init_cmds: nvim_cmd,
     };
 
     match vdiff::tui::run(app, config) {
@@ -354,6 +360,7 @@ fn launch_tui(
     _repo_path: &Path,
     _smoke: bool,
     _want_nvim: bool,
+    _nvim_cmd: Vec<String>,
     _diff_source: DiffSource,
     _review_setup: ReviewSetup,
 ) -> ExitCode {

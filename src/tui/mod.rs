@@ -46,7 +46,9 @@
 //! alternate-screen handoff ([`nvim_handoff`]) predates that and is now the
 //! fallback path only: it still runs `Ctrl-e`/`c`, but only when there is
 //! no live embedded session (`--no-nvim`, no `nvim` on `PATH`, a failed
-//! spawn, or a session that died mid-run -- see [`TuiState::nvim`]'s doc).
+//! spawn, or -- until the next file open respawns it, see
+//! [`TuiState::ensure_nvim_session`] -- a session the user quit out of;
+//! see [`TuiState::nvim`]'s doc).
 //!
 //! Event-driven, not per-frame polled: [`event_loop`] blocks on
 //! `crossterm::event::poll` and only redraws on an actual state change (a
@@ -64,7 +66,7 @@ pub mod nvim_pane;
 pub mod render;
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -141,12 +143,11 @@ const NVIM_POLL_INTERVAL: Duration = Duration::from_millis(30);
 /// [`TuiState::notice`]'s message when the embedded nvim session dies while
 /// the file pane still has focus (see [`event_loop`]'s liveness check) --
 /// mirrors the GUI's `reclaim_focus_from_dead_nvim` fix for the same `ZZ`-
-/// lockup class of bug, but the TUI has no separate `Msg::PaneLeft`-on-death
-/// path outside this notice: unlike the GUI (which can respawn nvim on the
-/// next file open), the TUI deliberately never auto-respawns (see
-/// [`TuiState::nvim`]'s doc) -- once dead, this run falls back to the
-/// hand-rolled viewers for good.
-const NVIM_DIED_NOTICE: &str = "nvim session ended -- falling back to the built-in viewer";
+/// lockup class of bug. Quitting the session is a normal way to get back to
+/// the graph, not the end of nvim mode for the run: the next `Enter`/`d`
+/// spawns a fresh one (see [`TuiState::ensure_nvim_session`]), so this says
+/// what happened rather than announcing a permanent downgrade.
+const NVIM_DIED_NOTICE: &str = "nvim session ended -- back on the graph (Enter/d starts a new one)";
 
 /// Everything [`run`] needs beyond the already-constructed [`App`]: the IO
 /// loader for `Cmd::LoadDiff`/`Cmd::LoadFile`, the review-completion store/
@@ -178,6 +179,15 @@ pub struct TuiConfig {
     /// falls back to the hand-rolled viewers for the rest of the run, same
     /// as `false` here.
     pub nvim_enabled: bool,
+    /// `--nvim-cmd`'s Ex commands, run in order after the initial spawn and
+    /// after every respawn (see [`TuiState::ensure_nvim_session`]) -- the
+    /// TUI's half of the same flag the GUI already honored. This is how a
+    /// user turns off whatever their own `init.lua` puts on screen that
+    /// only gets in the way inside vdiff's embedded instance (a context
+    /// window, a file tree, a status column), since the embedded session
+    /// deliberately loads their real config rather than `--clean`.
+    /// Ignored (silently) when [`Self::nvim_enabled`] is `false`.
+    pub nvim_init_cmds: Vec<String>,
 }
 
 /// Owns [`App`] and everything [`TuiConfig`] carried in, driving the
@@ -263,13 +273,20 @@ struct TuiState {
     /// otherwise (missing binary, or the spawn itself failing), in which
     /// case every code path in this module falls back to the hand-rolled
     /// file/diff viewers exactly as before this feature existed. Once
-    /// `Some`, stays `Some` even if the underlying process dies later --
-    /// unlike the GUI, this is deliberately never respawned (see the
-    /// crate's own fallback rule); [`event_loop`]'s liveness check just
-    /// bounces focus back to the graph pane with [`NVIM_DIED_NOTICE`] and
-    /// every subsequent [`handle_key`]/render call treats it as absent via
+    /// `Some`, stays `Some` for the rest of the run: a session whose
+    /// process died is replaced in place by the next file open
+    /// ([`Self::ensure_nvim_session`], mirroring the GUI's own
+    /// respawn-on-next-open), and only a respawn that itself fails to spawn
+    /// drops back to `None`/the built-in viewers. Between the death and
+    /// that next open, [`event_loop`]'s liveness check bounces focus back
+    /// to the graph pane with [`NVIM_DIED_NOTICE`] and every
+    /// [`handle_key`]/render call treats the pane as absent via
     /// [`NvimPane::is_alive`].
     nvim: Option<NvimPane>,
+    /// `--nvim-cmd`'s Ex commands (see [`TuiConfig::nvim_init_cmds`]), kept
+    /// for [`Self::ensure_nvim_session`]: a respawned session starts with
+    /// none of them applied, exactly like the initial spawn did.
+    nvim_init_cmds: Vec<String>,
 }
 
 impl TuiState {
@@ -295,6 +312,11 @@ impl TuiState {
             },
             Cmd::LoadFile(node) => match self.loader.load_file_view(&self.app.graph, &node) {
                 Ok(state) => {
+                    // A file open is exactly the moment a session the user
+                    // quit out of should come back -- see
+                    // `Self::ensure_nvim_session`. No-op when the current
+                    // one is still alive.
+                    self.ensure_nvim_session();
                     // Issue #19: mirror the GUI's `VdiffApp::load_file` --
                     // whenever the embedded session is alive, open the same
                     // file it just loaded for the hand-rolled viewer
@@ -442,10 +464,98 @@ impl TuiState {
             self.notice = Some(FILE_LESS_ROW_NOTICE.to_string());
             return KeyAction::Continue;
         }
+        // `Msg::OpenFile`'s own `Cmd::LoadFile` already respawns a dead
+        // session (see `Self::ensure_nvim_session`); this only has to
+        // notice when even that couldn't produce a live one and fall back
+        // to the hand-rolled full-screen diff view -- the same thing `d`
+        // does with nvim mode off entirely, rather than dropping the user
+        // on a plain file view with no diff at all.
         self.dispatch(Msg::OpenFile);
+        if !self.nvim.as_ref().is_some_and(NvimPane::is_alive) {
+            self.dispatch(Msg::OpenDiff);
+            return KeyAction::Continue;
+        }
         self.trigger_nvim_diff();
         KeyAction::Continue
     }
+
+    /// Replace a dead embedded session with a fresh one, in place, sized to
+    /// whatever the old one was last resized to (so the diffsplit it's
+    /// about to be asked for is split against the real pane width, not the
+    /// 80x24 a spawn starts at) and with `:VdiffDiff`/the host channel and
+    /// every [`Self::nvim_init_cmds`] command re-applied -- a new child
+    /// process has none of that. Mirrors the GUI's
+    /// `VdiffApp::respawn_nvim`, and is the fix for quitting the embedded
+    /// session (`ZZ`, `:q`) silently downgrading the rest of the run to the
+    /// built-in viewers: `ZZ` is how a user gets *out* of a file, not a
+    /// statement that they're done with nvim.
+    ///
+    /// Called from the file-open paths only ([`Self::execute`]'s
+    /// `Cmd::LoadFile`, reached by both `Enter` and `d`), never from the
+    /// event loop's own liveness check: a respawn per loop iteration would
+    /// turn an `nvim` that dies immediately on startup (a broken plugin, a
+    /// config error) into a spawn storm, whereas one per keypress is
+    /// self-limiting. A no-op unless [`nvim_pane::respawn_needed`] says
+    /// otherwise; a respawn that itself fails leaves [`Self::nvim`] `None`
+    /// and reports why via [`Self::notice`].
+    fn ensure_nvim_session(&mut self) {
+        if !nvim_pane::respawn_needed(
+            self.nvim.is_some(),
+            self.nvim.as_ref().is_some_and(NvimPane::is_alive),
+        ) {
+            return;
+        }
+        let (cols, rows) = self.nvim.as_ref().map_or((80, 24), NvimPane::size);
+        // Drop the old session (killing/reaping the child) before spawning
+        // the replacement, so two embedded nvims are never live at once.
+        self.nvim = None;
+        match spawn_nvim_pane(&self.repo_root, cols, rows, &self.nvim_init_cmds) {
+            Ok((pane, warning)) => {
+                self.nvim = Some(pane);
+                if let Some(warning) = warning {
+                    self.notice = Some(warning);
+                }
+            }
+            Err(err) => {
+                self.notice = Some(format!("warning: failed to respawn nvim: {err}"));
+            }
+        }
+    }
+}
+
+/// Spawn an embedded session in `cwd` at `cols`x`rows` and bring it up to
+/// the state every session needs: `:VdiffDiff`/`:VdiffDiffOff`/the host
+/// channel (registered by [`NvimPane::spawn`] itself) plus each
+/// `--nvim-cmd` in `init_cmds`, in order. Shared by the initial spawn in
+/// [`run`] and every [`TuiState::ensure_nvim_session`] respawn so the two
+/// can't drift apart -- a respawned session missing the user's init
+/// commands would be a subtly different editor than the one they started
+/// with.
+///
+/// The returned `Option<String>` is a display-ready warning for the *init
+/// commands* (the first one that failed, plus how many did -- the session
+/// itself is perfectly usable without them, so this is a notice, not an
+/// error). `Err` is the spawn itself failing, which leaves the caller with
+/// no session at all. Init-command failures can't use `eprintln!` here the
+/// way the GUI's equivalent does -- see [`TuiState::notice`]'s doc.
+fn spawn_nvim_pane(
+    cwd: &Path,
+    cols: u16,
+    rows: u16,
+    init_cmds: &[String],
+) -> io::Result<(NvimPane, Option<String>)> {
+    let pane = NvimPane::spawn(cwd, cols, rows, || {})?;
+    let mut failures = init_cmds
+        .iter()
+        .filter_map(|cmd| pane.run_init_command(cmd).err());
+    let warning = failures.next().map(|first| {
+        let rest = failures.count();
+        match rest {
+            0 => format!("warning: {first}"),
+            n => format!("warning: {first} (and {n} more --nvim-cmd failure(s))"),
+        }
+    });
+    Ok((pane, warning))
 }
 
 /// What [`event_loop`] should do after [`handle_key`] processes one
@@ -616,8 +726,13 @@ pub fn run(app: App, config: TuiConfig) -> io::Result<()> {
     // resize-debounce (see `NvimPane::maybe_resize`) sends the real size the
     // moment the first frame's terminal size is known.
     let nvim = if config.nvim_enabled {
-        match NvimPane::spawn(&config.repo_root, 80, 24, || {}) {
-            Ok(pane) => Some(pane),
+        match spawn_nvim_pane(&config.repo_root, 80, 24, &config.nvim_init_cmds) {
+            Ok((pane, warning)) => {
+                if let Some(warning) = warning {
+                    notice = Some(warning);
+                }
+                Some(pane)
+            }
             Err(err) => {
                 notice = Some(format!("warning: failed to spawn nvim: {err}"));
                 None
@@ -642,6 +757,7 @@ pub fn run(app: App, config: TuiConfig) -> io::Result<()> {
         canvas_fold_pending: false,
         comment_target: None,
         nvim,
+        nvim_init_cmds: config.nvim_init_cmds,
     };
 
     let result = event_loop(&mut terminal, &mut state, config.smoke);
@@ -768,13 +884,24 @@ fn event_loop(
         // this same frame rather than one iteration late.
         let nvim_alive = state.nvim.as_ref().is_some_and(NvimPane::is_alive);
         if nvim_alive {
-            if state.app.pane == Pane::File {
-                let size = terminal.size()?;
-                let cols = size.width;
-                let rows = render::rail_visible_rows(size.height) as u16;
-                if let Some(nvim) = state.nvim.as_mut() {
-                    nvim.maybe_resize(cols, rows);
-                }
+            // Sized every iteration, not only while the file pane has focus
+            // (which is how this used to work): `d` opens the file *and*
+            // asks for the diffsplit within a single keypress, so a session
+            // still sitting at its 80x24 spawn size when the split is made
+            // splits *that* width in half and then hands nvim's own resize
+            // logic the leftover columns -- which lands them all in one
+            // window, giving the sliver-plus-everything-else layout instead
+            // of the 50/50 diff the split intends (see `DIFF_SPLIT_LUA`'s
+            // own width fix for the other half of this). Keeping the
+            // attached UI at the pane's real size at all times means every
+            // command sent to it is computed against the geometry the user
+            // is actually looking at. `maybe_resize`'s debounce makes this
+            // free when nothing changed.
+            let size = terminal.size()?;
+            let cols = size.width;
+            let rows = render::rail_visible_rows(size.height) as u16;
+            if let Some(nvim) = state.nvim.as_mut() {
+                nvim.maybe_resize(cols, rows);
             }
             let diff_requested = state.nvim.as_ref().is_some_and(NvimPane::take_diff_request);
             if diff_requested {
@@ -784,9 +911,9 @@ fn event_loop(
             // The fix for the TUI's own `ZZ`-lockup class of bug (mirrors
             // the GUI's `reclaim_focus_from_dead_nvim`): a session that died
             // while it still held the file pane must not trap the user
-            // there with no working keys to escape with -- see
-            // `NVIM_DIED_NOTICE`'s doc for why this never tries to
-            // respawn.
+            // there with no working keys to escape with. The respawn itself
+            // deliberately doesn't happen here but on the next file open --
+            // see `TuiState::ensure_nvim_session`'s doc.
             state.notice = Some(NVIM_DIED_NOTICE.to_string());
             state.dispatch(Msg::PaneLeft);
         }
@@ -931,7 +1058,11 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
 
     if input == KeyInput::Char('d')
         && nvim_pane::should_open_diff_in_nvim(
-            nvim_alive,
+            // Presence, not liveness -- `open_diff_in_nvim` respawns a
+            // session the user quit out of, and falls back to the built-in
+            // diff view only if even that fails. See that function's doc
+            // and `should_open_diff_in_nvim`'s own.
+            state.nvim.is_some(),
             state.app.screen,
             state.app.pane,
             state.app.picker.is_some(),
@@ -1328,6 +1459,7 @@ mod tests {
             canvas_fold_pending: false,
             comment_target: None,
             nvim: None,
+            nvim_init_cmds: Vec::new(),
         }
     }
 
