@@ -1547,6 +1547,16 @@ mod tests {
             nodes,
             edges: vec![],
         };
+        // Rebuild `layers`/`rows` from the graph just assigned -- `App`'s
+        // own invariant (see `core::app::update`'s central backstop) is
+        // that `focus` is always `is_drawn` (present in `layers`) or a
+        // `fold_collapsed` entry; leaving `state_fixture`'s empty `layers`
+        // in place here would make `leaf` (a perfectly ordinary drawn node)
+        // fail that invariant purely because this fixture forgot to lay out
+        // the graph it just installed, not because of anything under test.
+        let result = crate::graph::layout::layout(&state.app.graph);
+        state.app.rows = crate::graph::layout::rows_with_x_centers(&result);
+        state.app.layers = result.layers;
         state.app.focus = crate::graph::model::NodeId::from(focus);
         state
     }
@@ -2258,10 +2268,24 @@ mod tests {
         let mut app = state_fixture().app;
         app.graph = graph;
         app.focus = NodeId::from("parent");
+        // A placeholder layer, not a realistic layering -- only its length
+        // matters to `seed_fold_collapsed_if_dense`'s density heuristic
+        // (see `seed_fold_collapsed_if_dense_seeds_top_level_namespaces_when_dense`,
+        // which pins that down directly).
         app.layers = vec![vec![NodeId::from("x"); FOLD_DEFAULT_NODE_THRESHOLD + 1]];
 
         seed_fold_collapsed_if_dense(&mut app);
         assert_eq!(app.fold_collapsed, HashSet::from([NodeId::from("parent")]));
+
+        // Swap in `layers` that actually reflect `app.graph` before
+        // dispatching through `update` -- the placeholder layer above only
+        // existed to drive the density heuristic and was never meant to
+        // stand in for a real layout; `App::focus`'s invariant (see
+        // `update`'s central backstop) requires `layers` to actually
+        // contain whatever `ExpandFocusedNamespace` reseats onto.
+        let result = crate::graph::layout::layout(&app.graph);
+        app.rows = crate::graph::layout::rows_with_x_centers(&result);
+        app.layers = result.layers;
 
         let (app, _) = update(app, Msg::ExpandFocusedNamespace);
         // `parent`'s only child is `leaf`, which has no children of its

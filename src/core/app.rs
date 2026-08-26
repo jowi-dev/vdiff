@@ -480,7 +480,66 @@ pub fn update(app: App, msg: Msg) -> (App, Cmd) {
     if !app.fold_collapsed.is_empty() {
         app.focus = rail_view::effective_row_id(&app.graph, &app.focus, &app.fold_collapsed);
     }
+    // Central backstop for the invariant every individual focus-setting arm
+    // above is supposed to maintain on its own: `App::focus` must satisfy
+    // `is_drawn(&focus) || fold_collapsed.contains(&focus)`, or hjkl and
+    // friends silently and permanently soft-lock (see `App::visible_graph`'s
+    // doc for the bug class -- three prior fixes, plus a fourth found and
+    // fixed alongside this backstop in `follow`, all broke this same
+    // invariant by deriving a focus/navigation candidate from `app.graph`,
+    // the raw never-test-pruned graph, instead of `app.visible_graph()`/
+    // `app.layers`). That history is the case for a structural guard here
+    // rather than trusting the next call site to remember the pattern:
+    // `debug_assert!` fails loudly in dev/test builds (where
+    // `debug_assertions` is on by default, including under `cargo test`)
+    // the moment a new arm reintroduces the bug, rather than waiting for
+    // someone to notice hjkl is dead in a manual pass. Release builds
+    // compile the `debug_assert!` away entirely (its own documented
+    // behavior), so `repair_stray_focus` always runs there instead,
+    // trading a silent focus jump for keeping a real user's session
+    // navigable rather than permanently locked. Run unconditionally, not
+    // gated on `!fold_collapsed.is_empty()` the way the remap above it is:
+    // `is_drawn` alone decides the outcome once `fold_collapsed` is empty
+    // (always true on the GUI path), and an `O(layers)` scan once per
+    // dispatch is negligible next to the layout pass a `Cmd::Relayout`
+    // already re-triggers.
+    //
+    // Both halves skip entirely when `app.layers` is empty: an empty
+    // `layers` means there is genuinely nothing drawn to focus at all (a
+    // wholly empty change set, or -- see `toggle_tests`'s doc -- every node
+    // just got test-hidden), and `main::build_initial_app` already seeds
+    // `focus` with the sentinel `NodeId("")` for exactly that case. That's
+    // a legitimate, self-healing blank state, not a stray focus to flag or
+    // repair -- `reseat_focus` treats an empty `new_layers` the same way,
+    // leaving `focus` untouched rather than inventing a target that
+    // doesn't exist.
+    if !app.layers.is_empty() {
+        debug_assert!(
+            app.is_drawn(&app.focus) || app.fold_collapsed.contains(&app.focus),
+            "App::focus {:?} is neither drawn nor a collapsed namespace after a dispatch -- \
+             a focus-setting arm derived a candidate from app.graph (raw) instead of \
+             app.visible_graph()/app.layers; see App::visible_graph's doc for the bug class",
+            app.focus,
+        );
+        repair_stray_focus(&mut app);
+    }
     (app, cmd)
+}
+
+/// Release-build half of [`update`]'s central invariant backstop (see that
+/// function's doc): if `app.focus` satisfies neither `is_drawn` nor
+/// `fold_collapsed.contains`, reseat it onto the first row of the first
+/// layer -- the same deterministic fallback [`reseat_focus`] falls back to
+/// when it can't find a better answer. Only called when `app.layers` is
+/// non-empty (see the call site's own doc), so `app.layers.first()` always
+/// has a row to offer.
+fn repair_stray_focus(app: &mut App) {
+    if app.is_drawn(&app.focus) || app.fold_collapsed.contains(&app.focus) {
+        return;
+    }
+    if let Some(first) = app.layers.first().and_then(|layer| layer.first()) {
+        app.focus = first.clone();
+    }
 }
 
 /// The per-`Msg` reducer [`update`] wraps with the fold-aware focus remap
@@ -862,12 +921,31 @@ fn reload_file_on_focus_change(app: &App, old_focus: &NodeId) -> Cmd {
 /// Shared handler for [`Msg::FollowDeps`]/[`Msg::FollowDependents`]: look up
 /// `candidates` via `edges_fn`, then no-op/jump/open-picker per how many
 /// there are.
+///
+/// `edges_fn` is called over [`App::visible_graph`], not `app.graph` --
+/// `app.graph` is the raw, never-test-pruned graph (see its own doc), and
+/// `dep_targets`/`dependent_sources` (`crate::core::focus`) walk *every*
+/// edge in whatever graph they're given, with no notion of `show_tests`.
+/// The common real-world shape this guards against: a leaf module with no
+/// production consumers at all, only its own test file depending on it
+/// (`test -> module`, an ordinary import edge) -- `dependent_sources` over
+/// the raw graph would surface that test module as `focus`'s sole
+/// candidate, and the `candidates.len() == 1` arm below jumps straight to
+/// it with no `is_drawn`/`fold_collapsed` check (unlike `Msg::FocusSet`,
+/// which guards explicitly). With `show_tests` off (the default), that test
+/// id has no row anywhere -- absent from `layers` (test-pruned) and never
+/// in `fold_collapsed` (nothing collapsed it) -- silently and permanently
+/// soft-locking `hjkl` (found in review: this is the same bug class fixed
+/// three times already for other call sites -- see `App::visible_graph`'s
+/// doc). `visible_graph()` has already pruned test edges out entirely (see
+/// `crate::graph::filter::prune`), so every candidate `edges_fn` can return
+/// here is guaranteed to be `is_drawn`.
 fn follow(mut app: App, edges_fn: impl Fn(&ProjectGraph, &NodeId) -> Vec<NodeId>) -> (App, Cmd) {
     if !on_graph_with_no_picker_and_graph_pane(&app) {
         return (app, Cmd::None);
     }
     let old_focus = app.focus.clone();
-    let candidates = edges_fn(&app.graph, &app.focus);
+    let candidates = edges_fn(&app.visible_graph(), &app.focus);
     let mut cmd = Cmd::None;
     match candidates.len() {
         0 => {}
@@ -1227,9 +1305,14 @@ mod tests {
 
     #[test]
     fn follow_dependents_zero_candidates_is_noop() {
-        let app = app_at("root");
+        // `leaf_a` has no incoming edges (see `graph_fixture`'s doc) and,
+        // unlike `root`, is an ordinary drawn node -- `App::focus` must
+        // always satisfy `is_drawn`/`fold_collapsed` (see `update`'s central
+        // backstop), so a synthetic file-less node like `root` is never a
+        // legitimate focus value to begin with.
+        let app = app_at("leaf_a");
         let (app, _) = update(app, Msg::FollowDependents);
-        assert_eq!(app.focus, NodeId::from("root"));
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
         assert!(app.picker.is_none());
     }
 
@@ -1263,6 +1346,92 @@ mod tests {
             app.focus,
             NodeId::from("leaf_a"),
             "no jump while picker open"
+        );
+    }
+
+    /// Reproduces the fourth instance of the recurring focus-lockout bug
+    /// class (see `App::visible_graph`'s doc): `follow` (backing
+    /// `Msg::FollowDeps`/`Msg::FollowDependents`) computed its candidates via
+    /// `dep_targets`/`dependent_sources` over `app.graph` -- the raw,
+    /// never-test-pruned graph -- rather than `app.visible_graph()`. A
+    /// module whose *only* dependent is its own test file (a common shape:
+    /// nothing in production code depends on a leaf module, only its test
+    /// does) would surface that test module's id as the single candidate,
+    /// and the `candidates.len() == 1` arm jumps straight to it with no
+    /// `is_drawn`/`fold_collapsed` check at all (unlike `Msg::FocusSet`,
+    /// which guards explicitly). With `show_tests` off (the default), the
+    /// test module has no row anywhere -- not in `layers` (test-pruned) and
+    /// not in `fold_collapsed` (nothing collapsed it) -- so this is bug
+    /// shape (b) from the class doc: total, silent cursor loss, since the
+    /// central fold-aware remap in `update` only fires when
+    /// `fold_collapsed` is non-empty, which it never is here.
+    #[test]
+    fn follow_dependents_does_not_jump_onto_a_hidden_test_module() {
+        let leaf_a = NodeId::from("leaf_a");
+        let leaf_a_test = NodeId::from("leaf_a_test");
+
+        let module = |id: &NodeId, name: &str| ModuleNode {
+            id: id.clone(),
+            display_name: name.to_string(),
+            parent: None,
+            children: vec![],
+            status: GitStatus::Unchanged,
+            files: vec![crate::graph::model::FileRef {
+                path: PathBuf::from(format!("{name}.rs")),
+                base_blob: Some("b".to_string()),
+                head_blob: Some("h".to_string()),
+            }],
+        };
+
+        let mut nodes = HashMap::new();
+        nodes.insert(leaf_a.clone(), module(&leaf_a, "leaf_a"));
+        // Ends with "Test", satisfying `is_test_module` -- the only thing
+        // that "depends on" `leaf_a` in this graph is its own test.
+        nodes.insert(leaf_a_test.clone(), module(&leaf_a_test, "leaf_aTest"));
+
+        let graph = ProjectGraph {
+            roots: vec![leaf_a.clone(), leaf_a_test.clone()],
+            nodes,
+            edges: vec![DepEdge {
+                from: leaf_a_test.clone(),
+                to: leaf_a.clone(),
+                kind: DepKind::Use,
+            }],
+        };
+
+        // Build `layers`/`rows` the way `main::build_initial_app` actually
+        // does: from the test-hidden graph, not the raw one -- `leaf_a_test`
+        // must never appear in either.
+        let visible = hide_test_modules(&graph).0;
+        let visible_layout = crate::graph::layout::layout(&visible);
+        let rows = crate::graph::layout::rows_with_x_centers(&visible_layout);
+
+        let app = App {
+            graph,
+            layers: visible_layout.layers,
+            rows,
+            focus: leaf_a.clone(),
+            screen: Screen::Graph,
+            diff: None,
+            picker: None,
+            show_tests: false,
+            file_view: None,
+            pane: Pane::Graph,
+            viewport_rows: 20,
+            reviewed: HashSet::new(),
+            findings: HashMap::new(),
+            comments: HashMap::new(),
+            fold_collapsed: HashSet::new(),
+        };
+
+        let (app, _) = update(app, Msg::FollowDependents);
+
+        assert_eq!(
+            app.focus, leaf_a,
+            "focus must not jump onto a test module hidden from `layers`; \
+             got {:?}, which is neither drawn nor a collapsed namespace, \
+             permanently soft-locking hjkl",
+            app.focus
         );
     }
 
@@ -2680,7 +2849,15 @@ mod tests {
     fn open_file_noop_on_a_file_less_focused_node() {
         let g = graph_fixture_with_namespace(vec![]);
         let mut app = app_with_graph(g, "outer");
-        app.focus = NodeId::from("ns"); // a synthetic, file-less namespace
+        // A collapsed namespace row -- the one legitimate way `App::focus`
+        // can ever be file-less (see `has_files`'s doc): `is_drawn` is
+        // false for a synthetic namespace, so it must be in
+        // `fold_collapsed` to satisfy `update`'s central focus-invariant
+        // backstop, exactly as the real `--tui` rail view collapse flow
+        // (`collapse_focused_namespace`) always arranges before setting
+        // `focus` to a namespace id.
+        app.fold_collapsed.insert(NodeId::from("ns"));
+        app.focus = NodeId::from("ns");
 
         let (app, cmd) = update(app, Msg::OpenFile);
 
@@ -2692,6 +2869,9 @@ mod tests {
     fn open_diff_noop_on_a_file_less_focused_node() {
         let g = graph_fixture_with_namespace(vec![]);
         let mut app = app_with_graph(g, "outer");
+        // See `open_file_noop_on_a_file_less_focused_node`'s comment: a
+        // collapsed namespace row is the only legitimate file-less focus.
+        app.fold_collapsed.insert(NodeId::from("ns"));
         app.focus = NodeId::from("ns");
 
         let (app, cmd) = update(app, Msg::OpenDiff);
@@ -2709,5 +2889,68 @@ mod tests {
 
         assert_eq!(app.pane, Pane::File);
         assert_eq!(cmd, Cmd::LoadFile(NodeId::from("outer")));
+    }
+
+    // -- Central focus-invariant backstop (`update`'s `repair_stray_focus`) -
+
+    /// Direct unit test of the release-build repair path, bypassing
+    /// `update`'s `debug_assert!` entirely (that assert is exercised
+    /// separately, in a `#[should_panic]` test below, and firing it here
+    /// would abort this test before the repair logic even ran). Simulates
+    /// whatever a *future* bad focus-setting arm would produce: `app.focus`
+    /// pointing at an id that is neither drawn nor collapsed.
+    #[test]
+    fn repair_stray_focus_reseats_onto_the_first_drawn_row() {
+        let g = graph_fixture_with_namespace(vec![]);
+        let mut app = app_with_graph(g, "outer");
+        app.focus = NodeId::from("nonexistent");
+
+        repair_stray_focus(&mut app);
+
+        assert!(app.is_drawn(&app.focus), "must reseat onto a drawn row");
+    }
+
+    /// A focus id that's already valid (drawn) must be left untouched --
+    /// `repair_stray_focus` only kicks in on an actual invariant violation.
+    #[test]
+    fn repair_stray_focus_is_a_noop_for_a_valid_focus() {
+        let g = graph_fixture_with_namespace(vec![]);
+        let mut app = app_with_graph(g, "outer");
+
+        repair_stray_focus(&mut app);
+
+        assert_eq!(app.focus, NodeId::from("outer"));
+    }
+
+    /// A focus id inside `fold_collapsed` counts as valid even though it's
+    /// never `is_drawn` -- mirrors `Msg::FocusSet`'s own guard.
+    #[test]
+    fn repair_stray_focus_is_a_noop_for_a_collapsed_namespace_focus() {
+        let g = graph_fixture_with_namespace(vec![]);
+        let mut app = app_with_graph(g, "outer");
+        app.fold_collapsed.insert(NodeId::from("ns"));
+        app.focus = NodeId::from("ns");
+
+        repair_stray_focus(&mut app);
+
+        assert_eq!(app.focus, NodeId::from("ns"));
+    }
+
+    /// `update`'s `debug_assert!` must fire the moment `App::focus` is
+    /// stray going into a dispatch, regardless of which `Msg` triggered
+    /// it -- proving the backstop catches a violation from *any* source,
+    /// not just the specific `follow` bug it was written alongside.
+    /// `Msg::PaneLeft` is a deliberately focus-irrelevant message: it
+    /// doesn't touch `focus` at all, so this pins down that the assert
+    /// checks the invariant unconditionally after every dispatch, not just
+    /// after focus-setting arms.
+    #[test]
+    #[should_panic(expected = "is neither drawn nor a collapsed namespace")]
+    fn update_debug_asserts_on_a_stray_focus_regardless_of_message() {
+        let g = graph_fixture_with_namespace(vec![]);
+        let mut app = app_with_graph(g, "outer");
+        app.focus = NodeId::from("nonexistent");
+
+        let _ = update(app, Msg::PaneLeft);
     }
 }
