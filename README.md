@@ -123,30 +123,42 @@ zoom is a 2D-canvas-only concept):
 
 The embedded session runs your own config, chrome and all — and a context
 panel or file tree that earns its columns while you're writing code usually
-just squeezes the diff while you're reading one. Two ways to turn things off
-inside vdiff without touching how you edit normally:
+just squeezes the diff while you're reading one. Three ways to turn things
+off inside vdiff without touching how you edit normally, in rough order of
+how well they hold up:
 
-```sh
-vdiff --nvim-cmd ContextPanelHide   # one Ex command per flag, repeatable
+**`g:vdiff`, set before your config runs.** The most reliable one: don't
+start the thing in the first place. Since the flag exists this early, a
+plugin spec can read it directly:
+
+```lua
+require("context-panel").setup({
+  panel = { show_on_startup = not vim.g.vdiff },
+})
 ```
 
-Or, from your own config, key off the session vdiff announces once it has
-finished setting up (`vim.g.vdiff` is also set, for anything that just wants
-to check). This one is the more reliable of the two if a plugin re-opens its
-window later in the session — you can hide it whenever you need to, not just
-once at startup:
+**`User VdiffSessionStart`**, fired once vdiff has finished setting the
+session up — for reacting rather than configuring:
 
 ```lua
 vim.api.nvim_create_autocmd("User", {
   pattern = "VdiffSessionStart",
-  callback = function()
-    vim.cmd("ContextPanelHide")
-  end,
+  callback = function() vim.cmd("ContextPanelHide") end,
 })
 ```
 
-Both run again after every respawn, so quitting a file's session and opening
-the next one doesn't bring the chrome back.
+**`--nvim-cmd`**, one repeatable flag per Ex command, for when you don't want
+to touch your config at all:
+
+```sh
+vdiff --nvim-cmd ContextPanelHide
+```
+
+Note that the last two run right after the session comes up, so a window
+some plugin opens on a timer or a `VimEnter`/`BufEnter` of its own can
+reopen itself a moment after they hide it — that's what `g:vdiff` is for.
+All three apply again after every respawn, so quitting a file's session and
+opening the next one doesn't bring the chrome back.
 
 ## Review comments
 

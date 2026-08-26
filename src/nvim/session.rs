@@ -158,9 +158,10 @@ impl NvimSession {
     /// Spawn `nvim --embed` with `cwd` as its working directory (so
     /// relative paths and the user's project-local config resolve the way
     /// they would from a terminal in that directory -- no `--clean`, the
-    /// user's own `init.lua`/plugins are the point), attach the
-    /// `ext_linegrid` UI at `cols`x`rows`, and start the reader/writer
-    /// threads. `repaint` is called (from the reader thread) every time a
+    /// user's own `init.lua`/plugins are the point) and
+    /// [`VDIFF_FLAG_PRE_COMMAND`] announcing whose session this is *before*
+    /// that config runs, attach the `ext_linegrid` UI at `cols`x`rows`, and
+    /// start the reader/writer threads. `repaint` is called (from the reader thread) every time a
     /// redraw batch's `flush` event lands, so the UI thread knows to paint
     /// the next frame.
     pub fn spawn(
@@ -171,6 +172,7 @@ impl NvimSession {
     ) -> io::Result<Self> {
         let mut child = Command::new("nvim")
             .arg("--embed")
+            .args(["--cmd", VDIFF_FLAG_PRE_COMMAND])
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -615,30 +617,38 @@ fn send_diff_split(
 /// (see [`run_reader`]'s `"vdiff_comment_saved"` handling).
 pub const HOST_CHANNEL_LUA: &str = "vim.g.vdiff_host_channel = 1";
 
+/// Passed to the spawned `nvim` as `--cmd <this>`, so it runs *before* the
+/// user's own config: sets `g:vdiff`, letting that config tell "I'm the
+/// editor inside vdiff's review pane" apart from "I'm a normal editing
+/// session" and set itself up accordingly -- typically not starting
+/// whatever chrome (a context panel, a file tree, a sidebar) earns its
+/// columns while writing code and only squeezes the diff while reading one.
+///
+/// `--cmd` rather than setting the global over RPC once the session is up
+/// (which is what [`SESSION_START_LUA`] does, and why that alone wasn't
+/// enough) because *when* the flag exists is the whole point: config and
+/// plugin setup have all run by the time this embedder can send anything,
+/// so a `vim.g.vdiff` check inside `init.lua` would always see `nil`, and
+/// any panel a plugin opens on a timer/`VimEnter` reopens itself right
+/// after a hook hides it. Set before startup, the same check just works,
+/// and nothing needs to be un-done afterwards.
+pub const VDIFF_FLAG_PRE_COMMAND: &str = "let g:vdiff = 1";
+
 /// Sent (via [`NvimCmd::ExecLua`]) as the last step of bringing a session
 /// up, once `:VdiffDiff`/`:VdiffDiffOff`/[`HOST_CHANNEL_LUA`] are all in
-/// place: sets `vim.g.vdiff` and fires a `User VdiffSessionStart`
-/// autocommand, so a user's own config can tell "I'm the editor inside
-/// vdiff's review pane" apart from "I'm a normal editing session" and adjust
-/// itself accordingly -- typically hiding whatever chrome (a context panel,
-/// a file tree, a sidebar) is useful while writing code and just eats
-/// columns while reading a diff.
-///
-/// This exists because neither of the two obvious alternatives works.
-/// Gating on `vim.g.vdiff` from `init.lua` directly can't: nvim finishes
-/// its own startup -- config included -- before this embedder gets to set
-/// any global, so at config time the flag is always `nil`. And `--nvim-cmd`
-/// (which runs a moment later still) only fires once per session, so
-/// anything the user's own plugins re-open on the first `BufEnter` is back
-/// before they see it. An autocommand the user hooks can respond whenever
-/// they need it to, and the global is there for anything that just wants to
-/// check.
+/// place: fires a `User VdiffSessionStart` autocommand, the "react to it"
+/// half of [`VDIFF_FLAG_PRE_COMMAND`]'s "know about it". A hook here runs
+/// with vdiff's own commands already registered and can fire whenever the
+/// user needs it to, which is what a config-time flag check can't do -- so
+/// the two cover different jobs and both are worth having.
 ///
 /// `modeline = false` because there's no buffer's modeline to process for a
 /// synthetic `User` event, and the payload is deliberately nothing: the
 /// event's meaning is entirely "a vdiff-owned session just came up", and
-/// anything else a hook needs (the channel, the cwd) it can already read.
-pub const SESSION_START_LUA: &str = "vim.g.vdiff = true\nvim.api.nvim_exec_autocmds('User', { pattern = 'VdiffSessionStart', modeline = false })";
+/// anything else a hook needs (the channel, the cwd, `g:vdiff`) it can
+/// already read.
+pub const SESSION_START_LUA: &str =
+    "vim.api.nvim_exec_autocmds('User', { pattern = 'VdiffSessionStart', modeline = false })";
 
 /// Allocate the next msgid and encode+write one msgpack-rpc request:
 /// `[0, msgid, method, params]`, returning the `msgid` used. Most callers
