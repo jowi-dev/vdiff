@@ -2944,6 +2944,15 @@ mod tests {
     /// doesn't touch `focus` at all, so this pins down that the assert
     /// checks the invariant unconditionally after every dispatch, not just
     /// after focus-setting arms.
+    ///
+    /// Gated on `debug_assertions`: the `debug_assert!` this test exercises
+    /// is compiled out entirely in release builds (that's `debug_assert!`'s
+    /// own documented behavior, and `update`'s doc comment above spells out
+    /// why release relies on `repair_stray_focus` instead), so under
+    /// `cargo test --release` nothing panics and this test fails with
+    /// "test did not panic as expected" -- not a regression, just the wrong
+    /// build profile for this assertion to be observable in.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "is neither drawn nor a collapsed namespace")]
     fn update_debug_asserts_on_a_stray_focus_regardless_of_message() {
