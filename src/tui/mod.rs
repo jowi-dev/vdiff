@@ -1381,12 +1381,16 @@ fn canvas_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
 /// `map_key` -- identical in shape to [`canvas_key_msg`] (spatial `h`/`j`/
 /// `k`/`l` over [`move_focus`], `zc`/`zo` fold chord), just fed
 /// [`render::plane_focus_grid`]'s rects instead of the canvas's Sugiyama
-/// band x-centers. Shares [`TuiState::canvas_fold_pending`] with the canvas
-/// view rather than a separate flag -- the two view modes are mutually
-/// exclusive at any given moment (see [`ViewMode`]'s doc), so there's never
-/// a chord in flight for one mode while the other is showing, and
-/// `should_toggle_view_mode`'s backtick handler already clears it on every
-/// mode switch regardless.
+/// band x-centers, and with one addition: `zf` toggles function-level
+/// drill-in ([`Msg::ToggleFunctionDrill`]) on the focused module/function
+/// row's owner. `zf` is plane-view-only -- the canvas/rail views have no
+/// function-row rendering to drill into yet, so `canvas_key_msg` doesn't
+/// accept the `f` completion at all. Shares [`TuiState::canvas_fold_pending`]
+/// with the canvas view rather than a separate flag -- the two view modes
+/// are mutually exclusive at any given moment (see [`ViewMode`]'s doc), so
+/// there's never a chord in flight for one mode while the other is showing,
+/// and `should_toggle_view_mode`'s backtick handler already clears it on
+/// every mode switch regardless.
 fn plane_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
     if state.app.screen != Screen::Graph
         || state.app.pane != Pane::Graph
@@ -1402,6 +1406,11 @@ fn plane_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
         return match input {
             KeyInput::Char('c') => Some(Msg::CollapseFocusedNamespace),
             KeyInput::Char('o') => Some(Msg::ExpandFocusedNamespace),
+            // `zf` is plane-view-only (function-level drill-in has no
+            // canvas/rail counterpart yet -- see `Msg::ToggleFunctionDrill`'s
+            // own doc), so this arm lives here rather than in the
+            // `canvas_key_msg` twin above.
+            KeyInput::Char('f') => Some(Msg::ToggleFunctionDrill),
             _ => None,
         };
     }
@@ -1504,6 +1513,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: std::collections::HashSet::new(),
         };
         TuiState {
             app,
@@ -1948,6 +1959,48 @@ mod tests {
         // (`Msg::CommentNode`), which would have requested an nvim handoff
         // instead.
         assert!(!state.canvas_fold_pending, "chord clears after completing");
+    }
+
+    /// `zf` in plane mode drills the focused module into its function rows
+    /// (`Msg::ToggleFunctionDrill`), and pressing `z`+`f` again un-drills --
+    /// the same round-trip `zc`/`zo` gets in
+    /// `zc_then_zo_collapses_then_expands_in_plane_mode`, just for
+    /// `App::fn_expanded` instead of `App::fold_collapsed`.
+    #[test]
+    fn zf_toggles_function_drill_in_plane_mode() {
+        let mut state = state_with_layered_graph("leaf");
+        assert_eq!(state.view_mode, ViewMode::Plane);
+        state.app.fn_index.functions.insert(
+            NodeId::from("leaf"),
+            vec![crate::graph::functions::FunctionInfo {
+                id: crate::graph::functions::function_node_id(&NodeId::from("leaf"), "f", 0),
+                name: "f".to_string(),
+                arity: 0,
+                start_line: 0,
+                end_line: 1,
+                public: true,
+                changed: true,
+            }],
+        );
+
+        handle_key(&mut state, press('z'));
+        assert!(
+            state.canvas_fold_pending,
+            "z alone should arm the chord, not dispatch anything yet"
+        );
+        handle_key(&mut state, press('f'));
+        assert!(!state.canvas_fold_pending, "chord clears after completing");
+        assert!(
+            state.app.fn_expanded.contains(&NodeId::from("leaf")),
+            "zf should drill the focused module"
+        );
+
+        handle_key(&mut state, press('z'));
+        handle_key(&mut state, press('f'));
+        assert!(
+            !state.app.fn_expanded.contains(&NodeId::from("leaf")),
+            "a second zf should un-drill"
+        );
     }
 
     #[test]

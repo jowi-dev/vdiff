@@ -66,6 +66,8 @@ fn main() {
         findings: HashMap::new(),
         comments: HashMap::new(),
         fold_collapsed: HashSet::new(),
+        fn_index: vdiff::graph::functions::FunctionIndex::default(),
+        fn_expanded: HashSet::new(),
     };
     let seeded = seed_fold_collapsed_if_dense(&mut app);
     eprintln!(

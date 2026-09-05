@@ -157,18 +157,41 @@ enum ItemKind {
     Box(Vec<Item>),
 }
 
+/// Everything [`build_item`]'s recursion threads through, bundled into one
+/// struct purely to keep that function's own argument count sane (clippy's
+/// `too_many_arguments` lint) -- `graph`/`collapsed`/`drilled`/`leaf_layer`
+/// are read-only for the whole walk, `order_cache`/`visible_cache` are the
+/// same per-call memoization tables [`order_key`]/[`is_visible`] already
+/// used before this refactor.
+struct BuildCtx<'a> {
+    graph: &'a ProjectGraph,
+    collapsed: &'a HashSet<NodeId>,
+    drilled: &'a HashMap<NodeId, Vec<(NodeId, String)>>,
+    leaf_layer: HashMap<NodeId, usize>,
+    order_cache: HashMap<NodeId, usize>,
+    visible_cache: HashMap<NodeId, bool>,
+}
+
 /// Lay `graph`'s visible tree out in unbounded, absolute char space. `layers`
 /// is `App::layers` (drawn-leaf-only depth layering, used purely as an
 /// ordering hint -- see the module doc); `collapsed` is `App::fold_collapsed`
-/// (where recursion stops); `leaf_label` returns the exact text a leaf or
-/// collapsed-namespace row should render as (the caller -- `crate::tui::
-/// render` -- is expected to reuse the same status-glyph/badge text the
-/// rail/canvas views already render, so all three views' widths and content
-/// agree; see that module's `plane_leaf_label`).
+/// (where recursion stops); `drilled` is `App::fn_expanded` turned into each
+/// drilled module id's ordered function rows -- `(function row id, exact
+/// label text)`, opaque here, same contract as `leaf_label` -- a module with
+/// an entry (non-empty) renders as a box of function rows instead of a
+/// plain leaf/self-row (see [`build_item`]'s doc); collapsed always wins
+/// over drilled (a folded row never shows its function rows, mirroring the
+/// module doc's "collapsed stops recursion" rule). `leaf_label` returns the
+/// exact text a leaf or collapsed-namespace row should render as (the
+/// caller -- `crate::tui::render` -- is expected to reuse the same
+/// status-glyph/badge text the rail/canvas views already render, so all
+/// three views' widths and content agree; see that module's
+/// `plane_leaf_label`).
 pub fn layout(
     graph: &ProjectGraph,
     layers: &[Vec<NodeId>],
     collapsed: &HashSet<NodeId>,
+    drilled: &HashMap<NodeId, Vec<(NodeId, String)>>,
     leaf_label: impl Fn(&NodeId) -> String,
 ) -> PlaneLayout {
     let leaf_layer: HashMap<NodeId, usize> = layers
@@ -176,17 +199,23 @@ pub fn layout(
         .enumerate()
         .flat_map(|(idx, row)| row.iter().map(move |id| (id.clone(), idx)))
         .collect();
-    let mut order_cache: HashMap<NodeId, usize> = HashMap::new();
-    let mut visible_cache: HashMap<NodeId, bool> = HashMap::new();
+    let mut ctx = BuildCtx {
+        graph,
+        collapsed,
+        drilled,
+        leaf_layer,
+        order_cache: HashMap::new(),
+        visible_cache: HashMap::new(),
+    };
 
     let mut roots = graph.sorted_roots();
-    roots.retain(|id| is_visible(graph, id, collapsed, &mut visible_cache));
+    roots.retain(|id| is_visible(graph, id, collapsed, &mut ctx.visible_cache));
     roots.sort_by(|a, b| {
-        order_key(graph, a, &leaf_layer, &mut order_cache).cmp(&order_key(
+        order_key(graph, a, &ctx.leaf_layer, &mut ctx.order_cache).cmp(&order_key(
             graph,
             b,
-            &leaf_layer,
-            &mut order_cache,
+            &ctx.leaf_layer,
+            &mut ctx.order_cache,
         ))
     });
     // `sort_by` above is a secondary sort layered on top of `sorted_roots`'s
@@ -196,17 +225,7 @@ pub fn layout(
 
     let items: Vec<Item> = roots
         .iter()
-        .map(|id| {
-            build_item(
-                graph,
-                id,
-                collapsed,
-                &leaf_layer,
-                &mut order_cache,
-                &mut visible_cache,
-                &leaf_label,
-            )
-        })
+        .map(|id| build_item(&mut ctx, id, &leaf_label))
         .collect();
     let packed = shelf_pack(items);
 
@@ -300,62 +319,50 @@ fn is_visible(
 /// (recursively built, then shelf-packed) children. Only ever called on an
 /// `id` [`is_visible`] already accepted -- see that function's doc for why
 /// a node failing it must never reach here.
-fn build_item(
-    graph: &ProjectGraph,
-    id: &NodeId,
-    collapsed: &HashSet<NodeId>,
-    leaf_layer: &HashMap<NodeId, usize>,
-    order_cache: &mut HashMap<NodeId, usize>,
-    visible_cache: &mut HashMap<NodeId, bool>,
-    leaf_label: &impl Fn(&NodeId) -> String,
-) -> Item {
-    let is_leaf_like = collapsed.contains(id)
-        || graph
+fn build_item(ctx: &mut BuildCtx, id: &NodeId, leaf_label: &impl Fn(&NodeId) -> String) -> Item {
+    let is_collapsed = ctx.collapsed.contains(id);
+    let is_leaf_like = is_collapsed
+        || ctx
+            .graph
             .node(id)
             .map(|node| node.children.is_empty())
             .unwrap_or(true);
 
     if is_leaf_like {
-        let width = leaf_label(id).chars().count().max(1);
-        return Item {
-            id: id.clone(),
-            rect: Rect {
-                x: 0,
-                y: 0,
-                w: width,
-                h: 1,
-            },
-            kind: ItemKind::Leaf,
-        };
+        let self_item = leaf_item(id, leaf_label);
+        // Collapsed always wins: a collapsed row never drills into function
+        // rows regardless of what `drilled` holds for it (see the module
+        // doc's fold-first precedent -- an expanded ancestor's box never
+        // contains a collapsed descendant's own children either).
+        if !is_collapsed {
+            if let Some(rows) = ctx.drilled.get(id) {
+                if !rows.is_empty() {
+                    let mut child_items = vec![self_item];
+                    child_items.extend(function_leaf_items(rows));
+                    return assemble_box(ctx.graph, id, child_items);
+                }
+            }
+        }
+        return self_item;
     }
 
-    let mut children = graph.sorted_children(id);
+    let mut children = ctx.graph.sorted_children(id);
     // Drop any child that would itself resolve to nothing focusable (see
     // [`is_visible`]'s doc) before recursing -- a namespace whose only
     // children are such orphans must not box them into existence.
-    children.retain(|child| is_visible(graph, child, collapsed, visible_cache));
+    children.retain(|child| is_visible(ctx.graph, child, ctx.collapsed, &mut ctx.visible_cache));
     children.sort_by(|a, b| {
-        order_key(graph, a, leaf_layer, order_cache).cmp(&order_key(
-            graph,
+        order_key(ctx.graph, a, &ctx.leaf_layer, &mut ctx.order_cache).cmp(&order_key(
+            ctx.graph,
             b,
-            leaf_layer,
-            order_cache,
+            &ctx.leaf_layer,
+            &mut ctx.order_cache,
         ))
     });
 
     let mut child_items: Vec<Item> = children
         .iter()
-        .map(|child| {
-            build_item(
-                graph,
-                child,
-                collapsed,
-                leaf_layer,
-                order_cache,
-                visible_cache,
-                leaf_label,
-            )
-        })
+        .map(|child| build_item(ctx, child, leaf_label))
         .collect();
     // A *drawn* namespace (a real module with its own backing file that also
     // has children -- `crate::graph::builder`'s "real defmodule takes
@@ -367,26 +374,70 @@ fn build_item(
     // [`PlaneLayout::rows`] (the self-row) and [`PlaneLayout::boxes`] (the
     // container) -- the two maps are keyed independently, and the renderer
     // paints borders and labels in separate passes.
-    let is_drawn = graph
+    let is_drawn = ctx
+        .graph
         .node(id)
         .map(|node| !node.files.is_empty())
         .unwrap_or(false);
     if is_drawn {
-        let width = leaf_label(id).chars().count().max(1);
-        child_items.insert(
-            0,
-            Item {
-                id: id.clone(),
-                rect: Rect {
-                    x: 0,
-                    y: 0,
-                    w: width,
-                    h: 1,
-                },
-                kind: ItemKind::Leaf,
-            },
-        );
+        child_items.insert(0, leaf_item(id, leaf_label));
+        // A drawn namespace can also be drilled (edge case -- the common
+        // drill target is a childless leaf module, handled above): splice
+        // the function rows in right after the self-row, ahead of the
+        // packed children.
+        if let Some(rows) = ctx.drilled.get(id) {
+            if !rows.is_empty() {
+                for (offset, item) in function_leaf_items(rows).into_iter().enumerate() {
+                    child_items.insert(1 + offset, item);
+                }
+            }
+        }
     }
+    assemble_box(ctx.graph, id, child_items)
+}
+
+/// One label-row [`Item`] for `id`: height 1, width the caller-supplied
+/// label's character count. Shared by the plain-leaf, collapsed-summary,
+/// and drawn-namespace/drilled-module self-row call sites.
+fn leaf_item(id: &NodeId, leaf_label: &impl Fn(&NodeId) -> String) -> Item {
+    let width = leaf_label(id).chars().count().max(1);
+    Item {
+        id: id.clone(),
+        rect: Rect {
+            x: 0,
+            y: 0,
+            w: width,
+            h: 1,
+        },
+        kind: ItemKind::Leaf,
+    }
+}
+
+/// One [`Item::Leaf`] per drilled function row, in the given order --
+/// `rows` is opaque `(function row id, exact label text)`, same contract as
+/// `leaf_label` itself (see [`layout`]'s doc).
+fn function_leaf_items(rows: &[(NodeId, String)]) -> Vec<Item> {
+    rows.iter()
+        .map(|(id, text)| Item {
+            id: id.clone(),
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: text.chars().count().max(1),
+                h: 1,
+            },
+            kind: ItemKind::Leaf,
+        })
+        .collect()
+}
+
+/// Shelf-pack `child_items` (already in desired order) and wrap the result
+/// in `id`'s own box: border+padding margin on every side, sized to fit
+/// both the packed children and a one-line title. Shared by the ordinary
+/// expanded-namespace path and the drilled-leaf/drilled-namespace paths in
+/// [`build_item`] -- box assembly itself doesn't care whether `child_items`
+/// came from real module children, function rows, or both.
+fn assemble_box(graph: &ProjectGraph, id: &NodeId, child_items: Vec<Item>) -> Item {
     let packed = shelf_pack(child_items);
     let (children_w, children_h) = bounding_size(&packed);
 
@@ -657,7 +708,13 @@ mod tests {
             edges: vec![],
         };
 
-        let layout = layout(&g, &layers_fixture(), &HashSet::new(), label);
+        let layout = layout(
+            &g,
+            &layers_fixture(),
+            &HashSet::new(),
+            &HashMap::new(),
+            label,
+        );
 
         let box_rect = *layout.boxes.get(&ns_id).expect("ns renders as a box");
         let self_rect = *layout
@@ -675,10 +732,192 @@ mod tests {
         }
     }
 
+    /// A drilled leaf module (`is_leaf_like`, drawn, no children -- the
+    /// common drill-in target, e.g. a real Elixir module with functions but
+    /// no submodules) renders as a box: self-row first, then one leaf row
+    /// per function, all landing in `layout.rows`, with the box itself
+    /// present in `layout.boxes`/`children_of`.
+    #[test]
+    fn drilled_leaf_module_produces_a_box_of_self_row_plus_function_rows() {
+        let (leaf_id, leaf_node) = leaf("leaf", "Leaf", None);
+        let mut nodes = HashMap::new();
+        nodes.insert(leaf_id.clone(), leaf_node);
+        let g = ProjectGraph {
+            roots: vec![leaf_id.clone()],
+            nodes,
+            edges: vec![],
+        };
+
+        let fn_a = NodeId::from("leaf#a/0");
+        let fn_b = NodeId::from("leaf#b/1");
+        let mut drilled = HashMap::new();
+        drilled.insert(
+            leaf_id.clone(),
+            vec![
+                (fn_a.clone(), "* a/0".to_string()),
+                (fn_b.clone(), "* b/1".to_string()),
+            ],
+        );
+
+        let layout = layout(&g, &[], &HashSet::new(), &drilled, label);
+
+        let box_rect = *layout
+            .boxes
+            .get(&leaf_id)
+            .expect("drilled leaf renders as a box");
+        let self_rect = *layout
+            .rows
+            .get(&leaf_id)
+            .expect("drilled leaf keeps a focusable self-row");
+        let a_rect = *layout.rows.get(&fn_a).expect("function row a is a row");
+        let b_rect = *layout.rows.get(&fn_b).expect("function row b is a row");
+        assert!(box_rect.contains(&self_rect));
+        assert!(box_rect.contains(&a_rect));
+        assert!(box_rect.contains(&b_rect));
+
+        let children = layout
+            .children_of
+            .get(&leaf_id)
+            .expect("drilled leaf's box has a recorded child order");
+        assert_eq!(children[0], leaf_id, "self-row must be first");
+        assert!(children.contains(&fn_a));
+        assert!(children.contains(&fn_b));
+    }
+
+    /// A module with no entry in `drilled` (the common, non-drilled case)
+    /// must render exactly as it did before this feature existed -- a plain
+    /// leaf row, no box.
+    #[test]
+    fn non_drilled_module_is_unaffected() {
+        let g = nested_fixture();
+        let layout = layout(
+            &g,
+            &layers_fixture(),
+            &HashSet::new(),
+            &HashMap::new(),
+            label,
+        );
+        assert!(layout.rows.contains_key(&NodeId::from("a")));
+        assert!(!layout.boxes.contains_key(&NodeId::from("a")));
+    }
+
+    /// Collapsed wins: a collapsed node is never drilled, even if `drilled`
+    /// holds an entry for it -- it must still render as a single summary
+    /// row, not a box of function rows.
+    #[test]
+    fn collapsed_module_ignores_its_drilled_entry() {
+        let (leaf_id, leaf_node) = leaf("leaf", "Leaf", None);
+        let mut nodes = HashMap::new();
+        nodes.insert(leaf_id.clone(), leaf_node);
+        let g = ProjectGraph {
+            roots: vec![leaf_id.clone()],
+            nodes,
+            edges: vec![],
+        };
+        let fn_a = NodeId::from("leaf#a/0");
+        let mut drilled = HashMap::new();
+        drilled.insert(leaf_id.clone(), vec![(fn_a.clone(), "* a/0".to_string())]);
+        let collapsed = HashSet::from([leaf_id.clone()]);
+
+        let layout = layout(&g, &[], &collapsed, &drilled, label);
+
+        assert!(layout.rows.contains_key(&leaf_id));
+        assert!(!layout.boxes.contains_key(&leaf_id));
+        assert!(
+            !layout.rows.contains_key(&fn_a),
+            "collapsed module must not expose its drilled function rows"
+        );
+    }
+
+    /// A drawn *namespace* (has both files and children) that's also
+    /// drilled: function rows are spliced in right after the self-row, and
+    /// still land in `layout.rows` alongside the namespace's real children.
+    #[test]
+    fn drilled_drawn_namespace_gets_function_rows_after_its_self_row() {
+        let (ns_id, mut ns) = namespace("ns", "Ns", None, &["a"]);
+        ns.files = vec![FileRef {
+            path: PathBuf::from("ns.rs"),
+            base_blob: None,
+            head_blob: None,
+        }];
+        let (a_id, a) = leaf("a", "A", Some("ns"));
+        let mut nodes = HashMap::new();
+        nodes.insert(ns_id.clone(), ns);
+        nodes.insert(a_id.clone(), a);
+        let g = ProjectGraph {
+            roots: vec![ns_id.clone()],
+            nodes,
+            edges: vec![],
+        };
+        let fn_x = NodeId::from("ns#x/0");
+        let mut drilled = HashMap::new();
+        drilled.insert(ns_id.clone(), vec![(fn_x.clone(), "* x/0".to_string())]);
+
+        let layout = layout(&g, &[], &HashSet::new(), &drilled, label);
+
+        assert!(layout.rows.contains_key(&ns_id));
+        assert!(layout.rows.contains_key(&fn_x));
+        assert!(layout.rows.contains_key(&a_id));
+        let children = layout.children_of.get(&ns_id).unwrap();
+        assert_eq!(children[0], ns_id, "self-row still first");
+        assert_eq!(
+            children[1], fn_x,
+            "function row inserted right after the self-row"
+        );
+        assert!(children.contains(&a_id));
+    }
+
+    /// [`focus_grid`] must pick up a drilled module's function rows via the
+    /// normal flatten path -- no special-casing needed in `focus_grid`
+    /// itself, just proof the rows really land at distinct `y`s inside the
+    /// module's own box.
+    #[test]
+    fn focus_grid_includes_drilled_function_rows() {
+        let (leaf_id, leaf_node) = leaf("leaf", "Leaf", None);
+        let mut nodes = HashMap::new();
+        nodes.insert(leaf_id.clone(), leaf_node);
+        let g = ProjectGraph {
+            roots: vec![leaf_id.clone()],
+            nodes,
+            edges: vec![],
+        };
+        let fn_a = NodeId::from("leaf#a/0");
+        let fn_b = NodeId::from("leaf#b/1");
+        let mut drilled = HashMap::new();
+        drilled.insert(
+            leaf_id.clone(),
+            vec![
+                (fn_a.clone(), "* a/0".to_string()),
+                (fn_b.clone(), "* b/1".to_string()),
+            ],
+        );
+
+        let layout = layout(&g, &[], &HashSet::new(), &drilled, label);
+        let (layers, rows) = focus_grid(&layout);
+        let all_grid_ids: HashSet<NodeId> = rows
+            .iter()
+            .flat_map(|row| row.iter().map(|(id, _)| id.clone()))
+            .collect();
+        assert!(all_grid_ids.contains(&fn_a));
+        assert!(all_grid_ids.contains(&fn_b));
+        assert!(all_grid_ids.contains(&leaf_id));
+        assert_eq!(
+            layers.iter().map(|l| l.len()).sum::<usize>(),
+            all_grid_ids.len(),
+            "every focus-grid entry should be accounted for exactly once"
+        );
+    }
+
     #[test]
     fn leaf_rows_have_height_one_and_width_matching_the_label() {
         let g = nested_fixture();
-        let layout = layout(&g, &layers_fixture(), &HashSet::new(), label);
+        let layout = layout(
+            &g,
+            &layers_fixture(),
+            &HashSet::new(),
+            &HashMap::new(),
+            label,
+        );
         let a_rect = layout.rows.get(&NodeId::from("a")).expect("a is a row");
         assert_eq!(a_rect.h, 1);
         assert_eq!(a_rect.w, label(&NodeId::from("a")).chars().count());
@@ -687,7 +926,13 @@ mod tests {
     #[test]
     fn expanded_namespace_produces_a_box_strictly_containing_its_children() {
         let g = nested_fixture();
-        let layout = layout(&g, &layers_fixture(), &HashSet::new(), label);
+        let layout = layout(
+            &g,
+            &layers_fixture(),
+            &HashSet::new(),
+            &HashMap::new(),
+            label,
+        );
         let ns_box = layout.boxes.get(&NodeId::from("ns")).expect("ns is a box");
         let a_rect = layout.rows.get(&NodeId::from("a")).expect("a is a row");
         let b_rect = layout.rows.get(&NodeId::from("b")).expect("b is a row");
@@ -705,7 +950,7 @@ mod tests {
     fn collapsed_namespace_renders_as_a_single_row_not_a_box() {
         let g = nested_fixture();
         let collapsed = HashSet::from([NodeId::from("ns")]);
-        let layout = layout(&g, &layers_fixture(), &collapsed, label);
+        let layout = layout(&g, &layers_fixture(), &collapsed, &HashMap::new(), label);
         assert!(layout.rows.contains_key(&NodeId::from("ns")));
         assert!(!layout.boxes.contains_key(&NodeId::from("ns")));
         assert!(!layout.rows.contains_key(&NodeId::from("a")));
@@ -715,7 +960,13 @@ mod tests {
     #[test]
     fn no_two_top_level_rects_overlap() {
         let g = nested_fixture();
-        let layout = layout(&g, &layers_fixture(), &HashSet::new(), label);
+        let layout = layout(
+            &g,
+            &layers_fixture(),
+            &HashSet::new(),
+            &HashMap::new(),
+            label,
+        );
         let ns_box = layout.boxes.get(&NodeId::from("ns")).unwrap();
         let c_rect = layout.rows.get(&NodeId::from("c")).unwrap();
         assert!(!ns_box.overlaps(c_rect));
@@ -724,7 +975,13 @@ mod tests {
     #[test]
     fn no_two_sibling_children_overlap() {
         let g = nested_fixture();
-        let layout = layout(&g, &layers_fixture(), &HashSet::new(), label);
+        let layout = layout(
+            &g,
+            &layers_fixture(),
+            &HashSet::new(),
+            &HashMap::new(),
+            label,
+        );
         let a_rect = layout.rows.get(&NodeId::from("a")).unwrap();
         let b_rect = layout.rows.get(&NodeId::from("b")).unwrap();
         assert!(!a_rect.overlaps(b_rect));
@@ -734,8 +991,8 @@ mod tests {
     fn layout_is_deterministic_across_repeated_calls() {
         let g = nested_fixture();
         let layers = layers_fixture();
-        let first = layout(&g, &layers, &HashSet::new(), label);
-        let second = layout(&g, &layers, &HashSet::new(), label);
+        let first = layout(&g, &layers, &HashSet::new(), &HashMap::new(), label);
+        let second = layout(&g, &layers, &HashSet::new(), &HashMap::new(), label);
         assert_eq!(first, second);
     }
 
@@ -745,7 +1002,13 @@ mod tests {
         // `ns`'s packed child order regardless of name (`a` < `b`
         // alphabetically too here, so also add a name-tiebreak case below).
         let g = nested_fixture();
-        let layout = layout(&g, &layers_fixture(), &HashSet::new(), label);
+        let layout = layout(
+            &g,
+            &layers_fixture(),
+            &HashSet::new(),
+            &HashMap::new(),
+            label,
+        );
         let children = layout.children_of.get(&NodeId::from("ns")).unwrap();
         assert_eq!(children, &vec![NodeId::from("a"), NodeId::from("b")]);
     }
@@ -766,7 +1029,7 @@ mod tests {
         };
         // Both in the same (only) layer -- name must decide the order.
         let layers = vec![vec![NodeId::from("zeta"), NodeId::from("alpha")]];
-        let layout = layout(&g, &layers, &HashSet::new(), label);
+        let layout = layout(&g, &layers, &HashSet::new(), &HashMap::new(), label);
         let children = layout.children_of.get(&ns_id).unwrap();
         assert_eq!(children, &vec![NodeId::from("alpha"), NodeId::from("zeta")]);
     }
@@ -774,7 +1037,13 @@ mod tests {
     #[test]
     fn top_level_items_are_also_ordered_by_layer_then_name() {
         let g = nested_fixture();
-        let layout = layout(&g, &layers_fixture(), &HashSet::new(), label);
+        let layout = layout(
+            &g,
+            &layers_fixture(),
+            &HashSet::new(),
+            &HashMap::new(),
+            label,
+        );
         // `c` is layer 0, `ns`'s minimum descendant layer is `a`'s (layer 0
         // too) -- tie, so name decides: "C" < "Ns"? Compare by node id
         // ordering used through `order_key`/`sorted_roots`; assert the
@@ -814,7 +1083,7 @@ mod tests {
             nodes,
             edges: vec![],
         };
-        let layout = layout(&g, &[], &HashSet::new(), label);
+        let layout = layout(&g, &[], &HashSet::new(), &HashMap::new(), label);
         let mut ys: Vec<usize> = child_ids
             .iter()
             .map(|c| layout.rows.get(&NodeId::from(c.as_str())).unwrap().y)
@@ -834,7 +1103,7 @@ mod tests {
             nodes: HashMap::new(),
             edges: vec![],
         };
-        let layout = layout(&g, &[], &HashSet::new(), label);
+        let layout = layout(&g, &[], &HashSet::new(), &HashMap::new(), label);
         assert!(layout.rows.is_empty());
         assert!(layout.boxes.is_empty());
         assert_eq!(layout.width, 0);
@@ -844,7 +1113,13 @@ mod tests {
     #[test]
     fn focus_grid_groups_same_y_rows_together_ordered_by_x() {
         let g = nested_fixture();
-        let layout = layout(&g, &layers_fixture(), &HashSet::new(), label);
+        let layout = layout(
+            &g,
+            &layers_fixture(),
+            &HashSet::new(),
+            &HashMap::new(),
+            label,
+        );
         let (layers, rows) = focus_grid(&layout);
         assert_eq!(layers.len(), rows.len());
         // `c` sits at the top level alongside `ns`'s own box, not inside any
@@ -889,7 +1164,7 @@ mod tests {
             edges: vec![],
         };
 
-        let layout = layout(&g, &[], &HashSet::new(), label);
+        let layout = layout(&g, &[], &HashSet::new(), &HashMap::new(), label);
 
         assert!(
             !layout.rows.contains_key(&orphan_id),
@@ -926,7 +1201,7 @@ mod tests {
             edges: vec![],
         };
         let collapsed = HashSet::from([ns_id.clone()]);
-        let layout = layout(&g, &[], &collapsed, label);
+        let layout = layout(&g, &[], &collapsed, &HashMap::new(), label);
         assert!(layout.rows.contains_key(&ns_id));
     }
 
@@ -1002,7 +1277,13 @@ mod tests {
         // (standing in for `app.graph`) paired with the test-pruned layers
         // (standing in for `app.layers`) -- exactly `build_plane_view`'s
         // `plane::layout(&app.graph, &app.layers, ...)` call.
-        let layout = layout(&full_graph, &layers_like_app, &HashSet::new(), label);
+        let layout = layout(
+            &full_graph,
+            &layers_like_app,
+            &HashSet::new(),
+            &HashMap::new(),
+            label,
+        );
 
         assert!(
             layout.rows.contains_key(&test_id),
@@ -1069,7 +1350,7 @@ mod tests {
 
         for g in fixtures {
             let collapsed = HashSet::new();
-            let layout = layout(&g, &[], &collapsed, label);
+            let layout = layout(&g, &[], &collapsed, &HashMap::new(), label);
             let (layers, rows) = focus_grid(&layout);
             let all_ids: HashSet<NodeId> = layout.rows.keys().cloned().collect();
             assert!(!all_ids.is_empty(), "fixture must have at least one row");

@@ -1063,16 +1063,99 @@ pub fn build_plane_view(app: &App) -> PlaneView {
     let visible_graph = app.visible_graph();
     let raw_rows = rail_view::visible_rows(&visible_graph, &app.layers, &app.fold_collapsed);
     let labels = rail_view::disambiguated_labels(&visible_graph, &raw_rows);
-    let layout = plane::layout(&visible_graph, &app.layers, &app.fold_collapsed, |id| {
-        plane_leaf_label(app, id, &labels)
-    });
-    let edges = rail_view::collapse_edges(&app.graph, &app.graph.edges, &app.fold_collapsed);
+    let drilled = drilled_functions(app);
+    let layout = plane::layout(
+        &visible_graph,
+        &app.layers,
+        &app.fold_collapsed,
+        &drilled,
+        |id| plane_leaf_label(app, id, &labels),
+    );
+    let mut edges = rail_view::collapse_edges(&app.graph, &app.graph.edges, &app.fold_collapsed);
+    // Function-level static-call edges, appended alongside the existing
+    // module-level edges (never in place of them -- see this function's
+    // caller-facing doc for why v1 keeps both): an edge is included once
+    // either endpoint's owning module is actually drilled in, so
+    // `plane_edges::route_edges`'s own function-id-falls-back-to-owner-row
+    // behavior draws the other, undrilled end at its module's row.
+    edges.extend(drilled_function_edges(app, &drilled));
     let routed = plane_edges::route_edges(&layout, &edges, &app.focus);
     PlaneView {
         layout,
         edges: routed,
         labels,
     }
+}
+
+/// The module -> function-row map [`plane::layout`] needs to render drilled
+/// boxes: every module in [`App::fn_expanded`] that's both actually drawn
+/// (present in `app.layers`, mirroring the private `App::is_drawn` check --
+/// see this module's own scope note on why that's duplicated inline rather
+/// than making `is_drawn` `pub(crate)`) and has at least one row in
+/// [`App::fn_index`], mapped to its rows' `(id, label)` pairs in
+/// [`crate::graph::functions::FunctionIndex::rows_for`]'s existing order.
+/// A stale `fn_expanded` entry (module no longer drawn, or with no
+/// extracted functions) is silently skipped, same "harmless, not an error"
+/// contract [`crate::core::app::toggle_function_drill`]'s own doc
+/// establishes for `fn_expanded` in general.
+fn drilled_functions(app: &App) -> HashMap<NodeId, Vec<(NodeId, String)>> {
+    let mut drilled = HashMap::new();
+    for module in &app.fn_expanded {
+        if !app.layers.iter().any(|layer| layer.contains(module)) {
+            continue;
+        }
+        let Some(rows) = app.fn_index.rows_for(module) else {
+            continue;
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        let entries = rows
+            .iter()
+            .map(|row| (row.id.clone(), function_row_label(row)))
+            .collect();
+        drilled.insert(module.clone(), entries);
+    }
+    drilled
+}
+
+/// One function row's label text: `"<glyph> <name>/<arity>"`, where `<glyph>`
+/// is `~` for a changed function (matching the diff view's own
+/// [`crate::diffing::hunks::LinePair::Changed`] marker/color convention --
+/// see [`draw_diff`]/[`draw_diff_side_by_side`]) or a plain space for an
+/// unchanged neighborhood function. Visibility (`public`/private) is
+/// deliberately not encoded here at all -- the issue explicitly defers that
+/// to a later milestone.
+fn function_row_label(row: &crate::graph::functions::FunctionInfo) -> String {
+    let glyph = if row.changed { '~' } else { ' ' };
+    format!("{glyph} {}/{}", row.name, row.arity)
+}
+
+/// Every [`App::fn_index`] call edge whose caller or callee is owned by a
+/// module in `drilled` -- the function-level edges [`build_plane_view`]
+/// appends to the module-level edge list. `to` is a function id only when
+/// the call resolved function-precise (see
+/// [`crate::graph::functions::FunctionEdge`]'s own doc); otherwise it's
+/// already a module id, so its "owner" is itself.
+fn drilled_function_edges(
+    app: &App,
+    drilled: &HashMap<NodeId, Vec<(NodeId, String)>>,
+) -> Vec<(NodeId, NodeId)> {
+    app.fn_index
+        .edges
+        .iter()
+        .filter(|edge| {
+            let from_owner = crate::graph::functions::function_owner(&edge.from);
+            let to_owner = if crate::graph::functions::is_function_id(&edge.to) {
+                crate::graph::functions::function_owner(&edge.to)
+            } else {
+                Some(edge.to.clone())
+            };
+            from_owner.is_some_and(|owner| drilled.contains_key(&owner))
+                || to_owner.is_some_and(|owner| drilled.contains_key(&owner))
+        })
+        .map(|edge| (edge.from.clone(), edge.to.clone()))
+        .collect()
 }
 
 /// The styled spans for `id`'s label row: [`node_line`] for a plain drawn
@@ -1090,6 +1173,9 @@ fn plane_leaf_spans(
     id: &NodeId,
     labels: &HashMap<NodeId, String>,
 ) -> Vec<Span<'static>> {
+    if let Some(spans) = function_row_spans(app, id) {
+        return spans;
+    }
     let label = labels
         .get(id)
         .cloned()
@@ -1101,6 +1187,37 @@ fn plane_leaf_spans(
     } else {
         node_line(app, id, &label).spans
     }
+}
+
+/// The styled spans for a drilled-in function row, or `None` if `id` isn't a
+/// function id owned by a module [`App::fn_index`] actually has a row for
+/// (a plain module/namespace id falls through to [`plane_leaf_spans`]'s own
+/// [`node_line`]/[`collapsed_row_spans`] handling instead -- [`node_line`]
+/// looks the id up in `app.graph` directly, which a function id was never
+/// going to be found in, so this has to be checked first rather than left as
+/// a silent fallback). Styled to match the house "changed" convention
+/// ([`draw_diff`]/[`draw_diff_side_by_side`]'s `~`-marked
+/// `LinePair::Changed` lines, `Color::Yellow`, the same color
+/// [`status_color`] gives a plain [`GitStatus::Modified`] node) for a
+/// changed function, or [`BOX_BORDER_DIM`]'s `Color::DarkGray` for an
+/// unchanged neighborhood function -- dimmed rather than left full-bright,
+/// so a drilled box's handful of actually-interesting rows still stand out
+/// among whatever unchanged callers/callees came along for static-call
+/// context. Visibility (`public`/private) is deliberately not styled at all
+/// here either -- see [`function_row_label`]'s doc.
+fn function_row_spans(app: &App, id: &NodeId) -> Option<Vec<Span<'static>>> {
+    let owner = crate::graph::functions::function_owner(id)?;
+    let row = app
+        .fn_index
+        .rows_for(&owner)?
+        .iter()
+        .find(|row| &row.id == id)?;
+    let style = if row.changed {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Some(vec![Span::styled(function_row_label(row), style)])
 }
 
 /// The plain-text content of [`plane_leaf_spans`] -- what [`build_plane_view`]
@@ -1638,7 +1755,7 @@ fn draw_legend(
                             .to_string()
                     }
                     ViewMode::Plane => {
-                        "` canvas  h/j/k/l move  zc/zo fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
+                        "` canvas  h/j/k/l move  zc/zo fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  zf fns  q quit"
                             .to_string()
                     }
                 };
@@ -1653,6 +1770,18 @@ fn draw_legend(
                             "  (+{dropped_edges} edges hidden — move focus to reveal)"
                         )),
                     }
+                }
+                // A drilled module is only ever visible on the plane view,
+                // so this note is plane-only too -- gated on `fn_expanded`
+                // being non-empty at all rather than re-deriving whether a
+                // drilled module is *currently drawn* (the cheap check
+                // `build_plane_view`'s own `drilled_functions` does): a
+                // false positive here (drilled-but-scrolled-off-screen) is
+                // harmless, whereas re-deriving it would mean this legend
+                // function needing `app.layers`/`app.fn_index` reasoning
+                // that's already `build_plane_view`'s job.
+                if view_mode == ViewMode::Plane && !app.fn_expanded.is_empty() {
+                    hint.push_str("  (functions: static calls only)");
                 }
                 hint
             }
@@ -1787,6 +1916,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: std::collections::HashSet::new(),
         }
     }
 
@@ -1978,6 +2109,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: std::collections::HashSet::new(),
         };
         let text = render_to_string(&app);
         assert!(
@@ -2014,6 +2147,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: collapsed,
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: std::collections::HashSet::new(),
         };
         let text = render_to_string(&app);
         assert!(text.contains("modules"), "expected the fold summary text");
@@ -2376,6 +2511,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: std::collections::HashSet::new(),
         }
     }
 
@@ -2531,6 +2668,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: std::collections::HashSet::new(),
         }
     }
 
@@ -2943,7 +3082,12 @@ mod tests {
     fn plane_legend_shows_edges_hidden_hint_when_the_budget_trips() {
         let dropped_edges = 5;
         let app = app_for_plane(diamond_graph_fixture(), "child");
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        // Wide enough that the (longer, post-`zf`) hint line doesn't word-wrap
+        // its trailing "+N edges" segment across two buffer rows -- this test
+        // only cares about the hint's *content*, not its wrapping, and
+        // `buffer_text` joins rows without a separating space, so a wrap
+        // mid-phrase would otherwise break the substring match below.
+        let mut terminal = Terminal::new(TestBackend::new(220, 24)).expect("test backend");
         terminal
             .draw(|frame| {
                 let area = frame.area();
@@ -2958,6 +3102,87 @@ mod tests {
         assert!(
             text.contains("hidden") || text.contains("reveal"),
             "expected the plane-specific wording, got: {text}"
+        );
+    }
+
+    /// Milestone 6's real wiring: a module in [`App::fn_expanded`] with
+    /// [`App::fn_index`] rows renders as a box containing its function rows
+    /// (rather than [`build_plane_view`]'s old empty-`drilled`-map stub),
+    /// and the legend picks up the "static calls only" caveat.
+    #[test]
+    fn plane_graph_shows_drilled_function_rows_and_legend_note() {
+        use crate::graph::functions::{function_node_id, FunctionInfo};
+
+        let child = NodeId::from("child");
+        let mut app = app_for_plane(diamond_graph_fixture(), "child");
+        app.fn_index.functions.insert(
+            child.clone(),
+            vec![
+                FunctionInfo {
+                    id: function_node_id(&child, "changed_fn", 0),
+                    name: "changed_fn".to_string(),
+                    arity: 0,
+                    start_line: 0,
+                    end_line: 1,
+                    public: true,
+                    changed: true,
+                },
+                FunctionInfo {
+                    id: function_node_id(&child, "quiet_fn", 1),
+                    name: "quiet_fn".to_string(),
+                    arity: 1,
+                    start_line: 2,
+                    end_line: 3,
+                    public: false,
+                    changed: false,
+                },
+            ],
+        );
+        app.fn_expanded.insert(child);
+
+        let text = render_plane_to_string(&app, 80, 24, 0, 0);
+        assert!(
+            text.contains("changed_fn/0"),
+            "missing changed function row, got:\n{text}"
+        );
+        assert!(
+            text.contains("quiet_fn/1"),
+            "missing unchanged function row, got:\n{text}"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_legend(frame, area, &app, None, 0, ViewMode::Plane)
+            })
+            .expect("draw");
+        let legend = buffer_text(terminal.backend().buffer());
+        assert!(
+            legend.contains("static calls only"),
+            "expected the static-calls-only caveat once a module is drilled, got:\n{legend}"
+        );
+    }
+
+    /// The counterpart to the above: with `fn_expanded` empty (nothing
+    /// drilled), the plane view renders exactly as it did before milestone
+    /// 6 -- no function rows, no legend caveat.
+    #[test]
+    fn plane_graph_with_no_drilled_modules_renders_unchanged() {
+        let app = app_for_plane(diamond_graph_fixture(), "child");
+        assert!(app.fn_expanded.is_empty());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_legend(frame, area, &app, None, 0, ViewMode::Plane)
+            })
+            .expect("draw");
+        let legend = buffer_text(terminal.backend().buffer());
+        assert!(
+            !legend.contains("static calls only"),
+            "no module is drilled, so the caveat must not appear, got:\n{legend}"
         );
     }
 

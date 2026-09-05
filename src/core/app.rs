@@ -150,6 +150,34 @@ pub struct App {
     /// [`crate::core::rail_view`] function is the identity transform when
     /// this is empty, so its presence has no GUI-visible effect.
     pub fold_collapsed: HashSet<NodeId>,
+    /// Sidecar function-level data (see [`crate::graph::functions`]'s module
+    /// doc): every extracted function/method, grouped by the id of the
+    /// module that owns it, plus every resolved static call edge between
+    /// them. Built once at startup (`main::build_initial_app`, from
+    /// [`crate::pipeline::functions::build_function_index`] run over the
+    /// same graph `App::graph` holds) and never mutated afterwards --
+    /// `core` only ever reads it, via [`App::focus_acceptable`] and the
+    /// `--tui` plane view's row-building (issue #6 milestone 4). Falls back
+    /// to [`crate::graph::functions::FunctionIndex::default`] (empty) if
+    /// extraction failed or found nothing, degrading the drill-in feature to
+    /// "unavailable" rather than blocking startup -- see that function's own
+    /// doc for the fallback rationale.
+    pub fn_index: crate::graph::functions::FunctionIndex,
+    /// The `--tui` plane view's function-level drill-in state (issue #6
+    /// milestone 4): module node ids currently "drilled into" their
+    /// changed/owned functions, i.e. expanded in the plane view to show one
+    /// row per [`App::fn_index`] entry instead of a single module row. A
+    /// TUI-plane-view-only concept, the same way [`App::fold_collapsed`] is
+    /// rail-view-only -- always empty on the GUI path and on the `--tui`
+    /// rail view, neither of which ever renders function rows. Toggled by
+    /// [`Msg::ToggleFunctionDrill`]; see that variant's own doc for the full
+    /// expand/collapse contract. A stale entry (naming a module that's since
+    /// left the drawn set, e.g. folded away by [`Msg::CollapseFocusedNamespace`])
+    /// is harmless: every consumer -- [`App::focus_acceptable`] here, and the
+    /// plane layout in a later chunk -- re-checks [`App::is_drawn`] on the
+    /// owner before trusting a `fn_expanded` entry, rather than assuming
+    /// membership alone means "currently visible."
+    pub fn_expanded: HashSet<NodeId>,
 }
 
 impl App {
@@ -160,6 +188,36 @@ impl App {
     /// namespace id also has to pass).
     fn is_drawn(&self, id: &NodeId) -> bool {
         self.layers.iter().any(|layer| layer.contains(id))
+    }
+
+    /// The central validity predicate every focus-setting arm must satisfy:
+    /// `id` is either a plain drawn node ([`Self::is_drawn`]), a currently
+    /// collapsed namespace row (present in [`Self::fold_collapsed`]), or a
+    /// valid *drilled-in function row* -- `id` is a function id (see
+    /// [`is_function_id`]) whose owning module ([`function_owner`]) is both
+    /// drawn and currently expanded (in [`Self::fn_expanded`]), and `id`
+    /// itself is one of that owner's actual rows in [`Self::fn_index`]
+    /// (guards against a stale/forged function id under a legitimately
+    /// expanded module). Used by [`update`]'s debug_assert/`repair_stray_focus`
+    /// backstop, [`Msg::FocusSet`]'s guard, and (via the same three call
+    /// sites) everywhere else "is this a legitimate focus target" needs
+    /// asking -- see this crate's history of focus-lockout bugs (documented
+    /// on [`update`]) for why this lives in exactly one place rather than
+    /// being re-derived at each call site.
+    fn focus_acceptable(&self, id: &NodeId) -> bool {
+        if self.is_drawn(id) || self.fold_collapsed.contains(id) {
+            return true;
+        }
+        let Some(owner) = crate::graph::functions::function_owner(id) else {
+            return false;
+        };
+        crate::graph::functions::is_function_id(id)
+            && self.fn_expanded.contains(&owner)
+            && self.is_drawn(&owner)
+            && self
+                .fn_index
+                .rows_for(&owner)
+                .is_some_and(|rows| rows.iter().any(|row| &row.id == id))
     }
 
     /// `id`'s attached findings, or an empty slice if it has none -- the
@@ -410,6 +468,48 @@ pub enum Msg {
     /// existence. Only acted on on [`Screen::Graph`]/[`Pane::Graph`] with no
     /// picker open.
     ExpandFocusedNamespace,
+    /// The `--tui` plane view's function-level drill-in key (issue #6
+    /// milestone 4): expand or collapse the focused module into its changed
+    /// functions.
+    ///
+    /// vdiff's module graph is deliberately coarse -- one box per module --
+    /// but a reviewer often wants to know not just *that* a module changed
+    /// but *which of its functions* did, and how those functions call each
+    /// other. Rather than folding that detail permanently into
+    /// [`ProjectGraph`] (which would make every other consumer -- layout,
+    /// the rail view, the GUI canvas -- pay for a level of resolution most
+    /// of them never asked for), function-level data lives in a sidecar,
+    /// [`App::fn_index`] (see [`crate::graph::functions`]'s module doc), and
+    /// this message is how the plane view asks to "drill into" one module's
+    /// entry in it on demand: pressing the key again drills back out. Only
+    /// static calls are ever shown as edges between drilled function rows
+    /// (see the module doc's "static calls only" section) -- there is no
+    /// attempt to reason about runtime dispatch.
+    ///
+    /// Only acted on on [`Screen::Graph`]/[`Pane::Graph`] with no picker
+    /// open, matching every other graph-pane message. The target module is
+    /// [`App::focus`] itself, unless focus is already *on* a function row
+    /// (see [`is_function_id`]) -- pressing the key while drilled in targets
+    /// that row's own owner ([`function_owner`]), so the same key collapses
+    /// the drill back up regardless of which of its rows happened to be
+    /// focused. If the target is already in [`App::fn_expanded`], it's
+    /// removed (collapsing back to a single module row); if focus was a
+    /// function row of that module, `focus` moves up to the module id
+    /// itself so it doesn't end up naming a row that no longer exists. If
+    /// the target isn't expanded, it's inserted -- but only when the target
+    /// is actually drawn ([`App::is_drawn`]) *and* [`App::fn_index`] has at
+    /// least one row for it ([`crate::graph::functions::FunctionIndex::rows_for`]);
+    /// otherwise this is a no-op (nothing to drill into: either the module
+    /// has no extracted functions at all, or focus is currently a collapsed
+    /// namespace row with no single owning module to drill). `focus` itself
+    /// is left as-is on expand -- the plane view's own layout decides which
+    /// row (module or its first function) ends up highlighted next frame,
+    /// the same way it already owns spatial navigation for
+    /// [`Msg::FocusMove`]. Always returns [`Cmd::None`]: like
+    /// [`Msg::CollapseFocusedNamespace`]/[`Msg::ExpandFocusedNamespace`], the
+    /// TUI relayouts its plane view every frame from current `App` state
+    /// rather than needing a one-shot [`Cmd::Relayout`] signal.
+    ToggleFunctionDrill,
 }
 
 /// I/O the caller should perform as a result of [`update`]. `update` never
@@ -481,7 +581,27 @@ pub enum Cmd {
 pub fn update(app: App, msg: Msg) -> (App, Cmd) {
     let (mut app, cmd) = update_inner(app, msg);
     if !app.fold_collapsed.is_empty() {
-        app.focus = rail_view::effective_row_id(&app.graph, &app.focus, &app.fold_collapsed);
+        // A function id (see `crate::graph::functions::is_function_id`) has
+        // no entry in `app.graph` at all -- `effective_row_id` would look it
+        // up via `graph.node(id)?.parent`, find nothing, and return `id`
+        // unchanged, which happens to be harmless on its own. But it also
+        // means running it on the function id directly can never notice the
+        // one case that *does* need a remap: the function's *owner* module
+        // getting swallowed into a namespace that just collapsed. So when
+        // focus names a function row, remap its owner instead -- if that
+        // moves (the owner now resolves to some collapsed ancestor's row),
+        // focus jumps up to that row, same as a plain drawn node would;
+        // otherwise the function-id focus is left exactly as-is, since it's
+        // still a legitimate drilled-in row (see `App::focus_acceptable`).
+        if let Some(owner) = crate::graph::functions::function_owner(&app.focus) {
+            let remapped_owner =
+                rail_view::effective_row_id(&app.graph, &owner, &app.fold_collapsed);
+            if remapped_owner != owner {
+                app.focus = remapped_owner;
+            }
+        } else {
+            app.focus = rail_view::effective_row_id(&app.graph, &app.focus, &app.fold_collapsed);
+        }
     }
     // Central backstop for the invariant every individual focus-setting arm
     // above is supposed to maintain on its own: `App::focus` must satisfy
@@ -518,10 +638,12 @@ pub fn update(app: App, msg: Msg) -> (App, Cmd) {
     // doesn't exist.
     if !app.layers.is_empty() {
         debug_assert!(
-            app.is_drawn(&app.focus) || app.fold_collapsed.contains(&app.focus),
-            "App::focus {:?} is neither drawn nor a collapsed namespace after a dispatch -- \
-             a focus-setting arm derived a candidate from app.graph (raw) instead of \
-             app.visible_graph()/app.layers; see App::visible_graph's doc for the bug class",
+            app.focus_acceptable(&app.focus),
+            "App::focus {:?} is neither drawn, a collapsed namespace, nor a valid drilled-in \
+             function row after a dispatch -- a focus-setting arm derived a candidate from \
+             app.graph (raw) instead of app.visible_graph()/app.layers, or drilled into a \
+             function row without App::focus_acceptable's other conditions holding; see \
+             App::visible_graph's doc for the bug class",
             app.focus,
         );
         repair_stray_focus(&mut app);
@@ -537,7 +659,7 @@ pub fn update(app: App, msg: Msg) -> (App, Cmd) {
 /// non-empty (see the call site's own doc), so `app.layers.first()` always
 /// has a row to offer.
 fn repair_stray_focus(app: &mut App) {
-    if app.is_drawn(&app.focus) || app.fold_collapsed.contains(&app.focus) {
+    if app.focus_acceptable(&app.focus) {
         return;
     }
     if let Some(first) = app.layers.first().and_then(|layer| layer.first()) {
@@ -561,7 +683,7 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Cmd) {
             (app, cmd)
         }
         Msg::FocusSet(id) => {
-            let acceptable = app.is_drawn(&id) || app.fold_collapsed.contains(&id);
+            let acceptable = app.focus_acceptable(&id);
             if !on_graph_with_no_picker_and_graph_pane(&app) || !acceptable {
                 return (app, Cmd::None);
             }
@@ -704,6 +826,7 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Cmd) {
         Msg::RailFocusMove(dir) => rail_focus_move(app, dir),
         Msg::CollapseFocusedNamespace => collapse_focused_namespace(app),
         Msg::ExpandFocusedNamespace => expand_focused_namespace(app),
+        Msg::ToggleFunctionDrill => toggle_function_drill(app),
     }
 }
 
@@ -739,7 +862,15 @@ fn collapse_focused_namespace(mut app: App) -> (App, Cmd) {
     if !on_graph_with_no_picker_and_graph_pane(&app) {
         return (app, Cmd::None);
     }
-    let Some(parent) = app.graph.node(&app.focus).and_then(|n| n.parent.clone()) else {
+    // A function id (see `crate::graph::functions::is_function_id`) has no
+    // entry in `app.graph` at all, so `graph.node(&app.focus)` would come
+    // back `None` and this would silently no-op with focus stuck on a
+    // drilled-in function row -- treat it as its owning module instead, so
+    // `h` on a function row collapses that module's parent namespace the
+    // same way it would from the module row itself.
+    let lookup_id =
+        crate::graph::functions::function_owner(&app.focus).unwrap_or_else(|| app.focus.clone());
+    let Some(parent) = app.graph.node(&lookup_id).and_then(|n| n.parent.clone()) else {
         return (app, Cmd::None);
     };
     app.fold_collapsed.insert(parent.clone());
@@ -799,6 +930,30 @@ fn expand_focused_namespace(mut app: App) -> (App, Cmd) {
     (app, Cmd::None)
 }
 
+/// Handle [`Msg::ToggleFunctionDrill`]. See that message's own doc for the
+/// full expand/collapse contract.
+fn toggle_function_drill(mut app: App) -> (App, Cmd) {
+    if !on_graph_with_no_picker_and_graph_pane(&app) {
+        return (app, Cmd::None);
+    }
+    let target =
+        crate::graph::functions::function_owner(&app.focus).unwrap_or_else(|| app.focus.clone());
+    if app.fn_expanded.remove(&target) {
+        if crate::graph::functions::function_owner(&app.focus).as_ref() == Some(&target) {
+            app.focus = target;
+        }
+        return (app, Cmd::None);
+    }
+    let has_rows = app
+        .fn_index
+        .rows_for(&target)
+        .is_some_and(|rows| !rows.is_empty());
+    if app.is_drawn(&target) && has_rows {
+        app.fn_expanded.insert(target);
+    }
+    (app, Cmd::None)
+}
+
 /// `true` if `id` sits anywhere under `ancestor` in the parent chain (`id`
 /// itself doesn't count). Used by [`collapse_focused_namespace`] to prune
 /// now-redundant nested fold entries once a namespace collapses one of its
@@ -847,7 +1002,21 @@ fn toggle_tests(mut app: App) -> (App, Cmd) {
     let result = layout(&app.visible_graph());
     app.rows = rows_with_x_centers(&result);
     app.layers = result.layers;
-    if !app.is_drawn(&app.focus) {
+    if let Some(owner) = crate::graph::functions::function_owner(&app.focus) {
+        // A drilled-in function row (see `App::fn_expanded`) never appears
+        // in `layers` itself -- `App::is_drawn` only ever answers plain
+        // module ids -- so always reseat off its *owner* module instead:
+        // land right on it if still drawn (the drill is orthogonal to
+        // `show_tests`/`layers`, so there's no better function-row target to
+        // re-derive), otherwise fall back to the ordinary reseat sequence
+        // rooted at the owner's old position, same as any other module
+        // that just got hidden.
+        app.focus = if app.is_drawn(&owner) {
+            owner
+        } else {
+            reseat_focus(&old_layers, &app.layers, &owner)
+        };
+    } else if !app.is_drawn(&app.focus) {
         app.focus = reseat_focus(&old_layers, &app.layers, &app.focus);
     }
     (app, Cmd::Relayout)
@@ -1191,6 +1360,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: HashSet::new(),
         }
     }
 
@@ -1425,6 +1596,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: HashSet::new(),
         };
 
         let (app, _) = update(app, Msg::FollowDependents);
@@ -1841,6 +2014,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: HashSet::new(),
         };
         assert!(!app
             .layers
@@ -1883,6 +2058,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: HashSet::new(),
         };
 
         let (app, cmd) = update(app, Msg::ToggleTests);
@@ -2062,6 +2239,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: HashSet::new(),
         }
     }
 
@@ -2463,6 +2642,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: HashSet::new(),
         }
     }
 
@@ -2595,6 +2776,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: HashSet::new(),
         };
         app.fold_collapsed.insert(outer.clone());
 
@@ -2776,6 +2959,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: HashSet::new(),
         }
     }
 
@@ -2957,12 +3142,224 @@ mod tests {
     /// build profile for this assertion to be observable in.
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "is neither drawn nor a collapsed namespace")]
+    #[should_panic(expected = "is neither drawn, a collapsed namespace, nor a valid drilled-in")]
     fn update_debug_asserts_on_a_stray_focus_regardless_of_message() {
         let g = graph_fixture_with_namespace(vec![]);
         let mut app = app_with_graph(g, "outer");
         app.focus = NodeId::from("nonexistent");
 
         let _ = update(app, Msg::PaneLeft);
+    }
+
+    // -- GH-6 milestone 4: function-level drill-in ----------------------
+
+    /// Give `app.fn_index` one function row (`<module>#f/0`) for `module`.
+    /// Enough shape for every drill-in test below -- none of them care
+    /// about `start_line`/`end_line`/`public`/`changed`.
+    fn seed_one_function_row(app: &mut App, module: &str) -> NodeId {
+        let module = NodeId::from(module);
+        let fn_id = crate::graph::functions::function_node_id(&module, "f", 0);
+        app.fn_index.functions.insert(
+            module,
+            vec![crate::graph::functions::FunctionInfo {
+                id: fn_id.clone(),
+                name: "f".to_string(),
+                arity: 0,
+                start_line: 0,
+                end_line: 1,
+                public: true,
+                changed: true,
+            }],
+        );
+        fn_id
+    }
+
+    #[test]
+    fn toggle_function_drill_drills_a_drawn_module_with_rows() {
+        let mut app = app_at("leaf_a");
+        seed_one_function_row(&mut app, "leaf_a");
+        let (app, cmd) = update(app, Msg::ToggleFunctionDrill);
+        assert!(app.fn_expanded.contains(&NodeId::from("leaf_a")));
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn toggle_function_drill_is_noop_for_a_module_with_no_rows() {
+        // `app_at`'s fixture seeds an empty `fn_index` -- `leaf_a` has no
+        // extracted functions at all, so there's nothing to drill into.
+        let app = app_at("leaf_a");
+        let (app, cmd) = update(app, Msg::ToggleFunctionDrill);
+        assert!(app.fn_expanded.is_empty());
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn toggle_function_drill_noop_for_a_collapsed_namespace_focus() {
+        // `root` is a synthetic namespace, never drawn -- even with rows
+        // seeded under it, drilling in must not fabricate a target for a
+        // focus that names a collapsed namespace row rather than a real
+        // module.
+        let mut app = app_for_fold();
+        app.fold_collapsed.insert(NodeId::from("root"));
+        app.focus = NodeId::from("root");
+        seed_one_function_row(&mut app, "root");
+        let (app, _) = update(app, Msg::ToggleFunctionDrill);
+        assert!(app.fn_expanded.is_empty());
+    }
+
+    #[test]
+    fn toggle_function_drill_while_on_a_function_row_undrills_and_reseats() {
+        let mut app = app_at("leaf_a");
+        let fn_id = seed_one_function_row(&mut app, "leaf_a");
+        app.fn_expanded.insert(NodeId::from("leaf_a"));
+        app.focus = fn_id;
+
+        let (app, cmd) = update(app, Msg::ToggleFunctionDrill);
+
+        assert!(app.fn_expanded.is_empty());
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn toggle_function_drill_from_a_function_row_of_a_different_module_only_undrills_its_own_owner()
+    {
+        // Focus is a function row of `leaf_a`, but `leaf_b` is also
+        // (independently) drilled in -- pressing the key should only
+        // collapse `leaf_a`'s drill, not `leaf_b`'s, and should re-seat
+        // focus onto `leaf_a` (its own owner), not touch `leaf_b` at all.
+        let mut app = app_at("leaf_a");
+        let fn_id = seed_one_function_row(&mut app, "leaf_a");
+        seed_one_function_row(&mut app, "leaf_b");
+        app.fn_expanded.insert(NodeId::from("leaf_a"));
+        app.fn_expanded.insert(NodeId::from("leaf_b"));
+        app.focus = fn_id;
+
+        let (app, _) = update(app, Msg::ToggleFunctionDrill);
+
+        assert!(!app.fn_expanded.contains(&NodeId::from("leaf_a")));
+        assert!(app.fn_expanded.contains(&NodeId::from("leaf_b")));
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
+    }
+
+    #[test]
+    fn focus_set_accepts_a_valid_drilled_in_function_row() {
+        let mut app = app_at("leaf_a");
+        let fn_id = seed_one_function_row(&mut app, "leaf_a");
+        app.fn_expanded.insert(NodeId::from("leaf_a"));
+
+        let (app, _) = update(app, Msg::FocusSet(fn_id.clone()));
+
+        assert_eq!(app.focus, fn_id);
+    }
+
+    #[test]
+    fn focus_set_rejects_a_function_row_whose_owner_is_not_expanded() {
+        let mut app = app_at("leaf_a");
+        let fn_id = seed_one_function_row(&mut app, "leaf_a");
+        // `fn_expanded` deliberately left empty: `leaf_a` was never drilled
+        // into, so its function row has no legitimate row to be.
+        let old_focus = app.focus.clone();
+
+        let (app, _) = update(app, Msg::FocusSet(fn_id));
+
+        assert_eq!(app.focus, old_focus);
+    }
+
+    #[test]
+    fn focus_set_rejects_a_function_row_whose_owner_is_not_drawn() {
+        // `fn_index`/`fn_expanded` both name a module id that appears
+        // nowhere in `app.layers` -- e.g. a module that existed at the
+        // time the index was built but has since dropped out of the
+        // drawn graph (a `t` toggle, a fold, ...). The function row must
+        // not be accepted just because `fn_expanded` still lists it.
+        let mut app = app_at("leaf_a");
+        let ghost = NodeId::from("ghost_module");
+        let fn_id = crate::graph::functions::function_node_id(&ghost, "f", 0);
+        app.fn_index.functions.insert(
+            ghost.clone(),
+            vec![crate::graph::functions::FunctionInfo {
+                id: fn_id.clone(),
+                name: "f".to_string(),
+                arity: 0,
+                start_line: 0,
+                end_line: 1,
+                public: true,
+                changed: true,
+            }],
+        );
+        app.fn_expanded.insert(ghost);
+        let old_focus = app.focus.clone();
+
+        let (app, _) = update(app, Msg::FocusSet(fn_id));
+
+        assert_eq!(app.focus, old_focus);
+    }
+
+    #[test]
+    fn update_does_not_panic_across_dispatches_with_a_drilled_focus() {
+        // The `debug_assert!` in `update` must accept a legitimately
+        // drilled-in function-row focus on every dispatch, not just the
+        // one that set it -- a focus-irrelevant message (`Msg::PaneLeft`,
+        // same choice as `update_debug_asserts_on_a_stray_focus_regardless_of_message`)
+        // is enough to prove the backstop doesn't misfire here.
+        let mut app = app_at("leaf_a");
+        let fn_id = seed_one_function_row(&mut app, "leaf_a");
+        app.fn_expanded.insert(NodeId::from("leaf_a"));
+        app.focus = fn_id.clone();
+
+        let (app, _) = update(app, Msg::PaneLeft);
+
+        assert_eq!(app.focus, fn_id);
+    }
+
+    #[test]
+    fn stale_fn_expanded_entry_is_harmless_and_does_not_wedge_focus() {
+        // `fn_expanded` names a module no longer in `app.layers` at all --
+        // simulating a module that was drilled into and then hidden by a
+        // later `t`/fold. Focus itself is a perfectly ordinary drawn node,
+        // so dispatching any message must behave exactly as if
+        // `fn_expanded` were empty: no panic, no stray focus.
+        let mut app = app_at("leaf_a");
+        app.fn_expanded.insert(NodeId::from("nonexistent_module"));
+
+        let (app, cmd) = update(app, Msg::FocusMove(Direction::Right));
+
+        assert_eq!(app.focus, NodeId::from("leaf_b"));
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn collapse_focused_namespace_from_a_function_row_collapses_the_owners_parent() {
+        let mut app = app_for_fold();
+        let fn_id = seed_one_function_row(&mut app, "leaf_a");
+        app.fn_expanded.insert(NodeId::from("leaf_a"));
+        app.focus = fn_id;
+
+        let (app, cmd) = update(app, Msg::CollapseFocusedNamespace);
+
+        assert_eq!(app.focus, NodeId::from("root"));
+        assert!(app.fold_collapsed.contains(&NodeId::from("root")));
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn focus_move_is_a_noop_with_a_function_row_focus() {
+        // Documented limitation (GH-6 milestone 4): `Msg::FocusMove` drives
+        // navigation off `App::layers`/`App::rows`, which never contain
+        // function ids -- `move_focus`'s `locate` lookup comes back `None`
+        // and the message no-ops, leaving the drilled-in function row
+        // focused. The plane view drives its own spatial navigation over
+        // drilled rows instead (a later chunk); `FocusMove` staying inert
+        // here is acceptable, not a bug.
+        let mut app = app_at("leaf_a");
+        let fn_id = seed_one_function_row(&mut app, "leaf_a");
+        app.fn_expanded.insert(NodeId::from("leaf_a"));
+        app.focus = fn_id.clone();
+
+        let (app, cmd) = update(app, Msg::FocusMove(Direction::Right));
+
+        assert_eq!(app.focus, fn_id);
+        assert_eq!(cmd, Cmd::None);
     }
 }

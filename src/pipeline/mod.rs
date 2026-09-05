@@ -6,6 +6,7 @@ pub mod crate_names;
 pub mod error;
 pub mod extract;
 pub mod file_diff;
+pub mod functions;
 pub mod git2_repo;
 pub mod pr;
 pub mod publish;

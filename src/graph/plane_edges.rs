@@ -34,8 +34,9 @@
 use std::collections::HashMap;
 
 use crate::graph::canvas::{merge_glyph, CanvasCell, CanvasRole};
+use crate::graph::functions::function_owner;
 use crate::graph::model::NodeId;
-use crate::graph::plane::PlaneLayout;
+use crate::graph::plane::{PlaneLayout, Rect};
 
 /// Above this many visible edges, only edges touching the focused node or
 /// one of its direct neighbors are actually routed -- mirrors
@@ -139,17 +140,35 @@ fn neighbor_set(edges: &[(NodeId, NodeId)], focus: &NodeId) -> std::collections:
     set
 }
 
+/// `id`'s own row rect if present, otherwise (a function id whose module
+/// isn't drilled -- see [`crate::graph::plane::layout`]'s `drilled` param)
+/// its owning module's plain row, or `None` if neither resolves. This is
+/// what makes a function-level edge attach to the target module's plain
+/// row when that module isn't drilled, and to the caller's module row when
+/// the caller isn't drilled -- [`route_one`]'s only job is orthogonal-path
+/// math over whatever rect it's handed, so this fallback is the entire
+/// "function-aware" part of routing.
+fn resolve_row(layout: &PlaneLayout, id: &NodeId) -> Option<Rect> {
+    layout
+        .rows
+        .get(id)
+        .copied()
+        .or_else(|| function_owner(id).and_then(|owner| layout.rows.get(&owner).copied()))
+}
+
 /// Route one edge's 3-segment orthogonal path: exit `from`'s label at its
 /// x-center (bottom edge if `to` sits below, top edge otherwise), a vertical
 /// run to a midpoint row strictly between the two labels, a horizontal run
 /// at that row, then a vertical run into `to`'s x-center (top or bottom
 /// edge, whichever faces `from`). A same-column pair (`from`'s x-center
 /// rounds to the same column as `to`'s) skips the horizontal run and corner
-/// glyphs entirely -- just one continuous `│`. Missing rects (an edge
-/// endpoint not present in `layout.rows` at all -- shouldn't happen for an
-/// edge [`crate::core::rail_view::collapse_edges`] produced from the same
-/// fold state this layout was built from, but this stays defensive) are
-/// silently skipped rather than panicking.
+/// glyphs entirely -- just one continuous `│`. Endpoints are resolved via
+/// [`resolve_row`] (a function id whose module isn't drilled falls back to
+/// that module's own row); an edge that still can't resolve both ends (or
+/// whose resolved rects land on the exact same rect -- e.g. an intra-module
+/// function edge whose module isn't drilled, so both ends fall back to the
+/// same module row: a box-to-itself arrow is noise, not signal) is silently
+/// dropped rather than drawn or panicking.
 fn route_one(
     layout: &PlaneLayout,
     from: &NodeId,
@@ -157,13 +176,13 @@ fn route_one(
     role: CanvasRole,
     grid: &mut HashMap<(usize, usize), (char, CanvasRole)>,
 ) {
-    let Some(src) = layout.rows.get(from) else {
+    let Some(src) = resolve_row(layout, from) else {
         return;
     };
-    let Some(tgt) = layout.rows.get(to) else {
+    let Some(tgt) = resolve_row(layout, to) else {
         return;
     };
-    if from == to {
+    if from == to || src == tgt {
         return;
     }
 
@@ -357,6 +376,63 @@ mod tests {
         let layout = layout_with(&[("a", 0, 0, 3, 1)]);
         let edges = vec![(id("a"), id("ghost"))];
         let routed = route_edges(&layout, &edges, &id("a"));
+        assert!(routed.cells.is_empty());
+    }
+
+    #[test]
+    fn function_endpoint_falls_back_to_its_owning_module_row() {
+        // `mod_a` isn't drilled -- no row for the function id itself, only
+        // for the module -- but `mod_b`'s function is (both a row for the
+        // module and, separately, its own function id would exist if
+        // drilled; here it's the caller's module that's undrilled).
+        let layout = layout_with(&[("mod_a", 0, 0, 3, 1), ("mod_b", 0, 5, 3, 1)]);
+        let caller = NodeId::from("mod_a#caller/0");
+        let callee = NodeId::from("mod_b#callee/0");
+        let edges = vec![(caller, callee)];
+        let routed = route_edges(&layout, &edges, &NodeId::from("nobody"));
+        assert!(
+            !routed.cells.is_empty(),
+            "edge must attach to the owning modules' plain rows"
+        );
+    }
+
+    #[test]
+    fn edge_between_two_drilled_function_rows_attaches_at_those_rows() {
+        // Both endpoints' function ids have their own rows directly (as
+        // they would once their modules are drilled) -- no fallback needed,
+        // the edge should route straight between them.
+        let layout = layout_with(&[
+            ("mod_a#caller/0", 0, 0, 10, 1),
+            ("mod_b#callee/0", 0, 5, 10, 1),
+        ]);
+        let edges = vec![(
+            NodeId::from("mod_a#caller/0"),
+            NodeId::from("mod_b#callee/0"),
+        )];
+        let routed = route_edges(&layout, &edges, &NodeId::from("nobody"));
+        assert!(!routed.cells.is_empty());
+        assert!(routed.cells.iter().all(|c| c.glyph == '│'));
+    }
+
+    #[test]
+    fn intra_module_function_edge_with_module_not_drilled_is_dropped() {
+        // Both functions belong to the same module, which has no row of its
+        // own for either function id -- both fall back to the *same* module
+        // row, so the edge is a self-loop in disguise and must be dropped.
+        let layout = layout_with(&[("mod_a", 0, 0, 3, 1)]);
+        let edges = vec![(
+            NodeId::from("mod_a#caller/0"),
+            NodeId::from("mod_a#callee/0"),
+        )];
+        let routed = route_edges(&layout, &edges, &NodeId::from("nobody"));
+        assert!(routed.cells.is_empty());
+    }
+
+    #[test]
+    fn unknown_both_ends_is_dropped() {
+        let layout = layout_with(&[("mod_a", 0, 0, 3, 1)]);
+        let edges = vec![(NodeId::from("ghost_a#x/0"), NodeId::from("ghost_b#y/0"))];
+        let routed = route_edges(&layout, &edges, &NodeId::from("nobody"));
         assert!(routed.cells.is_empty());
     }
 

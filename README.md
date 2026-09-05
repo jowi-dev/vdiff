@@ -67,7 +67,9 @@ in canvas/plane mode) and every other binding (`gd`/`gr`, `gt`, `t`, `v`,
 - **Plane** (the default) -- a true 2D nested layout: expanded namespaces
   render as `╭─ Name ─╮` boxes containing their children, spread across
   both dimensions, with orthogonally-routed dependency edges between
-  labels. `h`/`j`/`k`/`l` move focus spatially.
+  labels. `h`/`j`/`k`/`l` move focus spatially. `zf` drills a focused
+  changed module one level further, into its own changed functions (Elixir
+  only for now, static calls only -- see the key table below).
 - **Canvas** -- a semantic-zoom Sugiyama layout: horizontal bands of node
   labels (one band per dependency layer), with routed inter-band channels.
   `h`/`j`/`k`/`l` move focus spatially; horizontal scrolling auto-pans to
@@ -117,6 +119,7 @@ zoom is a 2D-canvas-only concept):
 | `` ` ``  | Cycle graph view: plane -> canvas -> rail -> plane               |
 | `h` `j` `k` `l` | Move focus spatially (plane/canvas) or fold/step rows (rail) |
 | `zc` `zo`| Collapse/expand the focused namespace (plane/canvas only)       |
+| `zf`     | Drill the focused changed module into its changed functions (plane view only; static calls only) |
 | `h` `l`  | Collapse/expand the focused row's namespace (rail only)         |
 
 ## Tuning your Neovim config for the review pane
