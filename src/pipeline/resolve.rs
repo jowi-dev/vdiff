@@ -77,6 +77,20 @@ fn resolve_one(
     progressive_match(nodes, &candidate, sep, lang_prefix)
 }
 
+/// Resolve a dotted Elixir module name (already alias-resolved, or as-written
+/// if unresolvable -- see [`crate::pipeline::extract::elixir_extract`]) to a
+/// [`NodeId`] via the same progressive-trim matching [`resolve_one`] uses for
+/// `alias`/`import`/`use`/`require`/remote-call [`DepRef`]s. Used by
+/// [`crate::pipeline::functions`] to resolve a remote call's target module
+/// without duplicating this trimming logic. `None` if nothing in `nodes`
+/// matches.
+pub(crate) fn resolve_elixir_module(
+    nodes: &HashMap<NodeId, ModuleNode>,
+    name: &str,
+) -> Option<NodeId> {
+    progressive_match(nodes, name, ".", "elixir:")
+}
+
 /// Substitute a Rust `crate::`/`self::`/`super::` prefix (or the bare
 /// `crate`/`self`/`super` forms) for the concrete path it names. A no-op
 /// for Elixir/Other contexts (`rust_crate_name` is `None`) and for any Rust
