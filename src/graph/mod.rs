@@ -3,6 +3,7 @@
 pub mod builder;
 pub mod canvas;
 pub mod filter;
+pub mod functions;
 pub mod labels;
 pub mod layers;
 pub mod layout;
