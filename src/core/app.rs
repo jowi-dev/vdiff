@@ -428,7 +428,10 @@ pub enum Cmd {
     LoadFile(NodeId),
     /// `App::layers` changed shape (currently only [`Msg::ToggleTests`]) --
     /// the caller must rebuild its [`crate::graph::layout::LayoutResult`]
-    /// from [`App::visible_graph`] before painting again.
+    /// from [`App::visible_graph`] before painting again, passing the
+    /// freshly recomputed [`App::layers`] to
+    /// [`crate::graph::layout::layout_from_layers`] so the rebuilt layout
+    /// shares this reducer's layer structure instead of deriving its own.
     Relayout,
     /// [`Msg::CommentNode`]: capture an architecture comment for the given
     /// node. Glue's job: in nvim mode, open the node's first backing file
