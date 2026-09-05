@@ -118,7 +118,8 @@ pub struct EdgePath {
 
 /// The full computed layout: every drawn node's absolute rect, one
 /// [`EdgePath`] per resolvable [`DepEdge`], and the layer structure used to
-/// place them (exactly [`assign_layers`]'s output) so navigation
+/// place them ([`assign_layers`]'s output, or the caller's own copy of it
+/// via [`layout_from_layers`]) so navigation
 /// ([`crate::core::focus`]) and rendering agree on which nodes sit in which
 /// layer/row without recomputing it.
 #[derive(Debug, Clone, PartialEq)]
@@ -188,8 +189,22 @@ pub fn layout_with_test_strips(
     graph: &ProjectGraph,
     test_strips: &HashMap<NodeId, TestStrip>,
 ) -> LayoutResult {
-    let layers = assign_layers(graph);
+    layout_from_layers(graph, assign_layers(graph), test_strips)
+}
 
+/// [`layout_with_test_strips`], but placing `layers` as given instead of
+/// running [`assign_layers`] over `graph` again. For a caller that already
+/// holds the layer structure -- [`crate::core::app::App::layers`], rebuilt
+/// by the reducer whenever it changes shape (see
+/// [`crate::core::app::Cmd::Relayout`]) -- this makes that copy the single
+/// source instead of a second derivation that only stays equal to this
+/// one's by `assign_layers` being deterministic. The returned
+/// [`LayoutResult::layers`] is exactly the `layers` passed in.
+pub fn layout_from_layers(
+    graph: &ProjectGraph,
+    layers: Vec<Vec<NodeId>>,
+    test_strips: &HashMap<NodeId, TestStrip>,
+) -> LayoutResult {
     let bands: Vec<(Vec<Row>, Size)> = layers
         .iter()
         .map(|layer| {
@@ -475,6 +490,48 @@ mod tests {
                 assert!(result.rects.contains_key(id));
             }
         }
+    }
+
+    #[test]
+    fn layout_from_layers_uses_the_given_layers_verbatim() {
+        let mut graph = graph_from(
+            vec![leaf("a", "a", None), leaf("b", "b", None)],
+            vec!["a", "b"],
+        );
+        graph.edges = vec![edge("a", "b")];
+
+        // Deliberately the REVERSE of what assign_layers would produce for
+        // the a -> b edge: if the function re-derived layers itself, "a"
+        // would land above "b" and this ordering would flip back.
+        let reversed: Vec<Vec<NodeId>> = vec![vec![NodeId::from("b")], vec![NodeId::from("a")]];
+
+        let result = layout_from_layers(&graph, reversed.clone(), &HashMap::new());
+
+        assert_eq!(result.layers, reversed);
+        let a_y = result.rects[&NodeId::from("a")].origin.y;
+        let b_y = result.rects[&NodeId::from("b")].origin.y;
+        assert!(
+            b_y < a_y,
+            "placement must follow the caller's layers, not a fresh assign_layers pass"
+        );
+    }
+
+    #[test]
+    fn layout_with_test_strips_equals_layout_from_layers_over_assign_layers() {
+        let mut graph = graph_from(
+            vec![
+                leaf("a", "a", None),
+                leaf("b", "b", None),
+                leaf("c", "c", None),
+            ],
+            vec!["a", "b", "c"],
+        );
+        graph.edges = vec![edge("a", "b"), edge("a", "c")];
+
+        let derived = layout_with_test_strips(&graph, &HashMap::new());
+        let precomputed = layout_from_layers(&graph, assign_layers(&graph), &HashMap::new());
+
+        assert_eq!(derived, precomputed);
     }
 
     #[test]

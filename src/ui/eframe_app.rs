@@ -38,7 +38,7 @@ use crate::core::app::{update, App, Cmd, Msg, Pane, Screen};
 use crate::core::diff_state::{DiffPaneState, FileEntry};
 use crate::core::file_view::{FileViewEntry, FileViewState};
 use crate::core::focus::Direction;
-use crate::graph::layout::{layout_with_test_strips, LayoutResult};
+use crate::graph::layout::{layout_from_layers, LayoutResult};
 use crate::graph::model::{GitStatus, ModuleNode, NodeId, ProjectGraph};
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome, Pending};
 use crate::nvim::session::NvimCmd;
@@ -342,11 +342,18 @@ impl VdiffApp {
                 // this `Cmd::Relayout` (see `core::app::toggle_tests`), so
                 // `GraphViewCache` needs rebuilding here too -- see its own
                 // doc for why `graph_view::show` doesn't just recompute it
-                // itself every frame. Rebuilt first so `layout_with_test_strips`
+                // itself every frame. Rebuilt first so `layout_from_layers`
                 // below reuses its `strips` instead of computing them twice.
+                // The reducer already recomputed `app.layers` from the same
+                // `visible_graph()` before emitting this `Cmd::Relayout`
+                // (see `core::app::toggle_tests`), so pass that copy in as
+                // the layer structure rather than running `assign_layers`
+                // a second time -- keeps `self.layout.layers` equal to
+                // `app.layers` by construction instead of by determinism.
                 self.graph_view_cache = GraphViewCache::rebuild(&self.app);
-                self.layout = layout_with_test_strips(
+                self.layout = layout_from_layers(
                     &self.app.visible_graph(),
+                    self.app.layers.clone(),
                     &self.graph_view_cache.strips,
                 );
             }
