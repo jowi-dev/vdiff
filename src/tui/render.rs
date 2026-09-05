@@ -1063,9 +1063,17 @@ pub fn build_plane_view(app: &App) -> PlaneView {
     let visible_graph = app.visible_graph();
     let raw_rows = rail_view::visible_rows(&visible_graph, &app.layers, &app.fold_collapsed);
     let labels = rail_view::disambiguated_labels(&visible_graph, &raw_rows);
-    let layout = plane::layout(&visible_graph, &app.layers, &app.fold_collapsed, |id| {
-        plane_leaf_label(app, id, &labels)
-    });
+    // TODO(milestone 6): build the real drilled-module -> function-row map
+    // from `app.fn_expanded`/`app.fn_index` here; empty for now just keeps
+    // the tree compiling.
+    let drilled: HashMap<NodeId, Vec<(NodeId, String)>> = HashMap::new();
+    let layout = plane::layout(
+        &visible_graph,
+        &app.layers,
+        &app.fold_collapsed,
+        &drilled,
+        |id| plane_leaf_label(app, id, &labels),
+    );
     let edges = rail_view::collapse_edges(&app.graph, &app.graph.edges, &app.fold_collapsed);
     let routed = plane_edges::route_edges(&layout, &edges, &app.focus);
     PlaneView {
