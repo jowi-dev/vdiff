@@ -118,7 +118,8 @@ pub struct EdgePath {
 
 /// The full computed layout: every drawn node's absolute rect, one
 /// [`EdgePath`] per resolvable [`DepEdge`], and the layer structure used to
-/// place them (exactly [`assign_layers`]'s output) so navigation
+/// place them ([`assign_layers`]'s output, or the caller's own copy of it
+/// via [`layout_from_layers`]) so navigation
 /// ([`crate::core::focus`]) and rendering agree on which nodes sit in which
 /// layer/row without recomputing it.
 #[derive(Debug, Clone, PartialEq)]
