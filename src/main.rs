@@ -317,8 +317,15 @@ fn launch_tui(
     // folded into `app` -- so the returned `LayoutResult` is dropped here
     // unlike `run_gui`, which threads it into `VdiffApp::new` for its
     // pixel geometry.
-    let (mut app, review_store, _layout_result) =
-        build_initial_app(graph, &git_dir, &branch, findings, comments);
+    let (mut app, review_store, _layout_result) = build_initial_app(
+        graph,
+        diff_source.repo.as_ref(),
+        &diff_source.base_oid,
+        &git_dir,
+        &branch,
+        findings,
+        comments,
+    );
     // Issue #18's fix 4: a dense enough change set is unusable fully
     // expanded on first paint (see `vdiff::tui::seed_fold_collapsed_if_dense`'s
     // doc) -- this only ever touches this TUI-local `App`, never the GUI's
@@ -639,6 +646,15 @@ fn dump(
 /// synthetic namespace containers, which are never drawn or focusable (see
 /// `graph::layers`).
 ///
+/// `repo`/`base_oid` are used for exactly one thing here: building
+/// [`App::fn_index`] (GH-6 milestone 4) via
+/// [`vdiff::pipeline::functions::build_function_index`] over this same
+/// `graph`, before it's moved into `App` -- see that field's own doc for why
+/// it must be built from the identical post-filter graph the running `App`
+/// holds. Both callers already have a repo/base_oid pair in hand from their
+/// own diff-loading setup (`diff_loader`/`diff_source`), so nothing new is
+/// resolved here.
+///
 /// `git_dir`/`branch` seed (and, later, persist) the review-completion
 /// store (issue #4): `<git_dir>/vdiff/review-state.json` is loaded here,
 /// `branch`'s entry run through [`vdiff::review::review_state::seed_reviewed`]
@@ -655,6 +671,8 @@ fn dump(
 #[cfg(any(feature = "gui", feature = "tui"))]
 fn build_initial_app(
     graph: ProjectGraph,
+    repo: &dyn GitRepo,
+    base_oid: &str,
     git_dir: &Path,
     branch: &str,
     findings: Findings,
@@ -664,6 +682,21 @@ fn build_initial_app(
     vdiff::review::review_state::ReviewStore,
     vdiff::graph::layout::LayoutResult,
 ) {
+    // GH-6 milestone 4: build the function-level drill-in sidecar from the
+    // exact same (post `focus_on_changes`-filter) graph `App::graph` is
+    // about to hold, so every `FunctionInfo`/`FunctionEdge` id extracted
+    // here always resolves against ids the running `App` actually knows
+    // about. A failure here (or a repo with nothing extractable) degrades
+    // to "no drill available" rather than blocking startup -- this feature
+    // is a bonus view over the graph, not something either frontend depends
+    // on to run at all.
+    let fn_index = match vdiff::pipeline::functions::build_function_index(repo, &graph, base_oid) {
+        Ok(index) => index,
+        Err(err) => {
+            eprintln!("warning: failed to build function-level index: {err}");
+            vdiff::graph::functions::FunctionIndex::default()
+        }
+    };
     let show_tests = initial_show_tests(&graph);
     let visible = if show_tests {
         group_matched_test_modules(&graph)
@@ -697,6 +730,8 @@ fn build_initial_app(
         findings,
         comments,
         fold_collapsed: std::collections::HashSet::new(),
+        fn_index,
+        fn_expanded: std::collections::HashSet::new(),
     };
     (app, review_store, layout_result)
 }
@@ -736,8 +771,15 @@ fn run_gui(
     }
     let want_nvim = want_nvim && nvim_available();
     let repo_root = repo_path.to_path_buf();
-    let (app, review_store, layout_result) =
-        build_initial_app(graph, &git_dir, &branch, findings, comments);
+    let (app, review_store, layout_result) = build_initial_app(
+        graph,
+        diff_loader.repo.as_ref(),
+        &diff_loader.base_oid,
+        &git_dir,
+        &branch,
+        findings,
+        comments,
+    );
 
     let title = format!("vdiff — {}", repo_dir_name(repo_path));
     // Start maximized rather than macOS native fullscreen: fullscreen opens

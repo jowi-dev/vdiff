@@ -412,6 +412,8 @@ mod tests {
             findings: std::collections::HashMap::new(),
             comments: std::collections::HashMap::new(),
             fold_collapsed: std::collections::HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: std::collections::HashSet::new(),
         }
     }
 

@@ -1504,6 +1504,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: std::collections::HashSet::new(),
         };
         TuiState {
             app,

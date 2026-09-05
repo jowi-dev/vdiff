@@ -1787,6 +1787,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: std::collections::HashSet::new(),
         }
     }
 
@@ -1978,6 +1980,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: std::collections::HashSet::new(),
         };
         let text = render_to_string(&app);
         assert!(
@@ -2014,6 +2018,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: collapsed,
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: std::collections::HashSet::new(),
         };
         let text = render_to_string(&app);
         assert!(text.contains("modules"), "expected the fold summary text");
@@ -2376,6 +2382,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: std::collections::HashSet::new(),
         }
     }
 
@@ -2531,6 +2539,8 @@ mod tests {
             findings: HashMap::new(),
             comments: HashMap::new(),
             fold_collapsed: HashSet::new(),
+            fn_index: crate::graph::functions::FunctionIndex::default(),
+            fn_expanded: std::collections::HashSet::new(),
         }
     }
 
