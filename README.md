@@ -36,8 +36,8 @@ independent of each other: `gui` (the egui/eframe graph-canvas GUI) and
 --graph`-style vertical rail DAG of every visible module, rather than the
 2D graph canvas). A
 `--no-default-features` build is fully headless: no window or terminal UI
-ever opens, and `--dump`/`--export-comments`/`--publish-comments` are the
-only usable entry points -- any invocation that would otherwise launch a
+ever opens, and `--dump`/`--export-comments`/`--comments-status`/
+`--publish-comments` are the only usable entry points -- any invocation that would otherwise launch a
 frontend (bare `vdiff`, `--tui`, `--smoke`, `--pr` without a headless flag,
 ...) exits 1 with a message naming the missing feature instead.
 
@@ -62,7 +62,7 @@ graph screen has three interchangeable views, cycled with backtick
 (`` ` ``) in `plane -> canvas -> rail -> plane` order -- all three share the
 same fold-by-namespace "zoom out" mechanic (`h`/`l` in rail mode, `zc`/`zo`
 in canvas/plane mode) and every other binding (`gd`/`gr`, `gt`, `t`, `v`,
-`c`, `Enter`, `d`, `q`, `Esc`):
+`c`, `m`, `Enter`, `d`, `q`, `Esc`):
 
 - **Plane** (the default) -- a true 2D nested layout: expanded namespaces
   render as `╭─ Name ─╮` boxes containing their children, spread across
@@ -105,13 +105,15 @@ zoom is a 2D-canvas-only concept):
 | `d`                  | Diff the current file against the merge-base                 |
 | `t`                  | Toggle showing test modules                                   |
 | `c`                  | Comment on the focused node (see below — requires `vdiff.nvim`) |
+| `v`                  | Toggle the focused node's reviewed flag                       |
+| `m`                  | Toggle the focused node's comments between addressed/unaddressed |
 | `gd` / `gr`          | Follow dependencies / dependents from the focused node        |
 | `+` / `-` / `=`      | Zoom in / out / reset                                          |
 | `Esc`                | Back out (close file pane, close diff, ...)                    |
 | `Ctrl-w h` / `Ctrl-w l` | Move focus between the graph and file panes                |
 
 `--tui`'s graph screen differs on `` ` ``/`h`/`j`/`k`/`l`/fold only
-(everything else above still applies, `Enter`/`d`/`t`/`c`/`gd`/`gr`/`Esc`/
+(everything else above still applies, `Enter`/`d`/`t`/`c`/`v`/`m`/`gd`/`gr`/`Esc`/
 `Ctrl-w h/l` included):
 
 | Key(s)   | Does                                                          |
@@ -178,6 +180,14 @@ vdiff reads that store back out with:
 ```sh
 vdiff --export-comments   # print every captured comment as markdown
 ```
+
+For external tooling that just needs to know whether a branch's review
+comments are addressed — a ticket board like tm/tskmstr, say — without
+parsing `comments.json` itself, `vdiff --comments-status` prints a small
+JSON summary instead (`repo`, `branch`, `total`, `unresolved`) and exits 0,
+including when there's no store yet (`total: 0, unresolved: 0`). See
+[`docs/comments-schema.md`](docs/comments-schema.md)'s "Status summary
+output" section for the exact shape.
 
 ## AI-review payload
 

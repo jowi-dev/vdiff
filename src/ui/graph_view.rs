@@ -441,11 +441,13 @@ struct NodeOverlay<'a> {
     /// corner so the two never overlap.
     findings: &'a HashMap<NodeId, Vec<Finding>>,
     /// Review comments (issue #14, see [`crate::review::comments::map_comments`]),
-    /// keyed by node -- painted as a small violet count badge (see
+    /// keyed by node -- painted as a small violet badge (see
     /// [`paint_comments_badge`]) at the main rect's bottom-right corner, the
     /// one corner the findings badge (top-left), tested checkmark
     /// (top-right), and attached test strip (below `main_rect`) never
-    /// touch.
+    /// touch. The badge counts only unaddressed comments (see
+    /// [`crate::review::comments::unresolved_count`]) and is hidden entirely
+    /// once every comment on a node is resolved.
     comments: &'a HashMap<NodeId, Vec<Comment>>,
 }
 
@@ -464,10 +466,11 @@ struct NodeOverlay<'a> {
 /// border stroke, root stripe, and badges are untouched) is desaturated via
 /// [`theme::dim_reviewed`], the visual cue that this node's been marked
 /// reviewed (`v`, see [`crate::core::app::Msg::ToggleReviewed`]). Also
-/// paints a small violet comment-count badge at the bottom-right corner if
-/// [`NodeOverlay::comments`] has an entry for `id` (issue #14) -- see
-/// [`paint_comments_badge`] for why that corner never collides with any of
-/// this function's other badges/decorations.
+/// paints a small violet unresolved-comment-count badge at the bottom-right
+/// corner if [`NodeOverlay::comments`] has an entry for `id` with at least
+/// one unaddressed comment (issue #14) -- see [`paint_comments_badge`] for
+/// why that corner never collides with any of this function's other
+/// badges/decorations.
 fn paint_node(
     painter: &egui::Painter,
     graph: &ProjectGraph,
@@ -551,7 +554,10 @@ fn paint_node(
     }
 
     if let Some(comments) = overlay.comments.get(id) {
-        paint_comments_badge(painter, main_rect, transform, comments);
+        let unresolved = crate::review::comments::unresolved_count(comments);
+        if unresolved > 0 {
+            paint_comments_badge(painter, main_rect, transform, unresolved);
+        }
     }
 
     if id == focus {
@@ -652,33 +658,33 @@ fn paint_findings_badge(
     );
 }
 
-/// Paint `comments`'s count badge (issue #14) at `main_rect`'s
+/// Paint `unresolved_count`'s badge (issue #14) at `main_rect`'s
 /// bottom-right corner: a small filled circle in [`theme::COMMENT_BADGE_COLOR`]
-/// (the same violet `vdiff.nvim` highlights a commented range with), count
-/// as white text on top. Bottom-right is the one corner none of the other
-/// three badge/decoration spots ever reach: the findings badge sits
-/// top-left (just past the root-hue stripe), the tested checkmark sits
+/// (the same violet `vdiff.nvim` highlights a commented range with),
+/// `unresolved_count` as white text on top -- the number of the node's
+/// comments still unaddressed (see
+/// [`crate::review::comments::unresolved_count`]), not the total; a comment
+/// with `resolved_at` set no longer counts, so a node whose comments are
+/// all resolved shows no badge at all. Bottom-right is the one corner none
+/// of the other three badge/decoration spots ever reach: the findings badge
+/// sits top-left (just past the root-hue stripe), the tested checkmark sits
 /// top-right, and an attached test strip (when `show_tests` is on) is
 /// painted below `main_rect` entirely, never overlapping it -- so all four
-/// can coexist legibly on the same node. A no-op if `comments` is empty
-/// (shouldn't happen -- callers only reach this with a non-empty
-/// `overlay.comments` entry -- but defended rather than assumed).
+/// can coexist legibly on the same node. Callers only reach this with a
+/// non-zero `unresolved_count` -- see [`paint_node`]'s zero-check.
 fn paint_comments_badge(
     painter: &egui::Painter,
     main_rect: EguiRect,
     transform: &Transform,
-    comments: &[Comment],
+    unresolved_count: usize,
 ) {
-    if comments.is_empty() {
-        return;
-    }
     let radius = (7.0 * transform.scale.max(0.3)).max(5.0);
     let center = main_rect.max - Vec2::new(radius + 2.0, radius + 2.0);
     painter.circle_filled(center, radius, theme::COMMENT_BADGE_COLOR);
     painter.text(
         center,
         Align2::CENTER_CENTER,
-        format!("{}", comments.len()),
+        format!("{unresolved_count}"),
         FontId::proportional((radius * 1.1).max(6.0)),
         Color32::WHITE,
     );
@@ -753,7 +759,7 @@ fn paint_root_legend(
     }
 }
 
-/// Row 2: the `Enter`/`d`/`c`/`v` pane-open/comment/review hint, the review
+/// Row 2: the `Enter`/`d`/`c`/`v`/`m` pane-open/comment/review/resolve hint, the review
 /// progress readout ("N/M changed modules reviewed" -- see
 /// [`App::review_progress`]), the test-module hidden/shown hint (only drawn
 /// once there are any test modules to mention at all), then the two
@@ -771,7 +777,7 @@ fn paint_hint_row(
 
     cursor_x = paint_text(
         painter,
-        "Enter: file   d: diff   c: comment   v: review",
+        "Enter: file   d: diff   c: comment   v: review   m: addressed",
         cursor_x,
         text_y,
         HINT_COLOR,

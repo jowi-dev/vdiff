@@ -79,6 +79,21 @@ pub struct Cli {
     /// empty or hasn't been created yet.
     #[arg(long)]
     pub export_comments: bool,
+    /// Print a small JSON summary of the comment store to stdout and exit,
+    /// instead of the full markdown `--export-comments` renders: `repo`,
+    /// `branch`, `total`, and `unresolved` comment counts (see
+    /// [`crate::review::comments::comments_status`] and
+    /// `docs/comments-schema.md`'s "Status summary output" section for the
+    /// exact shape). Meant for external tooling -- a ticket board like
+    /// tm/tskmstr, say -- that wants a machine-readable answer to "does
+    /// this branch still have unaddressed review comments?" without
+    /// parsing `comments.json` itself (issue #14). Headless, like
+    /// `--export-comments`: no graph build, and a missing store is
+    /// `total: 0, unresolved: 0` rather than an error. Conflicts with
+    /// `--dump`, `--export-comments`, and `--publish-comments` -- all four
+    /// are mutually exclusive headless/GUI output modes.
+    #[arg(long, conflicts_with_all = ["dump", "export_comments", "publish_comments"])]
+    pub comments_status: bool,
     /// Load AI review findings (see [`crate::review::findings`]) from a
     /// JSON file and render them on the graph -- a severity badge per
     /// flagged node, summaries in the focus overlay, and per-line markers
@@ -120,13 +135,13 @@ pub struct Cli {
     /// of the default egui/eframe GUI: a `git log --graph`-style vertical
     /// rail DAG of every visible module, with fold-by-namespace as the
     /// zoom mechanic -- see `crate::tui`'s module doc. Conflicts with
-    /// `--dump`/`--export-comments`/
-    /// `--publish-comments`, same as the GUI path this replaces (all three
-    /// are headless and never launch either frontend). Works combined with
+    /// `--dump`/`--export-comments`/`--publish-comments`/`--comments-status`,
+    /// same as the GUI path this replaces (all four are headless and never
+    /// launch either frontend). Works combined with
     /// `--pr`/`--findings` exactly like the GUI does. Errors cleanly,
     /// naming the missing feature, on a build without the `tui` feature
     /// (see `src/main.rs`'s `launch_tui`).
-    #[arg(long, conflicts_with_all = ["dump", "export_comments", "publish_comments"])]
+    #[arg(long, conflicts_with_all = ["dump", "export_comments", "publish_comments", "comments_status"])]
     pub tui: bool,
 }
 

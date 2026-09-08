@@ -26,7 +26,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::comments::Comment;
+use super::comments::{set_resolved, Comment};
 use super::publish::PublishedStore;
 use super::review_state::ReviewStore;
 
@@ -83,6 +83,24 @@ pub fn save(git_dir: &Path, comments: &[Comment]) -> io::Result<()> {
     let json = serde_json::to_string_pretty(comments)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     fs::write(path, json)
+}
+
+/// Load the comment store, flip [`Comment::resolved_at`] on every comment in
+/// `ids` (per [`set_resolved`]), and save it back -- the frontend-neutral
+/// glue behind [`crate::core::app::Cmd::ResolveComments`], shared by the TUI
+/// and GUI executors so neither reimplements the load/mutate/save sequence.
+/// `resolved_at` is passed in rather than computed here (`Some(timestamp)`
+/// to mark `ids` addressed, `None` to clear them back to unaddressed) so
+/// this stays as deterministic and easy to test as [`save`]/[`load`]
+/// themselves -- the caller is the one who knows "now".
+pub fn resolve_comments(
+    git_dir: &Path,
+    ids: &[String],
+    resolved_at: Option<&str>,
+) -> io::Result<()> {
+    let mut comments = load(git_dir)?;
+    set_resolved(&mut comments, ids, resolved_at);
+    save(git_dir, &comments)
 }
 
 /// Where the review-completion store lives, given the repository's actual
@@ -171,6 +189,7 @@ mod tests {
             end_line: 1,
             text: "hello".to_string(),
             node: None,
+            resolved_at: None,
             created_at: "2026-08-18T00:00:00Z".to_string(),
         }
     }
@@ -228,6 +247,50 @@ mod tests {
         save(tmp.path(), &comments).expect("save");
 
         assert_eq!(load_or_empty(tmp.path()), (comments, None));
+    }
+
+    fn sample_with_id(id: &str) -> Comment {
+        Comment {
+            id: id.to_string(),
+            ..sample()
+        }
+    }
+
+    #[test]
+    fn resolve_comments_stamps_matching_ids_and_saves() {
+        let tmp = TempDir::new().unwrap();
+        let comments = vec![sample_with_id("c1"), sample_with_id("c2")];
+        save(tmp.path(), &comments).expect("save");
+
+        resolve_comments(
+            tmp.path(),
+            &["c1".to_string()],
+            Some("2026-08-19T00:00:00Z"),
+        )
+        .expect("resolve_comments");
+
+        let loaded = load(tmp.path()).expect("load");
+        assert_eq!(
+            loaded.iter().find(|c| c.id == "c1").unwrap().resolved_at,
+            Some("2026-08-19T00:00:00Z".to_string())
+        );
+        assert_eq!(
+            loaded.iter().find(|c| c.id == "c2").unwrap().resolved_at,
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_comments_can_clear_back_to_unresolved() {
+        let tmp = TempDir::new().unwrap();
+        let mut resolved = sample_with_id("c1");
+        resolved.resolved_at = Some("2026-08-19T00:00:00Z".to_string());
+        save(tmp.path(), &[resolved]).expect("save");
+
+        resolve_comments(tmp.path(), &["c1".to_string()], None).expect("resolve_comments");
+
+        let loaded = load(tmp.path()).expect("load");
+        assert_eq!(loaded[0].resolved_at, None);
     }
 
     fn sample_review_store() -> ReviewStore {

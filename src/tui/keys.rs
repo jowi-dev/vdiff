@@ -48,7 +48,8 @@ pub fn crossterm_key_to_input(code: KeyCode, modifiers: KeyModifiers) -> Option<
     }
     match code {
         KeyCode::Char(
-            c @ ('h' | 'j' | 'k' | 'l' | 'g' | 'G' | 'd' | 'r' | 't' | 's' | 'c' | 'v' | 'f' | '['
+            c @ ('h' | 'j' | 'k' | 'l' | 'g' | 'G' | 'd' | 'r' | 't' | 's' | 'c' | 'v' | 'm' | 'f'
+            | '['
             | ']'
             // `` ` `` and `z` aren't part of `crate::keymap::map_key`'s
             // shared vocabulary at all -- both are intercepted directly by
@@ -96,6 +97,7 @@ mod tests {
             ('s', KeyInput::Char('s')),
             ('c', KeyInput::Char('c')),
             ('v', KeyInput::Char('v')),
+            ('m', KeyInput::Char('m')),
             ('f', KeyInput::Char('f')),
             ('[', KeyInput::Char('[')),
             (']', KeyInput::Char(']')),
