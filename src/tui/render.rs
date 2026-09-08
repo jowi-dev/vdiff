@@ -408,7 +408,9 @@ pub fn display_line_count(rows: &[(RailRow, usize)]) -> usize {
 
 /// One node's rendered line: a status-colored bullet, `label`, and
 /// trailing badges -- changed-test checkmark, findings count/severity,
-/// comment count, reviewed mark. `label` is `id`'s
+/// unresolved comment count (see [`crate::review::comments::unresolved_count`]
+/// -- a node whose comments are all resolved shows no badge at all), reviewed
+/// mark. `label` is `id`'s
 /// [`rail_view::disambiguated_labels`] entry rather than
 /// `node.display_name` directly, so two distinct ids that happen to share
 /// a bare display name (e.g. two different `docs` directories) render
@@ -442,9 +444,10 @@ fn node_line(app: &App, id: &NodeId, label: &str) -> Line<'static> {
         ));
     }
     if let Some(comments) = app.comments.get(id) {
-        if !comments.is_empty() {
+        let unresolved = crate::review::comments::unresolved_count(comments);
+        if unresolved > 0 {
             spans.push(Span::styled(
-                format!(" 💬{}", comments.len()),
+                format!(" 💬{unresolved}"),
                 Style::default().fg(Color::Magenta),
             ));
         }
@@ -2038,6 +2041,58 @@ mod tests {
             })
         });
         assert!(dimmed, "expected the reviewed node's line to carry DIM");
+    }
+
+    /// Bare-bones [`crate::review::comments::Comment`] fixture for badge
+    /// tests -- only `resolved_at` varies across callers.
+    fn comment_fixture(resolved_at: Option<&str>) -> crate::review::comments::Comment {
+        crate::review::comments::Comment {
+            id: "c1".to_string(),
+            path: "leaf.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            text: "hi".to_string(),
+            node: None,
+            resolved_at: resolved_at.map(|s| s.to_string()),
+            created_at: "2026-08-18T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn comment_badge_hidden_when_every_comment_is_resolved() {
+        let mut app = app_at("leaf");
+        app.comments.insert(
+            NodeId::from("leaf"),
+            vec![
+                comment_fixture(Some("2026-08-19T00:00:00Z")),
+                comment_fixture(Some("2026-08-19T00:00:00Z")),
+            ],
+        );
+        let text = render_to_string(&app);
+        assert!(
+            !text.contains('💬'),
+            "expected no comment badge once every comment is resolved: {text}"
+        );
+    }
+
+    #[test]
+    fn comment_badge_shows_only_the_unresolved_count() {
+        let mut app = app_at("leaf");
+        app.comments.insert(
+            NodeId::from("leaf"),
+            vec![
+                comment_fixture(Some("2026-08-19T00:00:00Z")),
+                comment_fixture(None),
+                comment_fixture(None),
+            ],
+        );
+        let text = render_to_string(&app);
+        // The emoji glyph occupies a wide terminal cell, so its trailing
+        // continuation cell renders as a space -- "💬 2", not "💬2".
+        assert!(
+            text.contains("💬 2"),
+            "expected the badge to show the unresolved count (2), got: {text}"
+        );
     }
 
     /// Real-use shape: two distinct drawn nodes (`elixir:Foo.Auction`,
