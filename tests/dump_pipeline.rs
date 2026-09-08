@@ -90,12 +90,18 @@ fn fixture_repo() -> TempDir {
     tmp
 }
 
+/// Builds the graph, then round-trips it through `serde_json` -- the exact
+/// shape `--dump json` produces (see `src/cli/dump.rs`) -- so every test
+/// using this helper exercises serialization, not just the in-memory
+/// `ProjectGraph` `build_graph` hands back.
 fn dump_json(repo_dir: &Path, base_override: Option<&str>) -> ProjectGraph {
     let repo = Git2Repo::open(repo_dir).expect("open fixture repo");
     let opts = PipelineOptions {
         base_override: base_override.map(str::to_string),
     };
-    build_graph(&repo, &opts).expect("build_graph")
+    let graph = build_graph(&repo, &opts).expect("build_graph");
+    let json = serde_json::to_string(&graph).expect("serialize graph");
+    serde_json::from_str(&json).expect("deserialize graph")
 }
 
 fn assert_fixture_graph(graph: &ProjectGraph) {
@@ -172,6 +178,55 @@ fn base_override_produces_the_same_result_as_default_detection() {
     let repo_dir = fixture_repo();
     let graph = dump_json(repo_dir.path(), Some("main"));
     assert_fixture_graph(&graph);
+}
+
+/// Per-file `FileStats` and the graph's overall `DiffTotals` must survive
+/// the `serde_json` round trip `dump_json` now exercises (see its doc):
+/// each of the fixture's four changed files (`accounts.ex` modified,
+/// `mailer.ex` added, `backend/src/foo.rs` deleted, `README.md` modified)
+/// carries non-`None` stats with plausible counts, an unchanged file
+/// carries `None`, and `graph.totals` sums to the same four files.
+#[test]
+fn stats_and_totals_survive_the_json_round_trip() {
+    let repo_dir = fixture_repo();
+    let graph = dump_json(repo_dir.path(), None);
+
+    let accounts = graph
+        .node(&NodeId::from("elixir:MyApp.Accounts"))
+        .expect("Accounts node");
+    let accounts_stats = accounts.files[0].stats.expect("accounts.ex has stats");
+    assert!(accounts_stats.added > 0, "alias line was added");
+    assert!(!accounts_stats.binary);
+
+    let mailer = graph
+        .node(&NodeId::from("elixir:MyApp.Mailer"))
+        .expect("Mailer node");
+    let mailer_stats = mailer.files[0].stats.expect("mailer.ex has stats");
+    assert!(mailer_stats.added > 0, "whole new file is all additions");
+    assert_eq!(mailer_stats.deleted, 0);
+
+    let backend_foo = graph
+        .node(&NodeId::from("rust:backend::foo"))
+        .expect("backend::foo node");
+    let foo_stats = backend_foo.files[0].stats.expect("foo.rs has stats");
+    assert!(foo_stats.deleted > 0, "whole deleted file is all deletions");
+    assert_eq!(foo_stats.added, 0);
+
+    let repo_node = graph
+        .node(&NodeId::from("elixir:MyApp.Repo"))
+        .expect("Repo node");
+    assert_eq!(
+        repo_node.files[0].stats, None,
+        "untouched file carries no stats"
+    );
+
+    assert_eq!(
+        graph.totals.files, 4,
+        "accounts.ex, mailer.ex, foo.rs, README.md"
+    );
+    assert!(graph.totals.added > 0);
+    assert!(graph.totals.deleted > 0);
+    assert_eq!(graph.totals.binary, 0);
 }
 
 /// A branch that adds a non-UTF8 binary file (a fake PNG, including its
