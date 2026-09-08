@@ -759,7 +759,7 @@ fn paint_root_legend(
     }
 }
 
-/// Row 2: the `Enter`/`d`/`c`/`v` pane-open/comment/review hint, the review
+/// Row 2: the `Enter`/`d`/`c`/`v`/`m` pane-open/comment/review/resolve hint, the review
 /// progress readout ("N/M changed modules reviewed" -- see
 /// [`App::review_progress`]), the test-module hidden/shown hint (only drawn
 /// once there are any test modules to mention at all), then the two
@@ -777,7 +777,7 @@ fn paint_hint_row(
 
     cursor_x = paint_text(
         painter,
-        "Enter: file   d: diff   c: comment   v: review",
+        "Enter: file   d: diff   c: comment   v: review   m: addressed",
         cursor_x,
         text_y,
         HINT_COLOR,

@@ -67,7 +67,7 @@ pub mod render;
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::terminal::{
@@ -339,6 +339,7 @@ impl TuiState {
             },
             Cmd::CommentNode(node) => self.comment_node(&node),
             Cmd::PersistReviewState => self.persist_review_state(),
+            Cmd::ResolveComments { ids, resolved } => self.resolve_comments(&ids, resolved),
         }
     }
 
@@ -355,6 +356,32 @@ impl TuiState {
                 review_store::review_state_path(&git_dir).display()
             ));
         }
+    }
+
+    /// `Cmd::ResolveComments { ids, resolved }`: the graph pane's `m`
+    /// binding (issue #14's resolve toggle, `Msg::ToggleCommentsResolved`).
+    /// Stamps `resolved_at` to now (via
+    /// `crate::review::comments::format_iso8601`) when `resolved` is
+    /// `true`, clears it to `None` otherwise, through
+    /// `crate::review::store::resolve_comments` -- the same
+    /// load/mutate/save sequence `crate::ui::eframe_app` uses -- then
+    /// reloads `App::comments` via `Self::reload_comments` so the graph's
+    /// comment badges pick up the new unresolved counts immediately. A save
+    /// failure is surfaced via `Self::notice`, same as
+    /// `Self::persist_review_state`, rather than panicking or going to
+    /// stderr.
+    fn resolve_comments(&mut self, ids: &[String], resolved: bool) {
+        let git_dir = self.loader.repo.git_dir();
+        let resolved_at =
+            resolved.then(|| crate::review::comments::format_iso8601(SystemTime::now()));
+        if let Err(err) = review_store::resolve_comments(&git_dir, ids, resolved_at.as_deref()) {
+            self.notice = Some(format!(
+                "warning: failed to save {}: {err}",
+                review_store::comments_path(&git_dir).display()
+            ));
+            return;
+        }
+        self.reload_comments();
     }
 
     /// `Cmd::CommentNode(node)`: the graph pane's `c` binding on `node`

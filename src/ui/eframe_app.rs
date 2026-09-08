@@ -359,6 +359,7 @@ impl VdiffApp {
             }
             Cmd::CommentNode(node) => self.comment_node(node),
             Cmd::PersistReviewState => self.persist_review_state(),
+            Cmd::ResolveComments { ids, resolved } => self.resolve_comments(&ids, resolved),
         }
     }
 
@@ -596,6 +597,30 @@ impl VdiffApp {
         if saved {
             self.reload_comments();
         }
+    }
+
+    /// Handle [`Cmd::ResolveComments`] (`m` on the graph pane, issue #14's
+    /// resolve toggle): stamp `resolved_at` to now (via
+    /// [`crate::review::comments::format_iso8601`]) when `resolved` is
+    /// `true`, clear it to `None` otherwise, through
+    /// [`crate::review::store::resolve_comments`] -- the same load/mutate/
+    /// save sequence [`crate::tui::TuiState`]'s counterpart uses -- then
+    /// reload [`App::comments`] via [`Self::reload_comments`] so the
+    /// graph's comment badges pick up the new unresolved counts
+    /// immediately. A save failure is logged, not fatal, mirroring
+    /// [`Self::persist_review_state`]'s own failure handling.
+    fn resolve_comments(&mut self, ids: &[String], resolved: bool) {
+        let git_dir = self.diff_loader.repo.git_dir();
+        let resolved_at =
+            resolved.then(|| crate::review::comments::format_iso8601(std::time::SystemTime::now()));
+        if let Err(err) = review_store::resolve_comments(&git_dir, ids, resolved_at.as_deref()) {
+            eprintln!(
+                "warning: failed to save {}: {err}",
+                review_store::comments_path(&git_dir).display()
+            );
+            return;
+        }
+        self.reload_comments();
     }
 
     /// Reload `<git_dir>/vdiff/comments.json` and remap it onto
@@ -896,7 +921,7 @@ fn extract_key_presses(events: &[egui::Event]) -> Vec<(Key, Modifiers)> {
 /// Translate an egui key press (with its modifiers) to vdiff's
 /// toolkit-independent [`KeyInput`]. Pure and unit-tested: with Ctrl held,
 /// only `w`/`d`/`u` map to anything ([`KeyInput::Ctrl`]); otherwise the
-/// keys [`crate::keymap::map_key`] cares about (h/j/k/l/g/G/d/r/t/s/c/f/[/],
+/// keys [`crate::keymap::map_key`] cares about (h/j/k/l/g/G/d/r/t/s/c/v/m/f/[/],
 /// Enter, Esc) map to anything, arrows map to [`KeyInput::Arrow`]
 /// unconditionally (checked before the Ctrl branch, so `Ctrl-w` followed by
 /// an arrow -- held or released -- both complete the `Ctrl-w` chord the
@@ -928,6 +953,7 @@ pub fn egui_key_to_input(key: Key, modifiers: Modifiers) -> Option<KeyInput> {
         Key::S => Some(KeyInput::Char('s')),
         Key::C => Some(KeyInput::Char('c')),
         Key::V => Some(KeyInput::Char('v')),
+        Key::M => Some(KeyInput::Char('m')),
         Key::F => Some(KeyInput::Char('f')),
         Key::OpenBracket => Some(KeyInput::Char('[')),
         Key::CloseBracket => Some(KeyInput::Char(']')),
@@ -967,6 +993,7 @@ mod tests {
             (Key::S, KeyInput::Char('s')),
             (Key::C, KeyInput::Char('c')),
             (Key::V, KeyInput::Char('v')),
+            (Key::M, KeyInput::Char('m')),
             (Key::F, KeyInput::Char('f')),
             (Key::OpenBracket, KeyInput::Char('[')),
             (Key::CloseBracket, KeyInput::Char(']')),

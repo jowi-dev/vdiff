@@ -1750,15 +1750,15 @@ fn draw_legend(
             (Screen::Graph, Pane::Graph) => {
                 let mut hint = match view_mode {
                     ViewMode::Rail => {
-                        "` plane  j/k move  h/l fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
+                        "` plane  j/k move  h/l fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  m addressed  gt test  Ctrl-e edit  q quit"
                             .to_string()
                     }
                     ViewMode::Canvas => {
-                        "` rail  h/j/k/l move  zc/zo fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
+                        "` rail  h/j/k/l move  zc/zo fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  m addressed  gt test  Ctrl-e edit  q quit"
                             .to_string()
                     }
                     ViewMode::Plane => {
-                        "` canvas  h/j/k/l move  zc/zo fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  zf fns  q quit"
+                        "` canvas  h/j/k/l move  zc/zo fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  m addressed  gt test  Ctrl-e edit  zf fns  q quit"
                             .to_string()
                     }
                 };
@@ -2885,7 +2885,13 @@ mod tests {
     fn canvas_legend_shows_edges_not_drawn_when_a_channel_drops_edges() {
         let dropped_edges = 3;
         let app = app_for(diamond_graph_fixture(), "child");
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        // Wide enough that the (longer, post-`m` toggle) hint line doesn't
+        // word-wrap its trailing "+N edges" segment across two buffer rows --
+        // see `plane_legend_shows_edges_hidden_hint_when_the_budget_trips`'s
+        // own comment for why: `buffer_text`/this test's manual row-join
+        // don't insert a separating space, so a wrap mid-phrase would
+        // otherwise break the substring match below.
+        let mut terminal = Terminal::new(TestBackend::new(220, 24)).expect("test backend");
         terminal
             .draw(|frame| {
                 let area = frame.area();

@@ -413,6 +413,22 @@ pub enum Msg {
     /// toggle actually did something, so a `v` on an unchanged node (or off
     /// the graph pane) never triggers a save.
     ToggleReviewed,
+    /// `m` on [`Pane::Graph`]: toggle the focused node's comments (see
+    /// [`App::comments`]) between addressed and unaddressed. Only acted on
+    /// on [`Screen::Graph`]/[`Pane::Graph`] with no picker open, matching
+    /// every other graph-pane message. The toggle direction is: if the
+    /// focused node has any comment with [`Comment::resolved_at`] unset,
+    /// mark exactly those comments resolved; otherwise (the node has
+    /// comments and every one is already resolved), clear `resolved_at` on
+    /// all of them. The ids to flip and the direction are both computed
+    /// purely from `App::comments[focus]` -- a focus with no entry there
+    /// (nothing ever commented, or a function-drill row, which
+    /// [`crate::review::comments::map_comments`] never populates) is a
+    /// no-op, emitting [`Cmd::None`]. The actual `resolved_at` write
+    /// (timestamp or `None`) and the comments-store save/reload happen in
+    /// [`Cmd::ResolveComments`] -- `core` only decides which ids move which
+    /// way.
+    ToggleCommentsResolved,
     /// `j`/`k` on the `--tui` rail view: move focus up/down the fold-aware
     /// visible row list (see [`crate::core::rail_view::visible_rows`]),
     /// rather than the layer/x-center-nearest logic [`Msg::FocusMove`] uses
@@ -549,6 +565,24 @@ pub enum Cmd {
     /// interrupted review resumes from the last mark) matters more here
     /// than avoiding a few extra small writes.
     PersistReviewState,
+    /// [`Msg::ToggleCommentsResolved`] found comments to flip: the glue
+    /// should load the comments store via [`crate::review::store`], apply
+    /// [`crate::review::comments::set_resolved`] to `ids` -- stamping
+    /// [`crate::review::comments::format_iso8601`]`(SystemTime::now())`
+    /// when `resolved` is `true`, `None` when `false` -- save the store
+    /// back, then reload [`App::comments`] the same way the comment-saved
+    /// drain already does, so the graph's comment badges (issue #14) pick
+    /// up the new counts. Fired only when there's something to change --
+    /// `core` never emits this for an empty `ids` -- mirroring
+    /// [`Cmd::PersistReviewState`]'s write-on-actual-change contract.
+    ResolveComments {
+        /// The comment ids to flip -- see [`Msg::ToggleCommentsResolved`]'s
+        /// doc for how these are chosen.
+        ids: Vec<String>,
+        /// `true` to mark `ids` addressed (stamp `resolved_at`), `false` to
+        /// clear them back to unaddressed.
+        resolved: bool,
+    },
 }
 
 /// Advance `app` in response to `msg`, returning the new state and any
@@ -823,6 +857,7 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Cmd) {
         }
         Msg::GoToTest => go_to_test(app),
         Msg::ToggleReviewed => toggle_reviewed(app),
+        Msg::ToggleCommentsResolved => toggle_comments_resolved(app),
         Msg::RailFocusMove(dir) => rail_focus_move(app, dir),
         Msg::CollapseFocusedNamespace => collapse_focused_namespace(app),
         Msg::ExpandFocusedNamespace => expand_focused_namespace(app),
@@ -985,6 +1020,39 @@ fn toggle_reviewed(mut app: App) -> (App, Cmd) {
         return (app, Cmd::None);
     }
     (app, Cmd::PersistReviewState)
+}
+
+/// Handle [`Msg::ToggleCommentsResolved`]: only on
+/// [`Screen::Graph`]/[`Pane::Graph`] with no picker open, look up
+/// `App::comments` for the focused node and, if it has any, decide the
+/// toggle direction -- any unresolved comment present means "resolve just
+/// those", all resolved means "clear all back to unresolved" -- and emit
+/// [`Cmd::ResolveComments`] with the matching ids. A no-op (emitting
+/// [`Cmd::None`]) if the focus has no entry in `App::comments` at all, e.g.
+/// a function-drill row or a node nobody has commented on.
+fn toggle_comments_resolved(app: App) -> (App, Cmd) {
+    if !on_graph_with_no_picker_and_graph_pane(&app) {
+        return (app, Cmd::None);
+    }
+    let Some(comments) = app.comments.get(&app.focus) else {
+        return (app, Cmd::None);
+    };
+    if comments.is_empty() {
+        return (app, Cmd::None);
+    }
+    let unresolved: Vec<String> = comments
+        .iter()
+        .filter(|c| c.resolved_at.is_none())
+        .map(|c| c.id.clone())
+        .collect();
+    let (ids, resolved) = if unresolved.is_empty() {
+        // Every comment is already resolved -- clear all of them back to
+        // unaddressed.
+        (comments.iter().map(|c| c.id.clone()).collect(), false)
+    } else {
+        (unresolved, true)
+    };
+    (app, Cmd::ResolveComments { ids, resolved })
 }
 
 /// Handle [`Msg::ToggleTests`]: flip `show_tests`, recompute `layers`/`rows`
@@ -2171,6 +2239,92 @@ mod tests {
         let mut app = app_at("leaf_a");
         app.pane = Pane::File;
         let (_app, cmd) = update(app, Msg::CommentNode);
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    /// A minimal fixture [`Comment`] for [`Msg::ToggleCommentsResolved`]
+    /// tests -- only `id` and `resolved_at` vary case to case.
+    fn fixture_comment(id: &str, resolved_at: Option<&str>) -> Comment {
+        Comment {
+            id: id.to_string(),
+            path: "leaf_a.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            text: "some text".to_string(),
+            node: Some("leaf_a".to_string()),
+            resolved_at: resolved_at.map(str::to_string),
+            created_at: "2026-08-18T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn toggle_comments_resolved_resolves_only_unresolved_ids() {
+        let mut app = app_at("leaf_a");
+        app.comments.insert(
+            NodeId::from("leaf_a"),
+            vec![
+                fixture_comment("c1", None),
+                fixture_comment("c2", Some("2026-08-19T00:00:00Z")),
+                fixture_comment("c3", None),
+            ],
+        );
+        let (_app, cmd) = update(app, Msg::ToggleCommentsResolved);
+        assert_eq!(
+            cmd,
+            Cmd::ResolveComments {
+                ids: vec!["c1".to_string(), "c3".to_string()],
+                resolved: true,
+            }
+        );
+    }
+
+    #[test]
+    fn toggle_comments_resolved_clears_all_when_all_already_resolved() {
+        let mut app = app_at("leaf_a");
+        app.comments.insert(
+            NodeId::from("leaf_a"),
+            vec![
+                fixture_comment("c1", Some("2026-08-19T00:00:00Z")),
+                fixture_comment("c2", Some("2026-08-19T00:00:01Z")),
+            ],
+        );
+        let (_app, cmd) = update(app, Msg::ToggleCommentsResolved);
+        assert_eq!(
+            cmd,
+            Cmd::ResolveComments {
+                ids: vec!["c1".to_string(), "c2".to_string()],
+                resolved: false,
+            }
+        );
+    }
+
+    #[test]
+    fn toggle_comments_resolved_noop_with_no_comments_entry() {
+        let app = app_at("leaf_a");
+        let (_app, cmd) = update(app, Msg::ToggleCommentsResolved);
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn toggle_comments_resolved_noop_when_picker_open() {
+        let mut app = app_at("leaf_a");
+        app.comments
+            .insert(NodeId::from("leaf_a"), vec![fixture_comment("c1", None)]);
+        app.picker = Some(EdgePicker {
+            candidates: vec![NodeId::from("target_x")],
+            selected: 0,
+        });
+        let (_app, cmd) = update(app, Msg::ToggleCommentsResolved);
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn toggle_comments_resolved_noop_on_file_pane() {
+        let mut app = app_at("leaf_a");
+        app.comments
+            .insert(NodeId::from("leaf_a"), vec![fixture_comment("c1", None)]);
+        app.pane = Pane::File;
+        let (_app, cmd) = update(app, Msg::ToggleCommentsResolved);
         assert_eq!(cmd, Cmd::None);
     }
 
