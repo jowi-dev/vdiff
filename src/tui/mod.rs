@@ -2348,17 +2348,13 @@ mod tests {
         assert_eq!(state.app.focus, partners);
     }
 
-    /// A namespace `ns` (childful, so it's a fold candidate) plus an
-    /// unrelated childless top-level sibling `b` -- enough to exercise
-    /// `zM`/`zR` actually folding/unfolding something, unlike
-    /// `state_with_layered_graph`'s two childless roots.
-    fn state_with_foldable_namespace() -> TuiState {
-        state_with_namespace_and_sibling()
-    }
-
     #[test]
     fn zm_folds_all_and_zr_unfolds_all_in_plane_mode() {
-        let mut state = state_with_foldable_namespace();
+        // `state_with_namespace_and_sibling`: a childful namespace `ns`
+        // (a fold candidate) plus a childless top-level sibling -- enough
+        // for `zM`/`zR` to actually fold/unfold something, unlike
+        // `state_with_layered_graph`'s two childless roots.
+        let mut state = state_with_namespace_and_sibling();
         assert_eq!(state.view_mode, ViewMode::Plane);
 
         handle_key(&mut state, press('z'));
@@ -2381,7 +2377,7 @@ mod tests {
 
     #[test]
     fn zm_folds_all_and_zr_unfolds_all_in_canvas_mode() {
-        let mut state = state_with_foldable_namespace();
+        let mut state = state_with_namespace_and_sibling();
         state.view_mode = ViewMode::Canvas;
 
         handle_key(&mut state, press('z'));
