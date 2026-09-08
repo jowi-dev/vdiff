@@ -22,6 +22,7 @@
 //! already feeds `App::viewport_rows` -- see that call site's own comment.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use ratatui::layout::{Alignment, Constraint, Direction as LayoutDirection, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -34,7 +35,7 @@ use crate::core::diff_state::DiffMode;
 use crate::core::file_view::FileViewState;
 use crate::core::rail_view::{self, RailRow};
 use crate::graph::canvas::{self, CanvasRole, Channel};
-use crate::graph::model::{GitStatus, NodeId};
+use crate::graph::model::{FileStats, GitStatus, NodeId, ProjectGraph};
 use crate::graph::plane::{self, PlaneLayout};
 use crate::graph::plane_edges::{self, PlaneEdges};
 use crate::graph::rails::{self, RailRole};
@@ -163,23 +164,37 @@ pub fn draw(
                     );
                 }
             } else {
+                let (graph_area, sidebar_area) = split_focus_sidebar(main_area);
                 match view_mode {
                     ViewMode::Rail => {
-                        dropped_edges = draw_rail_graph(frame, main_area, app, scroll.rail);
+                        dropped_edges = draw_rail_graph(frame, graph_area, app, scroll.rail);
                     }
                     ViewMode::Canvas => {
                         dropped_edges = draw_canvas_graph(
                             frame,
-                            main_area,
+                            graph_area,
                             app,
                             scroll.canvas,
                             scroll.canvas_x,
                         );
                     }
                     ViewMode::Plane => {
-                        dropped_edges =
-                            draw_plane_graph(frame, main_area, app, scroll.canvas, scroll.canvas_x);
+                        dropped_edges = draw_plane_graph(
+                            frame,
+                            graph_area,
+                            app,
+                            scroll.canvas,
+                            scroll.canvas_x,
+                        );
                     }
+                }
+                if let Some(sidebar_area) = sidebar_area {
+                    // A fresh `visible_graph()` call, same cost `build_plane_view`
+                    // above already pays each frame -- see [`split_focus_sidebar`]'s
+                    // doc for why the sidebar reads the laid-out graph rather than
+                    // `app.graph` directly.
+                    let visible = app.visible_graph();
+                    draw_focus_sidebar(frame, sidebar_area, &visible, &app.focus);
                 }
             }
         }
@@ -191,6 +206,165 @@ pub fn draw(
     if app.pane == Pane::Graph {
         draw_picker(frame, area, app);
     }
+}
+
+/// Fixed width, in columns, of the focus-sidebar right column [`split_focus_sidebar`]
+/// carves out of `main_area` on the rail/canvas/plane graph views -- see
+/// that function's own doc for the narrow-terminal threshold below which no
+/// sidebar is shown at all.
+const FOCUS_SIDEBAR_WIDTH: u16 = 28;
+
+/// `main_area` must be at least this wide before [`split_focus_sidebar`]
+/// carves a [`FOCUS_SIDEBAR_WIDTH`]-column sidebar out of it -- below this,
+/// a narrow terminal keeps its full width for the graph itself rather than
+/// squeezing both into an unreadable sliver each.
+const FOCUS_SIDEBAR_MIN_AREA_WIDTH: u16 = 60;
+
+/// Split `main_area` into `(graph_area, sidebar_area)` for the rail/canvas/
+/// plane graph views (issue #25's focused-node stats sidebar) -- a fixed
+/// [`FOCUS_SIDEBAR_WIDTH`]-column right column carved off, or `sidebar_area
+/// == None` (with `graph_area` left untouched, full width) when `main_area`
+/// is narrower than [`FOCUS_SIDEBAR_MIN_AREA_WIDTH`]. Only called from the
+/// [`draw`] branch that paints one of the three graph views -- the file
+/// pane, diff pane, and edge picker never get a sidebar at all, per the
+/// task brief.
+fn split_focus_sidebar(main_area: Rect) -> (Rect, Option<Rect>) {
+    if main_area.width < FOCUS_SIDEBAR_MIN_AREA_WIDTH {
+        return (main_area, None);
+    }
+    let chunks = Layout::default()
+        .direction(LayoutDirection::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(FOCUS_SIDEBAR_WIDTH)])
+        .split(main_area);
+    (chunks[0], Some(chunks[1]))
+}
+
+/// Pure data for the focused-node stats sidebar -- see [`build_focus_sidebar`],
+/// the pure builder that assembles this from a graph and focus id, and
+/// [`draw_focus_sidebar`], the thin paint function that turns it into a
+/// bordered `Paragraph`.
+struct FocusSidebar {
+    /// The focused node's display name, shown as the sidebar block's title.
+    /// Empty for an unknown focus id.
+    title: String,
+    /// The subtree rollup line, [`crate::graph::model::DiffTotals::summary_line`]'s
+    /// format -- reused so the sidebar and legend read the same way.
+    rollup: String,
+    /// One line per changed file in the subtree, capped to `max_file_lines`
+    /// with a final `... and N more` line when truncated -- empty when the
+    /// subtree has zero or one changed file (see [`build_focus_sidebar`]'s
+    /// doc for why a single-file rollup already says everything the
+    /// breakdown would).
+    files: Vec<String>,
+}
+
+/// Recursively collect every changed file (`stats: Some`) under `id` in
+/// `graph`, deduped by path -- the same walk/dedupe [`ProjectGraph::subtree_totals`]
+/// does for its running totals, but collecting entries instead of summing
+/// them, so [`build_focus_sidebar`]'s rollup (from `subtree_totals`) and its
+/// per-file breakdown (from this) always agree on which files count.
+/// Unchanged tracked files (`stats: None`) are skipped, matching
+/// `subtree_totals`. Sorted by path for a stable, deterministic order.
+fn collect_subtree_files(graph: &ProjectGraph, id: &NodeId) -> Vec<(PathBuf, FileStats)> {
+    fn walk(
+        graph: &ProjectGraph,
+        id: &NodeId,
+        seen: &mut std::collections::HashSet<PathBuf>,
+        out: &mut Vec<(PathBuf, FileStats)>,
+    ) {
+        let Some(node) = graph.node(id) else {
+            return;
+        };
+        for file in &node.files {
+            let Some(stats) = file.stats else { continue };
+            if !seen.insert(file.path.clone()) {
+                continue;
+            }
+            out.push((file.path.clone(), stats));
+        }
+        for child in &node.children {
+            walk(graph, child, seen, out);
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    walk(graph, id, &mut seen, &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Build the pure [`FocusSidebar`] data for `focus` in `graph` -- the graph
+/// must be the caller's `App::visible_graph()`, not the raw `App::graph`,
+/// so a folded namespace's rollup matches what's actually drawn under it
+/// (see [`draw`]'s call site). Unknown ids degrade to an empty title and a
+/// zeroed rollup (mirroring [`ProjectGraph::subtree_totals`]'s own
+/// unknown-id fallback) rather than panicking. The per-file breakdown is
+/// omitted entirely when the subtree has zero or one changed file -- the
+/// rollup line already says everything a one-line breakdown would.
+/// `max_file_lines` caps how many file lines are emitted before a final
+/// `... and N more` summary line takes their place.
+fn build_focus_sidebar(
+    graph: &ProjectGraph,
+    focus: &NodeId,
+    max_file_lines: usize,
+) -> FocusSidebar {
+    let title = graph
+        .node(focus)
+        .map(|n| n.display_name.clone())
+        .unwrap_or_default();
+    let rollup = graph.subtree_totals(focus).summary_line();
+    let changed_files = collect_subtree_files(graph, focus);
+
+    let mut files = Vec::new();
+    if changed_files.len() > 1 {
+        let shown = changed_files.len().min(max_file_lines);
+        for (path, stats) in &changed_files[..shown] {
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string();
+            let desc = if stats.binary {
+                "binary".to_string()
+            } else {
+                format!("+{}/-{}", stats.added, stats.deleted)
+            };
+            files.push(format!("{name} {desc}"));
+        }
+        let remaining = changed_files.len() - shown;
+        if remaining > 0 {
+            files.push(format!("... and {remaining} more"));
+        }
+    }
+
+    FocusSidebar {
+        title,
+        rollup,
+        files,
+    }
+}
+
+/// Paint the focused-node stats sidebar (issue #25) into `area`: a bordered
+/// block titled with the focused node's display name, its subtree rollup
+/// line, and a capped per-file breakdown -- see [`build_focus_sidebar`] for
+/// how those are assembled and [`FocusSidebar`]'s doc for the shape.
+/// `graph` must be the caller's `App::visible_graph()` -- see [`draw`]'s
+/// call site and [`build_focus_sidebar`]'s doc for why.
+fn draw_focus_sidebar(frame: &mut Frame, area: Rect, graph: &ProjectGraph, focus: &NodeId) {
+    // One line for the rollup, the rest (after the block's two border rows)
+    // free for the per-file breakdown.
+    let max_file_lines = (area.height as usize).saturating_sub(2).saturating_sub(1);
+    let sidebar = build_focus_sidebar(graph, focus, max_file_lines);
+
+    let mut lines = vec![Line::from(sidebar.rollup)];
+    lines.extend(sidebar.files.into_iter().map(Line::from));
+
+    let block = Block::bordered().title(format!(" {} ", sidebar.title));
+    frame.render_widget(
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+        area,
+    );
 }
 
 /// How many screen lines fit in a terminal of `terminal_rows` total rows --
@@ -2249,7 +2423,10 @@ mod tests {
     fn legend_omits_diff_totals_line_when_the_graph_has_no_changes() {
         let app = app_at("leaf");
         assert_eq!(app.graph.totals, DiffTotals::default());
-        let text = render_to_string(&app);
+        // Narrow enough that the focus sidebar doesn't render (it has its
+        // own, unrelated "0 files" rollup for a focus with no stats) --
+        // this test only cares about the legend's own totals line.
+        let text = render_to_string_at(&app, 50, 24, 0);
         assert!(
             !text.contains("across 0 files"),
             "a no-change diff should not render a totals line, got: {text}"
@@ -3557,5 +3734,263 @@ mod tests {
             crate::core::focus::Direction::Down,
         );
         assert_eq!(target, NodeId::from("p2"));
+    }
+
+    // -- Focus sidebar (issue #25) --------------------------------------
+
+    /// `ns` has two changed children -- `child_a` (a text file with line
+    /// stats) and `child_b` (a binary file) -- and one unchanged leaf,
+    /// `child_c`, whose file carries `stats: None` and must never appear in
+    /// a sidebar breakdown. Returns `(graph, ns_id)`.
+    fn sidebar_graph_fixture() -> (ProjectGraph, NodeId) {
+        let ns_id = NodeId::from("ns");
+        let a_id = NodeId::from("ns::child_a");
+        let b_id = NodeId::from("ns::child_b");
+        let c_id = NodeId::from("ns::child_c");
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            a_id.clone(),
+            ModuleNode {
+                id: a_id.clone(),
+                display_name: "child_a".to_string(),
+                parent: Some(ns_id.clone()),
+                children: vec![],
+                status: GitStatus::Modified,
+                files: vec![FileRef {
+                    path: PathBuf::from("lib/ns/child_a.ex"),
+                    base_blob: Some("b".to_string()),
+                    head_blob: Some("h".to_string()),
+                    stats: Some(FileStats {
+                        added: 5,
+                        deleted: 1,
+                        binary: false,
+                    }),
+                }],
+            },
+        );
+        nodes.insert(
+            b_id.clone(),
+            ModuleNode {
+                id: b_id.clone(),
+                display_name: "child_b".to_string(),
+                parent: Some(ns_id.clone()),
+                children: vec![],
+                status: GitStatus::Modified,
+                files: vec![FileRef {
+                    path: PathBuf::from("lib/ns/child_b.png"),
+                    base_blob: Some("b".to_string()),
+                    head_blob: Some("h".to_string()),
+                    stats: Some(FileStats {
+                        added: 0,
+                        deleted: 0,
+                        binary: true,
+                    }),
+                }],
+            },
+        );
+        nodes.insert(
+            c_id.clone(),
+            ModuleNode {
+                id: c_id.clone(),
+                display_name: "child_c".to_string(),
+                parent: Some(ns_id.clone()),
+                children: vec![],
+                status: GitStatus::Unchanged,
+                files: vec![FileRef {
+                    path: PathBuf::from("lib/ns/child_c.ex"),
+                    base_blob: Some("b".to_string()),
+                    head_blob: Some("b".to_string()),
+                    stats: None,
+                }],
+            },
+        );
+        nodes.insert(
+            ns_id.clone(),
+            ModuleNode {
+                id: ns_id.clone(),
+                display_name: "ns".to_string(),
+                parent: None,
+                children: vec![a_id, b_id, c_id],
+                status: GitStatus::Unchanged,
+                files: vec![],
+            },
+        );
+
+        (
+            ProjectGraph {
+                roots: vec![ns_id.clone()],
+                nodes,
+                edges: vec![],
+                totals: Default::default(),
+            },
+            ns_id,
+        )
+    }
+
+    #[test]
+    fn focus_sidebar_shows_rollup_and_no_breakdown_for_a_single_file_node() {
+        let (graph, ns_id) = sidebar_graph_fixture();
+        let child_a = NodeId::from("ns::child_a");
+        let sidebar = build_focus_sidebar(&graph, &child_a, 10);
+        assert_eq!(sidebar.title, "child_a");
+        assert_eq!(sidebar.rollup, "+5 / -1 across 1 file");
+        assert!(
+            sidebar.files.is_empty(),
+            "a single-file node has no per-file breakdown, got {:?}",
+            sidebar.files
+        );
+        let _ = ns_id;
+    }
+
+    #[test]
+    fn focus_sidebar_sums_deduped_children_for_a_namespace_parent() {
+        let (graph, ns_id) = sidebar_graph_fixture();
+        let sidebar = build_focus_sidebar(&graph, &ns_id, 10);
+        assert_eq!(sidebar.title, "ns");
+        // 5+0 added, 1+0 deleted, across 2 changed files (unchanged
+        // child_c's `stats: None` file is excluded), one binary.
+        assert_eq!(sidebar.rollup, "+5 / -1 across 2 files (1 binary)");
+    }
+
+    #[test]
+    fn focus_sidebar_lists_files_by_last_path_component_with_binary_marked() {
+        let (graph, ns_id) = sidebar_graph_fixture();
+        let sidebar = build_focus_sidebar(&graph, &ns_id, 10);
+        assert!(
+            sidebar
+                .files
+                .iter()
+                .any(|l| l.contains("child_a.ex") && l.contains("+5") && l.contains("-1")),
+            "expected a text-file breakdown line, got {:?}",
+            sidebar.files
+        );
+        assert!(
+            sidebar
+                .files
+                .iter()
+                .any(|l| l.contains("child_b.png") && l.contains("binary")),
+            "expected a binary-file breakdown line, got {:?}",
+            sidebar.files
+        );
+    }
+
+    #[test]
+    fn focus_sidebar_truncates_the_file_list_with_a_more_line() {
+        let (graph, ns_id) = sidebar_graph_fixture();
+        let sidebar = build_focus_sidebar(&graph, &ns_id, 1);
+        assert_eq!(sidebar.files.len(), 2, "1 kept file + 1 '...more' line");
+        assert!(
+            sidebar.files.last().unwrap().contains("... and 1 more"),
+            "expected a truncation line, got {:?}",
+            sidebar.files
+        );
+    }
+
+    #[test]
+    fn focus_sidebar_is_empty_rollup_for_an_unknown_focus() {
+        let (graph, _) = sidebar_graph_fixture();
+        let sidebar = build_focus_sidebar(&graph, &NodeId::from("missing"), 10);
+        assert_eq!(sidebar.title, "");
+        assert_eq!(sidebar.rollup, "+0 / -0 across 0 files");
+        assert!(sidebar.files.is_empty());
+    }
+
+    #[test]
+    fn split_focus_sidebar_carves_a_fixed_width_right_column_when_wide_enough() {
+        let main_area = Rect::new(0, 0, 100, 20);
+        let (graph_area, sidebar_area) = split_focus_sidebar(main_area);
+        let sidebar_area = sidebar_area.expect("wide enough for a sidebar");
+        assert_eq!(sidebar_area.width, FOCUS_SIDEBAR_WIDTH);
+        assert_eq!(graph_area.width, 100 - FOCUS_SIDEBAR_WIDTH);
+    }
+
+    #[test]
+    fn split_focus_sidebar_skips_the_sidebar_when_the_terminal_is_narrow() {
+        let main_area = Rect::new(0, 0, 59, 20);
+        let (graph_area, sidebar_area) = split_focus_sidebar(main_area);
+        assert!(sidebar_area.is_none());
+        assert_eq!(graph_area.width, 59, "narrow terminal keeps the full graph");
+    }
+
+    #[test]
+    fn plane_view_renders_the_focus_sidebar_when_wide_enough() {
+        let (graph, ns_id) = sidebar_graph_fixture();
+        let app = app_for_plane(graph, "ns::child_a");
+        let text = render_plane_to_string(&app, 120, 24, 0, 0);
+        let _ = ns_id;
+        assert!(
+            text.contains("child_a"),
+            "expected the focused node's name in the sidebar, got:\n{text}"
+        );
+        assert!(
+            text.contains("+5 / -1 across 1 file"),
+            "expected the focused node's rollup in the sidebar, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn plane_view_moving_focus_changes_the_sidebar_rollup() {
+        let (graph, ns_id) = sidebar_graph_fixture();
+        let app = app_for_plane(graph, "ns::child_a");
+        let text_a = render_plane_to_string(&app, 120, 24, 0, 0);
+        assert!(text_a.contains("+5 / -1 across 1 file"));
+
+        let mut app_ns = app_for_plane(app.graph.clone(), "ns");
+        app_ns.layers = app.layers.clone();
+        let text_ns = render_plane_to_string(&app_ns, 120, 24, 0, 0);
+        // The sidebar's fixed 28-column width wraps this line mid-phrase --
+        // assert on the fragments the wrap can't separate, same as the
+        // legend's own wrap-tolerant tests.
+        assert!(
+            text_ns.contains("+5 / -1 across 2 files"),
+            "expected the namespace's deduped rollup, got:\n{text_ns}"
+        );
+        assert!(
+            text_ns.contains("binary)"),
+            "expected the binary-file count, got:\n{text_ns}"
+        );
+        let _ = ns_id;
+    }
+
+    #[test]
+    fn plane_view_hides_the_focus_sidebar_on_a_narrow_terminal() {
+        let (graph, _ns_id) = sidebar_graph_fixture();
+        let app = app_for_plane(graph, "ns::child_a");
+        let text = render_plane_to_string(&app, 50, 24, 0, 0);
+        assert!(
+            !text.contains("across 1 file"),
+            "a narrow terminal must not render the sidebar, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn file_view_renders_no_focus_sidebar() {
+        let (graph, _ns_id) = sidebar_graph_fixture();
+        let mut app = app_for_plane(graph, "ns::child_a");
+        app.pane = Pane::File;
+        app.file_view = None;
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Plane,
+                    None,
+                )
+            })
+            .expect("draw");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            !text.contains("across 1 file"),
+            "the file pane must not render the graph focus sidebar, got:\n{text}"
+        );
     }
 }
