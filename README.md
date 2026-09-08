@@ -36,8 +36,8 @@ independent of each other: `gui` (the egui/eframe graph-canvas GUI) and
 --graph`-style vertical rail DAG of every visible module, rather than the
 2D graph canvas). A
 `--no-default-features` build is fully headless: no window or terminal UI
-ever opens, and `--dump`/`--export-comments`/`--publish-comments` are the
-only usable entry points -- any invocation that would otherwise launch a
+ever opens, and `--dump`/`--export-comments`/`--comments-status`/
+`--publish-comments` are the only usable entry points -- any invocation that would otherwise launch a
 frontend (bare `vdiff`, `--tui`, `--smoke`, `--pr` without a headless flag,
 ...) exits 1 with a message naming the missing feature instead.
 
@@ -180,6 +180,14 @@ vdiff reads that store back out with:
 ```sh
 vdiff --export-comments   # print every captured comment as markdown
 ```
+
+For external tooling that just needs to know whether a branch's review
+comments are addressed — a ticket board like tm/tskmstr, say — without
+parsing `comments.json` itself, `vdiff --comments-status` prints a small
+JSON summary instead (`repo`, `branch`, `total`, `unresolved`) and exits 0,
+including when there's no store yet (`total: 0, unresolved: 0`). See
+[`docs/comments-schema.md`](docs/comments-schema.md)'s "Status summary
+output" section for the exact shape.
 
 ## AI-review payload
 

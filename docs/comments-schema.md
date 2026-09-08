@@ -90,3 +90,33 @@ This is schema **v1**. A future incompatible change bumps this document
 (and, if the shape itself needs to change, an explicit `schema` field would
 be added to disambiguate old files) rather than silently breaking either
 project's reader/writer.
+
+## Status summary output
+
+`vdiff --comments-status` prints a single pretty-printed JSON object to
+stdout and exits 0 -- a small, stable read surface for external tooling
+(a ticket board like tm/tskmstr, say) that wants to know whether a
+branch's review comments are addressed, without parsing `comments.json`
+itself:
+
+```json
+{
+  "repo": "vdiff",
+  "branch": "main",
+  "total": 3,
+  "unresolved": 2
+}
+```
+
+| Field        | Type   | Notes                                                                 |
+|--------------|--------|------------------------------------------------------------------------|
+| `repo`       | string | Repo display name -- the reviewed worktree's directory name, same derivation as `--export-comments`'s markdown header. |
+| `branch`     | string | Current branch name (`HEAD`'s shorthand, or `"HEAD"` for a detached head). |
+| `total`      | number | Total number of comments in the store, resolved or not.               |
+| `unresolved` | number | Comments with no `resolved_at` set -- still unaddressed.               |
+
+A missing store (no comments captured yet) reports `total: 0, unresolved:
+0` rather than erroring; a corrupt store is a fatal CLI error, same as
+`--export-comments`. This is the intended read surface for tooling that
+only needs the counts -- prefer it over parsing `comments.json` directly,
+which is free to gain fields this summary doesn't expose.

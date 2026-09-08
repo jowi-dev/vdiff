@@ -179,6 +179,40 @@ pub fn unresolved_count(comments: &[Comment]) -> usize {
     comments.iter().filter(|c| c.resolved_at.is_none()).count()
 }
 
+/// The `--comments-status` JSON summary: a small, stable read surface for
+/// external tooling (a ticket board like tm/tskmstr, say -- see issue #14)
+/// that wants to know whether a branch's review comments have been
+/// addressed without parsing `comments.json` itself. See
+/// `docs/comments-schema.md`'s "Status summary output" section for the
+/// exact wire shape; field order here is the field order printed, via
+/// `serde`'s declaration-order default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommentsStatus {
+    /// Repo display name, derived the same way as `--export-comments`'s
+    /// markdown header (see `crate::main`'s `export_comments`).
+    pub repo: String,
+    /// Current branch name, same derivation as `repo`.
+    pub branch: String,
+    /// Total number of comments in the store, resolved or not.
+    pub total: usize,
+    /// Comments still unaddressed (`resolved_at` unset) -- see
+    /// [`unresolved_count`].
+    pub unresolved: usize,
+}
+
+/// Build a [`CommentsStatus`] from `comments`: pure and total (never
+/// fails), so all the IO/error-handling for a missing or corrupt store
+/// lives entirely on the caller's side (see `crate::main`'s
+/// `comments_status`), same division of labor as [`render_markdown`].
+pub fn comments_status(comments: &[Comment], repo: &str, branch: &str) -> CommentsStatus {
+    CommentsStatus {
+        repo: repo.to_string(),
+        branch: branch.to_string(),
+        total: comments.len(),
+        unresolved: unresolved_count(comments),
+    }
+}
+
 /// Set or clear `resolved_at` on every comment in `comments` whose `id` is
 /// in `ids` -- `resolved_at` some timestamp to mark addressed, `None` to
 /// unmark. This is the *only* mutation vdiff itself ever performs on the
@@ -319,6 +353,30 @@ mod tests {
         let unresolved = comment("b.rs", 1, 1);
         let comments = vec![resolved, unresolved];
         assert_eq!(unresolved_count(&comments), 1);
+    }
+
+    #[test]
+    fn comments_status_counts_total_and_unresolved() {
+        let mut resolved = comment("a.rs", 1, 1);
+        resolved.resolved_at = Some("2026-08-19T00:00:00Z".to_string());
+        let unresolved_one = comment("b.rs", 1, 1);
+        let unresolved_two = comment("c.rs", 1, 1);
+        let comments = vec![resolved, unresolved_one, unresolved_two];
+        let status = comments_status(&comments, "vdiff", "main");
+        assert_eq!(status.repo, "vdiff");
+        assert_eq!(status.branch, "main");
+        assert_eq!(status.total, 3);
+        assert_eq!(status.unresolved, 2);
+    }
+
+    #[test]
+    fn comments_status_serializes_with_exact_json_keys() {
+        let status = comments_status(&[], "vdiff", "main");
+        let json = serde_json::to_string(&status).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"repo":"vdiff","branch":"main","total":0,"unresolved":0}"#
+        );
     }
 
     #[test]

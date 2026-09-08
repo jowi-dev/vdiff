@@ -126,6 +126,10 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
         return export_comments(repo_path);
     }
 
+    if cli.comments_status {
+        return comments_status(repo_path);
+    }
+
     if let Some(pr_number) = cli.publish_comments {
         return publish_comments(repo_path, pr_number, cli.dry_run, cli.republish);
     }
@@ -225,8 +229,8 @@ struct DiffSource {
     base_oid: String,
 }
 
-/// The `--dump`/`--export-comments`/`--publish-comments`-less default
-/// path: open the GUI. Split out from [`run_gui`] itself (rather than
+/// The `--dump`/`--export-comments`/`--comments-status`/`--publish-comments`-less
+/// default path: open the GUI. Split out from [`run_gui`] itself (rather than
 /// `#[cfg]`-ing `run_gui`'s body in place) so the `--no-default-features`
 /// headless build -- which has no `egui`/`eframe`/[`vdiff::ui`] at all --
 /// still compiles this call site: [`DiffLoader`] only exists behind the
@@ -259,9 +263,9 @@ fn launch_gui(
 /// The headless-build (`--no-default-features`) counterpart of
 /// [`launch_gui`]: there's no GUI to open at all, so any invocation that
 /// would otherwise launch it (no `--dump`/`--export-comments`/
-/// `--publish-comments`, whether or not `--smoke`/`--nvim` were also given)
-/// fails cleanly with a stderr message and a nonzero exit rather than a
-/// compile hole or a silent no-op.
+/// `--comments-status`/`--publish-comments`, whether or not
+/// `--smoke`/`--nvim` were also given) fails cleanly with a stderr message
+/// and a nonzero exit rather than a compile hole or a silent no-op.
 #[cfg(not(feature = "gui"))]
 fn launch_gui(
     _graph: ProjectGraph,
@@ -273,7 +277,7 @@ fn launch_gui(
     _review_setup: ReviewSetup,
 ) -> ExitCode {
     eprintln!(
-        "error: vdiff was built without the `gui` feature (--no-default-features); only --dump, --export-comments, and --publish-comments are available in this build"
+        "error: vdiff was built without the `gui` feature (--no-default-features); only --dump, --export-comments, --comments-status, and --publish-comments are available in this build"
     );
     ExitCode::FAILURE
 }
@@ -424,24 +428,22 @@ fn load_comments(git_dir: &Path, graph: &ProjectGraph) -> Comments {
     map_comments(graph, &comments)
 }
 
-/// `--export-comments`: print every captured review comment (see
-/// [`vdiff::review::comments`]) as markdown to stdout and exit -- headless,
-/// like `--dump`, and doesn't need a graph build at all (comments are keyed
-/// by path/line, not by node). Re-discovers the repository via `git2`
-/// directly to get its actual git directory (`repo.path()` -- see
+/// Re-discover the repository at `repo_path` via `git2` directly (rather
+/// than the already-open [`Git2Repo`] from `run`, which doesn't expose its
+/// inner `git2::Repository`) and derive the `repo`/`branch` display pair
+/// shared by every headless comments command (`--export-comments`,
+/// `--comments-status`): the repo's actual git directory (see
 /// [`vdiff::pipeline::repo::GitRepo::git_dir`]'s doc for why this can't be
-/// `<worktree>/.git` joined by hand) and current branch name for the
-/// markdown header; the workdir is only used for the header's repo-name
-/// display, with a friendly fallback for a bare repository (no workdir) --
-/// unlike the GUI/`--dump` paths, comments don't otherwise need one.
-fn export_comments(repo_path: &Path) -> ExitCode {
-    let repo = match git2::Repository::discover(repo_path) {
-        Ok(repo) => repo,
-        Err(err) => {
-            eprintln!("error: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+/// `<worktree>/.git` joined by hand) drives current branch name via
+/// `HEAD`'s shorthand (`"HEAD"` for a detached head), and the workdir's
+/// last path component names the repo, falling back to `"(bare
+/// repository)"` when there's no workdir at all. Returns the opened
+/// [`git2::Repository`] alongside so callers can also get at `.path()` for
+/// [`vdiff::review::store::load`].
+fn discover_repo_and_branch(
+    repo_path: &Path,
+) -> Result<(git2::Repository, String, String), git2::Error> {
+    let repo = git2::Repository::discover(repo_path)?;
     let branch = repo
         .head()
         .ok()
@@ -451,6 +453,25 @@ fn export_comments(repo_path: &Path) -> ExitCode {
         .workdir()
         .map(repo_dir_name)
         .unwrap_or_else(|| "(bare repository)".to_string());
+    Ok((repo, repo_name, branch))
+}
+
+/// `--export-comments`: print every captured review comment (see
+/// [`vdiff::review::comments`]) as markdown to stdout and exit -- headless,
+/// like `--dump`, and doesn't need a graph build at all (comments are keyed
+/// by path/line, not by node). Repo/branch derivation is shared with
+/// `--comments-status` via [`discover_repo_and_branch`]; the workdir is
+/// only used for the header's repo-name display, with a friendly fallback
+/// for a bare repository (no workdir) -- unlike the GUI/`--dump` paths,
+/// comments don't otherwise need one.
+fn export_comments(repo_path: &Path) -> ExitCode {
+    let (repo, repo_name, branch) = match discover_repo_and_branch(repo_path) {
+        Ok(result) => result,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let git_dir = repo.path();
 
     let comments = match vdiff::review::store::load(git_dir) {
@@ -467,6 +488,45 @@ fn export_comments(repo_path: &Path) -> ExitCode {
     print!(
         "{}",
         vdiff::review::comments::render_markdown(&comments, &repo_name, &branch)
+    );
+    ExitCode::SUCCESS
+}
+
+/// `--comments-status`: print a single pretty-printed JSON object
+/// summarizing the comment store (see
+/// [`vdiff::review::comments::comments_status`] and
+/// `docs/comments-schema.md`'s "Status summary output" section) to stdout
+/// and exit -- headless, like [`export_comments`], whose repo/branch
+/// derivation this shares via [`discover_repo_and_branch`] rather than
+/// duplicating it. A missing store loads as an empty comment list (see
+/// [`vdiff::review::store::load`]), which serializes to `total: 0,
+/// unresolved: 0` rather than an error; a corrupt store is treated as the
+/// same fatal CLI error `--export-comments` gives it.
+fn comments_status(repo_path: &Path) -> ExitCode {
+    let (repo, repo_name, branch) = match discover_repo_and_branch(repo_path) {
+        Ok(result) => result,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let git_dir = repo.path();
+
+    let comments = match vdiff::review::store::load(git_dir) {
+        Ok(comments) => comments,
+        Err(err) => {
+            eprintln!(
+                "error loading {}: {err}",
+                vdiff::review::store::comments_path(git_dir).display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let status = vdiff::review::comments::comments_status(&comments, &repo_name, &branch);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&status).expect("CommentsStatus serializes")
     );
     ExitCode::SUCCESS
 }
