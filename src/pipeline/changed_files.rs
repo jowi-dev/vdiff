@@ -13,34 +13,55 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::graph::model::GitStatus;
+use crate::graph::model::{FileStats, GitStatus};
 use crate::pipeline::repo::{Change, FileDelta};
 
-/// A path -> [`GitStatus`] lookup built from a repo's changed files.
+/// A path's [`GitStatus`] plus the [`FileStats`] its delta carried, if any.
+#[derive(Debug, Clone, Copy)]
+struct ChangeEntry {
+    status: GitStatus,
+    stats: FileStats,
+}
+
+/// A path -> status/stats lookup built from a repo's changed files.
 #[derive(Debug, Clone, Default)]
 pub struct ChangeSet {
-    statuses: HashMap<PathBuf, GitStatus>,
+    entries: HashMap<PathBuf, ChangeEntry>,
 }
 
 impl ChangeSet {
     /// Build a `ChangeSet` from a [`GitRepo`](crate::pipeline::repo::GitRepo)'s
     /// reported deltas.
     pub fn from_deltas(deltas: Vec<FileDelta>) -> Self {
-        let statuses = deltas
+        let entries = deltas
             .into_iter()
-            .map(|delta| (delta.path, status_of(&delta.change)))
+            .map(|delta| {
+                let entry = ChangeEntry {
+                    status: status_of(&delta.change),
+                    stats: delta.stats,
+                };
+                (delta.path, entry)
+            })
             .collect();
-        ChangeSet { statuses }
+        ChangeSet { entries }
     }
 
     /// `path`'s status relative to the diff base. [`GitStatus::Unchanged`]
     /// if `path` wasn't touched (or is only known as the old side of a
     /// rename -- see the module docs).
     pub fn status_for(&self, path: &Path) -> GitStatus {
-        self.statuses
+        self.entries
             .get(path)
-            .copied()
+            .map(|entry| entry.status)
             .unwrap_or(GitStatus::Unchanged)
+    }
+
+    /// `path`'s line-count stats, or `None` if `path` wasn't touched (or is
+    /// only known as the old side of a rename -- see the module docs) --
+    /// feeds [`crate::graph::model::FileRef::stats`], where `None` means
+    /// the same thing: not part of the change set.
+    pub fn stats_for(&self, path: &Path) -> Option<FileStats> {
+        self.entries.get(path).map(|entry| entry.stats)
     }
 }
 
@@ -89,6 +110,31 @@ mod tests {
             set.status_for(Path::new("never_touched.rs")),
             GitStatus::Unchanged
         );
+    }
+
+    #[test]
+    fn stats_for_returns_the_deltas_stats() {
+        let mut delta = delta("modified.rs", Change::Modified);
+        delta.stats = FileStats {
+            added: 4,
+            deleted: 2,
+            binary: false,
+        };
+        let set = ChangeSet::from_deltas(vec![delta]);
+        assert_eq!(
+            set.stats_for(Path::new("modified.rs")),
+            Some(FileStats {
+                added: 4,
+                deleted: 2,
+                binary: false,
+            })
+        );
+    }
+
+    #[test]
+    fn stats_for_unknown_path_is_none() {
+        let set = ChangeSet::from_deltas(vec![delta("added.rs", Change::Added)]);
+        assert_eq!(set.stats_for(Path::new("never_touched.rs")), None);
     }
 
     #[test]
