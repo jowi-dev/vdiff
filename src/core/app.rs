@@ -1289,6 +1289,7 @@ mod tests {
                 path: PathBuf::from(format!("{name}.rs")),
                 base_blob: Some("b".to_string()),
                 head_blob: Some("h".to_string()),
+                stats: None,
             }],
         };
 
@@ -1337,6 +1338,7 @@ mod tests {
             roots: vec![root, target_x, target_y, target_z],
             nodes,
             edges,
+            totals: Default::default(),
         }
     }
 
@@ -1554,6 +1556,7 @@ mod tests {
                 path: PathBuf::from(format!("{name}.rs")),
                 base_blob: Some("b".to_string()),
                 head_blob: Some("h".to_string()),
+                stats: None,
             }],
         };
 
@@ -1571,6 +1574,7 @@ mod tests {
                 to: leaf_a.clone(),
                 kind: DepKind::Use,
             }],
+            totals: Default::default(),
         };
 
         // Build `layers`/`rows` the way `main::build_initial_app` actually
@@ -1871,6 +1875,7 @@ mod tests {
                     path: PathBuf::from("test/test_x_test.exs"),
                     base_blob: Some("b".to_string()),
                     head_blob: Some("h".to_string()),
+                    stats: None,
                 }],
             },
         );
@@ -1899,6 +1904,7 @@ mod tests {
                     path: PathBuf::from("test/leaf_a_test.rs"),
                     base_blob: Some("b".to_string()),
                     head_blob: Some("h".to_string()),
+                    stats: None,
                 }],
             },
         );
@@ -1957,6 +1963,7 @@ mod tests {
                     path: PathBuf::from("only_test.rs"),
                     base_blob: Some("b".to_string()),
                     head_blob: Some("h".to_string()),
+                    stats: None,
                 }],
             },
         );
@@ -1964,6 +1971,7 @@ mod tests {
             roots: vec![id],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         }
     }
 
@@ -1988,6 +1996,7 @@ mod tests {
             roots: vec![],
             nodes: HashMap::new(),
             edges: vec![],
+            totals: Default::default(),
         };
         assert!(!initial_show_tests(&empty));
     }
@@ -2194,6 +2203,7 @@ mod tests {
                 path: PathBuf::from(format!("{name}.rs")),
                 base_blob: Some("b".to_string()),
                 head_blob: Some("h".to_string()),
+                stats: None,
             }],
         };
 
@@ -2216,6 +2226,7 @@ mod tests {
             roots: vec![root],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         }
     }
 
@@ -2582,6 +2593,7 @@ mod tests {
                 path: PathBuf::from(format!("{name}.rs")),
                 base_blob: Some("b".to_string()),
                 head_blob: Some("h".to_string()),
+                stats: None,
             }],
         };
 
@@ -2619,6 +2631,7 @@ mod tests {
             roots: vec![outer],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         }
     }
 
@@ -2731,6 +2744,7 @@ mod tests {
                     path: PathBuf::from("test/aaa_test.rs"),
                     base_blob: Some("b".to_string()),
                     head_blob: Some("h".to_string()),
+                    stats: None,
                 }],
             },
         );
@@ -2746,6 +2760,7 @@ mod tests {
                     path: PathBuf::from("lib/b_real.rs"),
                     base_blob: Some("b".to_string()),
                     head_blob: Some("h".to_string()),
+                    stats: None,
                 }],
             },
         );
@@ -2753,6 +2768,7 @@ mod tests {
             roots: vec![outer.clone()],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
 
         // `show_tests` is false (the default) -- `layers`/`rows` are built
@@ -2906,6 +2922,7 @@ mod tests {
                 path: PathBuf::from(format!("{name}.rs")),
                 base_blob: Some("b".to_string()),
                 head_blob: Some("h".to_string()),
+                stats: None,
             }],
         };
 
@@ -2929,6 +2946,7 @@ mod tests {
             roots: vec![ns, outer],
             nodes,
             edges,
+            totals: Default::default(),
         }
     }
 

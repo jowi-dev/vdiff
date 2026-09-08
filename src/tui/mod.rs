@@ -1498,6 +1498,7 @@ mod tests {
                 nodes: HashMap::new(),
                 roots: vec![],
                 edges: vec![],
+                totals: Default::default(),
             },
             layers: vec![],
             rows: vec![],
@@ -1759,6 +1760,7 @@ mod tests {
                     path: StdPathBuf::from("leaf.rs"),
                     base_blob: Some("b".to_string()),
                     head_blob: Some("h".to_string()),
+                    stats: None,
                 }],
             },
         );
@@ -1768,6 +1770,7 @@ mod tests {
             roots: vec![ns, leaf_id],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
         // Rebuild `layers`/`rows` from the graph just assigned -- `App`'s
         // own invariant (see `core::app::update`'s central backstop) is
@@ -1843,6 +1846,7 @@ mod tests {
                 path: StdPathBuf::from(format!("{name}.rs")),
                 base_blob: Some("b".to_string()),
                 head_blob: Some("h".to_string()),
+                stats: None,
             }],
         };
         let mut nodes = HashMap::new();
@@ -1856,6 +1860,7 @@ mod tests {
                 to: target.clone(),
                 kind: DepKind::Use,
             }],
+            totals: Default::default(),
         };
         let layers = crate::graph::layers::assign_layers(&graph);
 
@@ -2059,6 +2064,7 @@ mod tests {
                     path: StdPathBuf::from("a.rs"),
                     base_blob: Some("b".to_string()),
                     head_blob: Some("h".to_string()),
+                    stats: None,
                 }],
             },
         );
@@ -2074,6 +2080,7 @@ mod tests {
                     path: StdPathBuf::from("b.rs"),
                     base_blob: Some("b".to_string()),
                     head_blob: Some("h".to_string()),
+                    stats: None,
                 }],
             },
         );
@@ -2081,6 +2088,7 @@ mod tests {
             roots: vec![ns.clone(), b],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
         let layers = crate::graph::layers::assign_layers(&graph);
 
@@ -2178,6 +2186,7 @@ mod tests {
             path: StdPathBuf::from(path),
             base_blob: Some("b".to_string()),
             head_blob: Some("h".to_string()),
+            stats: None,
         };
 
         let mut nodes = HashMap::new();
@@ -2252,6 +2261,7 @@ mod tests {
             roots: vec![app_ns],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
         let layers = crate::graph::layers::assign_layers(
             &crate::graph::test_modules::hide_test_modules(&graph).0,
@@ -2424,6 +2434,7 @@ mod tests {
             roots: vec![parent, lonely],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         }
     }
 
@@ -2510,6 +2521,7 @@ mod tests {
                     path: PathBuf::from("leaf.rs"),
                     base_blob: Some("b".to_string()),
                     head_blob: Some("h".to_string()),
+                    stats: None,
                 }],
             },
         );
@@ -2517,6 +2529,7 @@ mod tests {
             roots: vec![parent],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         }
     }
 

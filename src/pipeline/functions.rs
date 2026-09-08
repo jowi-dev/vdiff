@@ -741,6 +741,7 @@ mod tests {
             path: PathBuf::from(path),
             base_blob: Some("b".to_string()),
             head_blob: Some("h".to_string()),
+            stats: None,
         }]
     }
 
@@ -762,6 +763,7 @@ mod tests {
                 to: a.id.clone(),
                 kind: DepKind::RemoteCall,
             }],
+            totals: Default::default(),
         };
 
         let targets = target_module_ids(&graph);
@@ -782,6 +784,7 @@ mod tests {
             nodes,
             roots: vec![],
             edges: vec![],
+            totals: Default::default(),
         };
         assert!(target_module_ids(&graph).is_empty());
     }

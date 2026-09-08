@@ -396,6 +396,7 @@ mod tests {
                     path: PathBuf::from(format!("{id}.rs")),
                     base_blob: Some("b".to_string()),
                     head_blob: Some("h".to_string()),
+                    stats: None,
                 }],
             },
         )
@@ -407,6 +408,7 @@ mod tests {
             nodes,
             roots: roots.into_iter().map(NodeId::from).collect(),
             edges: vec![],
+            totals: Default::default(),
         }
     }
 

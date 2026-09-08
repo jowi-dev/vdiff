@@ -358,6 +358,7 @@ mod tests {
             path: PathBuf::from(path),
             base_blob: Some("b".to_string()),
             head_blob: Some("h".to_string()),
+            stats: None,
         }
     }
 
@@ -383,6 +384,7 @@ mod tests {
             nodes: map,
             roots,
             edges: vec![],
+            totals: Default::default(),
         }
     }
 

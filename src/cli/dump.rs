@@ -146,6 +146,7 @@ mod tests {
                 to: zeta,
                 kind: DepKind::Use,
             }],
+            totals: Default::default(),
         }
     }
 

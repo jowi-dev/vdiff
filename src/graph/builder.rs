@@ -156,6 +156,10 @@ pub fn build(
         nodes,
         roots,
         edges,
+        // Set by `crate::pipeline::build_graph` from the still-in-scope
+        // deltas after this returns -- the builder itself has no notion of
+        // per-file stats, only `ChangeSet`'s coarser [`GitStatus`].
+        totals: crate::graph::model::DiffTotals::default(),
     }
 }
 
@@ -405,6 +409,7 @@ mod tests {
             path: PathBuf::from(path),
             base_blob: Some("base".to_string()),
             head_blob: Some("head".to_string()),
+            stats: None,
         }
     }
 

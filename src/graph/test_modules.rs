@@ -198,6 +198,7 @@ mod tests {
             path: PathBuf::from(path),
             base_blob: Some("b".to_string()),
             head_blob: Some("h".to_string()),
+            stats: None,
         }
     }
 
@@ -307,6 +308,7 @@ mod tests {
             nodes: nodes.into_iter().map(|n| (n.id.clone(), n)).collect(),
             roots,
             edges,
+            totals: Default::default(),
         }
     }
 
@@ -426,6 +428,7 @@ mod tests {
             roots: vec![a_lead.id.clone(), b_lead_test.id.clone()],
             nodes: nodes_map,
             edges: vec![],
+            totals: Default::default(),
         };
 
         // `a_lead` and `b_lead_test` are each their own top-level root (no

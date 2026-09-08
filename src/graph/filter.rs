@@ -35,6 +35,7 @@ pub fn focus_on_changes(graph: &ProjectGraph) -> ProjectGraph {
             nodes: HashMap::new(),
             roots: Vec::new(),
             edges: Vec::new(),
+            totals: graph.totals,
         };
     }
 
@@ -195,6 +196,7 @@ pub(crate) fn prune(graph: &ProjectGraph, keep: &HashSet<NodeId>) -> ProjectGrap
         nodes,
         roots,
         edges,
+        totals: graph.totals,
     }
 }
 
@@ -216,6 +218,7 @@ mod tests {
                 path: PathBuf::from(format!("{id}.rs")),
                 base_blob: Some("base".to_string()),
                 head_blob: Some("head".to_string()),
+                stats: None,
             }],
         }
     }
@@ -233,6 +236,7 @@ mod tests {
             nodes: nodes.into_iter().map(|n| (n.id.clone(), n)).collect(),
             roots: roots.iter().map(|r| NodeId::from(*r)).collect(),
             edges,
+            totals: Default::default(),
         }
     }
 

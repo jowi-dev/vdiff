@@ -1875,6 +1875,7 @@ mod tests {
                 path: PathBuf::from(format!("{name}.rs")),
                 base_blob: Some("b".to_string()),
                 head_blob: Some("h".to_string()),
+                stats: None,
             }],
         };
 
@@ -1893,6 +1894,7 @@ mod tests {
                 to: target,
                 kind: DepKind::Use,
             }],
+            totals: Default::default(),
         }
     }
 
@@ -2062,6 +2064,7 @@ mod tests {
                 path: PathBuf::from(format!("{name}.ex")),
                 base_blob: Some("b".to_string()),
                 head_blob: Some("h".to_string()),
+                stats: None,
             }],
         };
         let namespace = |id: &NodeId, name: &str, child: &NodeId| ModuleNode {
@@ -2088,6 +2091,7 @@ mod tests {
             roots: vec![foo_id, bar_id],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
 
         let layers = crate::graph::layers::assign_layers(&graph);
@@ -2170,6 +2174,7 @@ mod tests {
                 path: PathBuf::from(format!("{name}.rs")),
                 base_blob: Some("b".to_string()),
                 head_blob: Some("h".to_string()),
+                stats: None,
             }],
         };
         let mut nodes = HashMap::new();
@@ -2191,6 +2196,7 @@ mod tests {
                 roots: vec![ns_id.clone()],
                 nodes,
                 edges: vec![],
+                totals: Default::default(),
             },
             ns_id,
         )
@@ -2473,6 +2479,7 @@ mod tests {
                         path: PathBuf::from(format!("{name}.rs")),
                         base_blob: Some("b".to_string()),
                         head_blob: Some("h".to_string()),
+                        stats: None,
                     }],
                 },
             );
@@ -2489,6 +2496,7 @@ mod tests {
             roots: names.iter().map(|n| NodeId::from(n.as_str())).collect(),
             nodes,
             edges,
+            totals: Default::default(),
         }
     }
 
@@ -2626,6 +2634,7 @@ mod tests {
                 path: PathBuf::from(format!("{name}.rs")),
                 base_blob: Some("b".to_string()),
                 head_blob: Some("h".to_string()),
+                stats: None,
             }],
         };
         let mut nodes = HashMap::new();
@@ -2647,6 +2656,7 @@ mod tests {
                     kind: DepKind::Use,
                 },
             ],
+            totals: Default::default(),
         }
     }
 
@@ -2869,6 +2879,7 @@ mod tests {
                 roots: vec![],
                 nodes: HashMap::new(),
                 edges: vec![],
+                totals: Default::default(),
             },
             "nobody",
         );
@@ -3193,6 +3204,7 @@ mod tests {
                 roots: vec![],
                 nodes: HashMap::new(),
                 edges: vec![],
+                totals: Default::default(),
             },
             "nobody",
         );
@@ -3219,6 +3231,7 @@ mod tests {
                 path: PathBuf::from(format!("{name}.rs")),
                 base_blob: Some("b".to_string()),
                 head_blob: Some("h".to_string()),
+                stats: None,
             }],
         };
         let mut nodes = HashMap::new();
@@ -3239,6 +3252,7 @@ mod tests {
                     path: PathBuf::from("ns1.rs"),
                     base_blob: None,
                     head_blob: None,
+                    stats: None,
                 }],
             },
         );
@@ -3257,6 +3271,7 @@ mod tests {
             roots: vec![ns1_id, ns2_id],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         }
     }
 

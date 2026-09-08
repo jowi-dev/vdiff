@@ -118,6 +118,7 @@ mod tests {
             path: PathBuf::from(path),
             base_blob: Some("base".to_string()),
             head_blob: head.map(str::to_string),
+            stats: None,
         }
     }
 
@@ -132,6 +133,7 @@ mod tests {
             nodes: map,
             roots,
             edges: vec![],
+            totals: Default::default(),
         }
     }
 

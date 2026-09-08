@@ -618,6 +618,7 @@ mod tests {
                     path: PathBuf::from(format!("{id}.rs")),
                     base_blob: None,
                     head_blob: None,
+                    stats: None,
                 }],
             },
         )
@@ -669,6 +670,7 @@ mod tests {
             roots: vec![ns_id, c_id],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         }
     }
 
@@ -695,6 +697,7 @@ mod tests {
             path: PathBuf::from("ns.rs"),
             base_blob: None,
             head_blob: None,
+            stats: None,
         }];
         let (a_id, a) = leaf("a", "A", Some("ns"));
         let (b_id, b) = leaf("b", "B", Some("ns"));
@@ -706,6 +709,7 @@ mod tests {
             roots: vec![ns_id.clone()],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
 
         let layout = layout(
@@ -746,6 +750,7 @@ mod tests {
             roots: vec![leaf_id.clone()],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
 
         let fn_a = NodeId::from("leaf#a/0");
@@ -813,6 +818,7 @@ mod tests {
             roots: vec![leaf_id.clone()],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
         let fn_a = NodeId::from("leaf#a/0");
         let mut drilled = HashMap::new();
@@ -839,6 +845,7 @@ mod tests {
             path: PathBuf::from("ns.rs"),
             base_blob: None,
             head_blob: None,
+            stats: None,
         }];
         let (a_id, a) = leaf("a", "A", Some("ns"));
         let mut nodes = HashMap::new();
@@ -848,6 +855,7 @@ mod tests {
             roots: vec![ns_id.clone()],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
         let fn_x = NodeId::from("ns#x/0");
         let mut drilled = HashMap::new();
@@ -880,6 +888,7 @@ mod tests {
             roots: vec![leaf_id.clone()],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
         let fn_a = NodeId::from("leaf#a/0");
         let fn_b = NodeId::from("leaf#b/1");
@@ -1026,6 +1035,7 @@ mod tests {
             roots: vec![ns_id.clone()],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
         // Both in the same (only) layer -- name must decide the order.
         let layers = vec![vec![NodeId::from("zeta"), NodeId::from("alpha")]];
@@ -1082,6 +1092,7 @@ mod tests {
             roots: vec![ns_id.clone()],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
         let layout = layout(&g, &[], &HashSet::new(), &HashMap::new(), label);
         let mut ys: Vec<usize> = child_ids
@@ -1102,6 +1113,7 @@ mod tests {
             roots: vec![],
             nodes: HashMap::new(),
             edges: vec![],
+            totals: Default::default(),
         };
         let layout = layout(&g, &[], &HashSet::new(), &HashMap::new(), label);
         assert!(layout.rows.is_empty());
@@ -1162,6 +1174,7 @@ mod tests {
             roots: vec![root_id.clone()],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
 
         let layout = layout(&g, &[], &HashSet::new(), &HashMap::new(), label);
@@ -1199,6 +1212,7 @@ mod tests {
             roots: vec![root_id],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
         let collapsed = HashSet::from([ns_id.clone()]);
         let layout = layout(&g, &[], &collapsed, &HashMap::new(), label);
@@ -1245,6 +1259,7 @@ mod tests {
             path: PathBuf::from("ns.rs"),
             base_blob: None,
             head_blob: None,
+            stats: None,
         }];
         let (real_id, real) = leaf("real", "DynamicBids", Some("ns"));
         let (test_id, test_node) = leaf("real_test", "DynamicBidsCustomPipelineTest", Some("ns"));
@@ -1257,6 +1272,7 @@ mod tests {
             roots: vec![ns_id.clone()],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
 
         // What `App::layers` would actually hold: `assign_layers` run over
@@ -1410,6 +1426,7 @@ mod tests {
             roots: vec![ns_id],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         }
     }
 
@@ -1423,12 +1440,14 @@ mod tests {
             path: PathBuf::from("top.rs"),
             base_blob: None,
             head_blob: None,
+            stats: None,
         }];
         let (mid_id, mut mid) = namespace("mid", "Mid", Some("top"), &["leaf", "deep"]);
         mid.files = vec![FileRef {
             path: PathBuf::from("mid.rs"),
             base_blob: None,
             head_blob: None,
+            stats: None,
         }];
         let (leaf_id, leaf_node) = leaf("leaf", "Leaf", Some("mid"));
         let (deep_id, deep_node) = leaf("deep", "Deep", Some("mid"));
@@ -1444,6 +1463,7 @@ mod tests {
             roots: vec![top_id],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         }
     }
 
@@ -1474,6 +1494,7 @@ mod tests {
             roots: vec![before_id, root_orphan_id, mid_id, after_id],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         }
     }
 }

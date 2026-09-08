@@ -82,6 +82,7 @@ pub fn build_graph(repo: &dyn GitRepo, opts: &PipelineOptions) -> Result<Project
             path: path.clone(),
             base_blob: repo.base_blob_oid(&base_oid, &path)?,
             head_blob: repo.head_blob_oid(&path)?,
+            stats: None,
         };
 
         let defs = match lang {

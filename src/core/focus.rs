@@ -340,6 +340,7 @@ mod tests {
                     kind: DepKind::XrefCall,
                 },
             ],
+            totals: Default::default(),
         }
     }
 

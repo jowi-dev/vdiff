@@ -164,6 +164,7 @@ mod tests {
                 path: PathBuf::from("changed.rs"),
                 base_blob: Some("b".to_string()),
                 head_blob: Some("h".to_string()),
+                stats: None,
             }],
         );
         let added = node(
@@ -173,6 +174,7 @@ mod tests {
                 path: PathBuf::from("new.rs"),
                 base_blob: None,
                 head_blob: Some("h2".to_string()),
+                stats: None,
             }],
         );
         let unchanged = node("rust:demo", GitStatus::Unchanged, vec![]);
@@ -186,6 +188,7 @@ mod tests {
             nodes,
             roots: vec![NodeId::from("rust:demo")],
             edges: vec![],
+            totals: Default::default(),
         };
 
         let diffs = diffs_for_graph(&repo, "base-oid", &graph).unwrap();

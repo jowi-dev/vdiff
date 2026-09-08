@@ -449,6 +449,7 @@ mod tests {
                     path: PathBuf::from(format!("{id}.rs")),
                     base_blob: Some("b".to_string()),
                     head_blob: Some("h".to_string()),
+                    stats: None,
                 }],
             },
         )
@@ -499,6 +500,7 @@ mod tests {
                     path: PathBuf::from(format!("{id}.ex")),
                     base_blob: Some("b".to_string()),
                     head_blob: Some("h".to_string()),
+                    stats: None,
                 }],
             },
         )
@@ -538,6 +540,7 @@ mod tests {
                     kind: DepKind::Alias,
                 },
             ],
+            totals: Default::default(),
         }
     }
 
@@ -618,6 +621,7 @@ mod tests {
             roots: vec![ns_id.clone()],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
         // The namespace's own drawn entry sits in `layers` right alongside
         // its child, exactly as `crate::graph::layers::assign_layers` would
@@ -670,6 +674,7 @@ mod tests {
             roots: vec![root_docs_id.clone(), priv_id],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
 
         let rows = vec![
@@ -712,6 +717,7 @@ mod tests {
             roots: vec![foo_id, bar_auction_id.clone()],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
 
         let rows = vec![
@@ -743,6 +749,7 @@ mod tests {
             roots: vec![a1_id.clone()],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
 
         let rows = vec![RailRow::Node(a1_id.clone())];
@@ -765,6 +772,7 @@ mod tests {
             roots: vec![a1_id.clone()],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
 
         // Only `a1_id` is actually visible right now.
@@ -853,6 +861,7 @@ mod tests {
             roots: vec![empty_id.clone()],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
         assert_eq!(
             first_visible_descendant(&g, &empty_id, &HashSet::new()),

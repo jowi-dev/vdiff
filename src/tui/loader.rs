@@ -122,6 +122,7 @@ mod tests {
                 path: PathBuf::from("changed.rs"),
                 base_blob: Some("b".to_string()),
                 head_blob: Some("h".to_string()),
+                stats: None,
             }],
         };
         let mut nodes = HashMap::new();
@@ -130,6 +131,7 @@ mod tests {
             nodes,
             roots: vec![node_id],
             edges: vec![],
+            totals: Default::default(),
         };
 
         let mut base_files = HashMap::new();

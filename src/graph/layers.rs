@@ -357,6 +357,7 @@ mod tests {
                 path: PathBuf::from(format!("{id}.ex")),
                 base_blob: Some("b".to_string()),
                 head_blob: Some("h".to_string()),
+                stats: None,
             }
         }
     }
@@ -378,6 +379,7 @@ mod tests {
             nodes: entries.into_iter().collect(),
             roots: roots.into_iter().map(NodeId::from).collect(),
             edges,
+            totals: Default::default(),
         }
     }
 
@@ -554,6 +556,7 @@ mod tests {
                     path: PathBuf::from(format!("lib/app_web/{id}.ex")),
                     base_blob: Some("b".to_string()),
                     head_blob: Some("h".to_string()),
+                    stats: None,
                 }],
             },
         )

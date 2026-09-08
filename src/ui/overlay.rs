@@ -385,6 +385,7 @@ mod tests {
                 path: PathBuf::from(format!("{name}.rs")),
                 base_blob: Some("b".to_string()),
                 head_blob: Some("h".to_string()),
+                stats: None,
             }],
         };
         let mut nodes = HashMap::new();
@@ -394,6 +395,7 @@ mod tests {
             roots: vec![module.clone(), test.clone()],
             nodes,
             edges: vec![],
+            totals: Default::default(),
         };
 
         App {
