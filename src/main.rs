@@ -10,10 +10,8 @@ use vdiff::cli::{self, Cli};
 use vdiff::core::app::{initial_show_tests, App, Pane, Screen};
 use vdiff::graph::filter::focus_on_changes;
 #[cfg(any(feature = "gui", feature = "tui"))]
-use vdiff::graph::layout::layout;
+use vdiff::graph::layout::layout_as_drawn;
 use vdiff::graph::model::{NodeId, ProjectGraph};
-#[cfg(any(feature = "gui", feature = "tui"))]
-use vdiff::graph::test_modules::{group_matched_test_modules, hide_test_modules};
 #[cfg(any(feature = "gui", feature = "tui"))]
 use vdiff::nvim::session::nvim_available;
 use vdiff::pipeline::git2_repo::Git2Repo;
@@ -639,8 +637,12 @@ fn dump(
 /// modules, hiding them would blank the graph entirely (an empty canvas
 /// with a sentinel focus, `NodeId("")` -- see [`initial_show_tests`]'s
 /// doc), so start with tests shown instead. The layout computed here for
-/// the very first frame mirrors `App::visible_graph`'s own branching
-/// exactly, so it's the same one a later `Msg::ToggleTests` round-trip back
+/// the very first frame comes from [`layout_as_drawn`], which mirrors
+/// `App::visible_graph`'s branching *and* -- when tests start shown --
+/// sizes each tested node's box for its attached test strip (GH-26: a
+/// plain `layout` here left those boxes `LEAF_H` tall while the GUI
+/// painted strips on them, until the first `Cmd::Relayout` fixed it up).
+/// So it's the same layout a later `Msg::ToggleTests` round-trip back
 /// to this `show_tests` value would recompute. Focus lands on the first
 /// node of the first layer, not `graph.sorted_roots()[0]` -- roots can be
 /// synthetic namespace containers, which are never drawn or focusable (see
@@ -698,12 +700,7 @@ fn build_initial_app(
         }
     };
     let show_tests = initial_show_tests(&graph);
-    let visible = if show_tests {
-        group_matched_test_modules(&graph)
-    } else {
-        hide_test_modules(&graph).0
-    };
-    let layout_result = layout(&visible);
+    let layout_result = layout_as_drawn(&graph, show_tests);
     let focus = layout_result
         .layers
         .first()
