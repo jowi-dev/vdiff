@@ -81,6 +81,12 @@ every namespace at once) and every other binding (`gd`/`gr`, `gt`, `t`, `v`,
   move down/up the row list; `h`/`l` collapse/expand the focused row's
   namespace directly (no `z` chord).
 
+Plane and canvas also share a condensed ("zoom out") rendering mode,
+toggled with `-`: a terminal can't scale its font down the way the GUI's
+pixel zoom can, so condensed mode instead drops each row's status marker
+and badges and truncates its label, fitting far more of the graph on
+screen at once (rail is untouched -- it's already one row per module).
+
 All three keep vdiff's change sets (usually 15-40 visible modules) readable
 without folding anything by default. The hand-rolled read-only file viewer
 and unified/side-by-side diff screen, plus `Ctrl-e`'s suspend-and-run
@@ -123,6 +129,7 @@ zoom is a 2D-canvas-only concept):
 | `zM` `zR`| Fold/unfold all namespaces (plane/canvas only)                   |
 | `zf`     | Drill the focused changed module into its changed functions (plane view only; static calls only) |
 | `h` `l`  | Collapse/expand the focused row's namespace (rail only)         |
+| `-`      | Toggle condensed rendering — abbreviated labels, more of the map on screen (plane/canvas) |
 
 ## Tuning your Neovim config for the review pane
 
