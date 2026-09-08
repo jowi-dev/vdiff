@@ -1348,6 +1348,10 @@ fn canvas_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
         return match input {
             KeyInput::Char('c') => Some(Msg::CollapseFocusedNamespace),
             KeyInput::Char('o') => Some(Msg::ExpandFocusedNamespace),
+            // `zM`/`zR`: fold-all/unfold-all (issue #24), the same chord
+            // completing onto the wholesale variants of `zc`/`zo` above.
+            KeyInput::Char('M') => Some(Msg::CollapseAllNamespaces),
+            KeyInput::Char('R') => Some(Msg::ExpandAllNamespaces),
             _ => None,
         };
     }
@@ -1406,6 +1410,10 @@ fn plane_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
             // own doc), so this arm lives here rather than in the
             // `canvas_key_msg` twin above.
             KeyInput::Char('f') => Some(Msg::ToggleFunctionDrill),
+            // `zM`/`zR`: fold-all/unfold-all (issue #24), the same chord
+            // completing onto the wholesale variants of `zc`/`zo` above.
+            KeyInput::Char('M') => Some(Msg::CollapseAllNamespaces),
+            KeyInput::Char('R') => Some(Msg::ExpandAllNamespaces),
             _ => None,
         };
     }
@@ -2338,6 +2346,60 @@ mod tests {
         let key = plane_key_stepping_from_to(&state, &dynamic_bids, &partners);
         handle_key(&mut state, press(key));
         assert_eq!(state.app.focus, partners);
+    }
+
+    /// A namespace `ns` (childful, so it's a fold candidate) plus an
+    /// unrelated childless top-level sibling `b` -- enough to exercise
+    /// `zM`/`zR` actually folding/unfolding something, unlike
+    /// `state_with_layered_graph`'s two childless roots.
+    fn state_with_foldable_namespace() -> TuiState {
+        state_with_namespace_and_sibling()
+    }
+
+    #[test]
+    fn zm_folds_all_and_zr_unfolds_all_in_plane_mode() {
+        let mut state = state_with_foldable_namespace();
+        assert_eq!(state.view_mode, ViewMode::Plane);
+
+        handle_key(&mut state, press('z'));
+        assert!(state.canvas_fold_pending);
+        handle_key(&mut state, press('M'));
+        assert!(!state.canvas_fold_pending, "chord clears after completing");
+        assert_eq!(
+            state.app.fold_collapsed,
+            HashSet::from([NodeId::from("ns")]),
+            "zM must fold every childful namespace"
+        );
+
+        handle_key(&mut state, press('z'));
+        handle_key(&mut state, press('R'));
+        assert!(
+            state.app.fold_collapsed.is_empty(),
+            "zR must unfold everything"
+        );
+    }
+
+    #[test]
+    fn zm_folds_all_and_zr_unfolds_all_in_canvas_mode() {
+        let mut state = state_with_foldable_namespace();
+        state.view_mode = ViewMode::Canvas;
+
+        handle_key(&mut state, press('z'));
+        assert!(state.canvas_fold_pending);
+        handle_key(&mut state, press('M'));
+        assert!(!state.canvas_fold_pending, "chord clears after completing");
+        assert_eq!(
+            state.app.fold_collapsed,
+            HashSet::from([NodeId::from("ns")]),
+            "zM must fold every childful namespace"
+        );
+
+        handle_key(&mut state, press('z'));
+        handle_key(&mut state, press('R'));
+        assert!(
+            state.app.fold_collapsed.is_empty(),
+            "zR must unfold everything"
+        );
     }
 
     #[test]
