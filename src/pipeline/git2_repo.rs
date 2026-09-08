@@ -114,6 +114,52 @@ impl Git2Repo {
         Ok(commit.tree()?)
     }
 
+    /// Added/deleted line counts for `diff`'s delta at `idx`, or
+    /// `{ binary: true, .. }` if either side is binary. `idx` must be the
+    /// delta's position in `diff` itself (`diff.deltas().enumerate()`), not
+    /// in some already-filtered list -- `Patch::from_diff` indexes into the
+    /// diff it's given, so any skip applied by the caller after
+    /// enumerating would desync the two.
+    ///
+    /// The binary check is done on the *patch's* delta, not the plain
+    /// `DiffDelta` passed in: building a diff (`diff_tree_to_workdir_with_index`)
+    /// only reports a delta's presence, it doesn't sniff content for a
+    /// binary flag until a patch actually reads both sides -- so `delta`'s
+    /// own `is_binary()` is unreliable and only `Patch::from_diff`'s result
+    /// (`Ok(None)` for "binary or unchanged", or a built patch whose own
+    /// `delta()` carries the real flag) can be trusted.
+    fn delta_stats(diff: &git2::Diff, idx: usize) -> FileStats {
+        match git2::Patch::from_diff(diff, idx) {
+            Ok(Some(patch)) => {
+                let delta = patch.delta();
+                if delta.new_file().is_binary() || delta.old_file().is_binary() {
+                    return FileStats {
+                        binary: true,
+                        ..Default::default()
+                    };
+                }
+                match patch.line_stats() {
+                    Ok((_context, additions, deletions)) => FileStats {
+                        added: additions,
+                        deleted: deletions,
+                        binary: false,
+                    },
+                    Err(_) => FileStats {
+                        binary: true,
+                        ..Default::default()
+                    },
+                }
+            }
+            // `Patch::from_diff` itself documents `Ok(None)` as "unchanged
+            // or binary" -- a changed delta reaching here must be the
+            // binary case.
+            Ok(None) | Err(_) => FileStats {
+                binary: true,
+                ..Default::default()
+            },
+        }
+    }
+
     /// Read `path`'s raw bytes and lossy-decode as UTF-8 -- mirrors
     /// `base_blob`'s handling of git blob content, so a non-UTF8 file (a
     /// binary asset, say) degrades to garbage text instead of erroring the
@@ -156,7 +202,14 @@ impl GitRepo for Git2Repo {
         // new untracked *directory* shows up as one opaque delta for the
         // directory itself rather than one per file inside it.
         let mut opts = DiffOptions::new();
-        opts.include_untracked(true).recurse_untracked_dirs(true);
+        // `show_untracked_content` matters for line-count stats: without
+        // it, an untracked (brand-new) file's patch has no hunks at all --
+        // its content is never read for diffing, only its presence is
+        // reported -- so `Patch::from_diff`/`line_stats` would silently
+        // report zero added lines for every new file.
+        opts.include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .show_untracked_content(true);
         let mut diff = self
             .repo
             .diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut opts))?;
@@ -166,7 +219,7 @@ impl GitRepo for Git2Repo {
 
         let workdir = self.repo.workdir();
         let mut deltas = Vec::new();
-        for delta in diff.deltas() {
+        for (idx, delta) in diff.deltas().enumerate() {
             let new_path = delta.new_file().path().map(Path::to_path_buf);
             let old_path = delta.old_file().path().map(Path::to_path_buf);
 
@@ -192,6 +245,8 @@ impl GitRepo for Git2Repo {
                 continue;
             }
 
+            let stats = Self::delta_stats(&diff, idx);
+
             match delta.status() {
                 // `Untracked` -- a brand-new file with no index entry at
                 // all -- is reported distinctly from `Added` (present in
@@ -203,7 +258,7 @@ impl GitRepo for Git2Repo {
                         deltas.push(FileDelta {
                             path,
                             change: Change::Added,
-                            stats: FileStats::default(),
+                            stats,
                         });
                     }
                 }
@@ -212,7 +267,7 @@ impl GitRepo for Git2Repo {
                         deltas.push(FileDelta {
                             path,
                             change: Change::Deleted,
-                            stats: FileStats::default(),
+                            stats,
                         });
                     }
                 }
@@ -221,7 +276,7 @@ impl GitRepo for Git2Repo {
                         deltas.push(FileDelta {
                             path,
                             change: Change::Renamed { from },
-                            stats: FileStats::default(),
+                            stats,
                         });
                     }
                 }
@@ -233,7 +288,7 @@ impl GitRepo for Git2Repo {
                         deltas.push(FileDelta {
                             path,
                             change: Change::Modified,
-                            stats: FileStats::default(),
+                            stats,
                         });
                     }
                 }
@@ -517,5 +572,138 @@ mod tests {
 
         let repo = Git2Repo::open(dir).expect("open fixture repo");
         assert_eq!(repo.current_branch(), "HEAD");
+    }
+
+    /// A committed file, then modified in the worktree with two lines
+    /// changed to three lines: `changed_files` must report the exact
+    /// added/deleted counts imara-diff-style tools would agree on --
+    /// content-addition-of-a-line and content-removal-of-a-line, not a
+    /// whole-file replace.
+    #[test]
+    fn modified_file_reports_exact_added_and_deleted_line_counts() {
+        let tmp = TempDir::new().expect("create tempdir");
+        let dir = tmp.path();
+        git(dir, &["init", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "initial"]);
+
+        std::fs::write(dir.join("a.txt"), "one\ntwo changed\nthree\nfour\n").unwrap();
+
+        let repo = Git2Repo::open(dir).expect("open fixture repo");
+        let base_oid = repo.default_base_oid(Some("main")).expect("resolve base");
+        let deltas = repo.changed_files(&base_oid).expect("changed_files");
+
+        let delta = deltas
+            .iter()
+            .find(|d| d.path == Path::new("a.txt"))
+            .expect("a.txt delta present");
+        assert_eq!(delta.change, Change::Modified);
+        assert_eq!(
+            delta.stats,
+            FileStats {
+                added: 2,
+                deleted: 1,
+                binary: false,
+            }
+        );
+    }
+
+    /// A deleted file's `stats.deleted` must equal its full line count (and
+    /// `added` must be zero -- nothing survives at head).
+    #[test]
+    fn deleted_file_reports_deletions_equal_to_its_full_line_count() {
+        let tmp = TempDir::new().expect("create tempdir");
+        let dir = tmp.path();
+        git(dir, &["init", "-b", "main"]);
+        std::fs::write(dir.join("gone.txt"), "one\ntwo\nthree\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "initial"]);
+
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+
+        let repo = Git2Repo::open(dir).expect("open fixture repo");
+        let base_oid = repo.default_base_oid(Some("main")).expect("resolve base");
+        let deltas = repo.changed_files(&base_oid).expect("changed_files");
+
+        let delta = deltas
+            .iter()
+            .find(|d| d.path == Path::new("gone.txt"))
+            .expect("gone.txt delta present");
+        assert_eq!(delta.change, Change::Deleted);
+        assert_eq!(
+            delta.stats,
+            FileStats {
+                added: 0,
+                deleted: 3,
+                binary: false,
+            }
+        );
+    }
+
+    /// A pure rename with no content change reports all-zero stats.
+    #[test]
+    fn pure_rename_reports_zero_stats() {
+        let tmp = TempDir::new().expect("create tempdir");
+        let dir = tmp.path();
+        git(dir, &["init", "-b", "main"]);
+        // Enough content that git's similarity heuristic recognizes the
+        // rename rather than reporting a delete+add pair.
+        let content = "one\ntwo\nthree\nfour\nfive\nsix\n";
+        std::fs::write(dir.join("old.txt"), content).unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "initial"]);
+
+        std::fs::rename(dir.join("old.txt"), dir.join("new.txt")).unwrap();
+        git(dir, &["add", "-A"]);
+
+        let repo = Git2Repo::open(dir).expect("open fixture repo");
+        let base_oid = repo.default_base_oid(Some("main")).expect("resolve base");
+        let deltas = repo.changed_files(&base_oid).expect("changed_files");
+
+        let delta = deltas
+            .iter()
+            .find(|d| d.path == Path::new("new.txt"))
+            .expect("new.txt delta present");
+        assert_eq!(
+            delta.change,
+            Change::Renamed {
+                from: PathBuf::from("old.txt")
+            }
+        );
+        assert_eq!(delta.stats, FileStats::default());
+    }
+
+    /// A binary file (non-UTF8, null-byte-containing content) must be
+    /// reported with `binary: true` and zero line counts, not a garbage
+    /// line diff.
+    #[test]
+    fn binary_file_reports_binary_true_with_zero_line_counts() {
+        let tmp = TempDir::new().expect("create tempdir");
+        let dir = tmp.path();
+        git(dir, &["init", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "hi\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "initial"]);
+
+        std::fs::write(dir.join("logo.png"), [0u8, 1, 2, 3, 0, 255, 0, 128]).unwrap();
+
+        let repo = Git2Repo::open(dir).expect("open fixture repo");
+        let base_oid = repo.default_base_oid(Some("main")).expect("resolve base");
+        let deltas = repo.changed_files(&base_oid).expect("changed_files");
+
+        let delta = deltas
+            .iter()
+            .find(|d| d.path == Path::new("logo.png"))
+            .expect("logo.png delta present");
+        assert_eq!(delta.change, Change::Added);
+        assert_eq!(
+            delta.stats,
+            FileStats {
+                added: 0,
+                deleted: 0,
+                binary: true,
+            }
+        );
     }
 }
