@@ -127,13 +127,19 @@ pub fn file_view_visible_rows(terminal_rows: u16) -> usize {
 /// cursor drawn only while [`Pane::File`] actually has keyboard focus.
 /// `None` (no session, or a dead one -- the caller degrades to `None`
 /// rather than passing a stale grid) falls back to the hand-rolled viewer
-/// exactly as before.
+/// exactly as before. `condensed` (issue #24's "zoom out", toggled by
+/// `-` -- see `crate::tui::TuiState::condensed`'s doc) is threaded into
+/// [`draw_canvas_graph`]/[`draw_plane_graph`] only -- the rail view is
+/// already one row per module and has nothing left to abbreviate -- so a
+/// terminal too small to show real font-scaling can still fit far more of
+/// the graph on screen by dropping badges and truncating labels instead.
 pub fn draw(
     frame: &mut Frame,
     app: &App,
     notice: Option<&str>,
     scroll: ScrollOffsets,
     view_mode: ViewMode,
+    condensed: bool,
     nvim_grid: Option<&crate::nvim::grid::GridState>,
 ) {
     let area = frame.area();
@@ -174,11 +180,18 @@ pub fn draw(
                             app,
                             scroll.canvas,
                             scroll.canvas_x,
+                            condensed,
                         );
                     }
                     ViewMode::Plane => {
-                        dropped_edges =
-                            draw_plane_graph(frame, main_area, app, scroll.canvas, scroll.canvas_x);
+                        dropped_edges = draw_plane_graph(
+                            frame,
+                            main_area,
+                            app,
+                            scroll.canvas,
+                            scroll.canvas_x,
+                            condensed,
+                        );
                     }
                 }
             }
@@ -460,6 +473,76 @@ fn node_line(app: &App, id: &NodeId, label: &str) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The maximum character width of a condensed-mode row label (issue #24's
+/// "zoom out" -- see `crate::tui::TuiState::condensed`'s doc) -- deliberately
+/// small: a terminal can't scale its font down the way the GUI's pixel
+/// [`crate::ui::graph_view::Transform`] zoom can, so condensed mode's whole
+/// point is fitting more of the map on screen by making each row itself
+/// narrower, not by shrinking glyphs that can't shrink.
+const CONDENSED_LABEL_MAX_CHARS: usize = 12;
+
+/// Truncate `s` to at most `max_chars` characters, replacing the last kept
+/// character with a trailing `…` when truncation actually happens (so a
+/// genuinely short label and a truncated one are never visually
+/// indistinguishable). Char-count based, not byte length -- matches every
+/// other width computation `crate::graph::plane`/`crate::graph::sugiyama`
+/// already do (`leaf_item`'s `chars().count()`, etc.), so a multi-byte
+/// glyph still counts as one column here too. Shared by every condensed-
+/// mode label this module builds (leaf rows, collapsed-namespace rows,
+/// drilled function rows, box titles) so they all truncate identically
+/// rather than drifting into slightly different rules.
+fn truncate_label(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut truncated: String = s.chars().take(max_chars - 1).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// The condensed-mode counterpart of [`node_line`]: no `"● "` status
+/// marker, no `✓t`/`⚑`/`💬`/`✔` badges -- just the label itself, truncated to
+/// [`CONDENSED_LABEL_MAX_CHARS`], colored with the same [`status_color`]
+/// the marker glyph would otherwise have carried (condensed mode changes
+/// the *text*, not the color scheme -- see the module's condensed-mode
+/// design note). A reviewed node still gets the dimmed style [`node_line`]
+/// applies, for the same reason.
+fn condensed_node_line(app: &App, id: &NodeId, label: &str) -> Line<'static> {
+    let Some(node) = app.graph.node(id) else {
+        return Line::from(truncate_label(label, CONDENSED_LABEL_MAX_CHARS));
+    };
+    let mut style = Style::default().fg(status_color(node.status));
+    if app.reviewed.contains(id) {
+        style = style.add_modifier(Modifier::DIM);
+    }
+    Line::from(Span::styled(
+        truncate_label(label, CONDENSED_LABEL_MAX_CHARS),
+        style,
+    ))
+}
+
+/// The condensed-mode counterpart of [`collapsed_row_spans`]: `"{name}/
+/// (N)"` instead of `"{name}/ (N modules, M changed)"` -- keeps the fold
+/// summary recognizable while dropping the changed-count clause entirely
+/// (condensed mode is about fitting more rows on screen, not about
+/// preserving every detail of each one). `name` is truncated the same way
+/// [`condensed_node_line`] truncates a plain leaf's label.
+fn condensed_collapsed_row_spans(name: &str, module_count: usize) -> Vec<Span<'static>> {
+    let text = format!(
+        "{}/ ({module_count})",
+        truncate_label(name, CONDENSED_LABEL_MAX_CHARS)
+    );
+    vec![Span::styled(
+        text,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )]
+}
+
 fn status_color(status: GitStatus) -> Color {
     match status {
         GitStatus::Unchanged => Color::Gray,
@@ -682,6 +765,13 @@ pub struct CanvasView {
     edges: Vec<(NodeId, NodeId)>,
     row_of: HashMap<NodeId, RailRow>,
     labels: HashMap<NodeId, String>,
+    /// Whether this view was built for condensed rendering (issue #24) --
+    /// stashed here rather than re-threaded as a separate argument into
+    /// every downstream function ([`canvas_label_line`] in particular)
+    /// that needs to know: it's a property of the view itself (baked into
+    /// `layout`'s own width measurements the moment [`build_canvas_view`]
+    /// ran), not a per-call painting choice.
+    condensed: bool,
 }
 
 /// Build [`CanvasView`] from `app`'s current fold state -- one band per
@@ -689,8 +779,13 @@ pub struct CanvasView {
 /// output (matching the rail view's own band-separator grouping exactly),
 /// [`rail_view::collapse_edges`] for the edge list, and
 /// [`plain_row_text`] as the label function feeding
-/// [`sugiyama::layout`]'s width calculation.
-pub fn build_canvas_view(app: &App) -> CanvasView {
+/// [`sugiyama::layout`]'s width calculation. `condensed` (issue #24's "zoom
+/// out") is threaded into that same `plain_row_text` call so the layout's
+/// own width measurements already reflect condensed text -- every caller
+/// (the renderer, the focus grid, the event loop's auto-pan) must pass the
+/// same value for a given frame, exactly as [`build_plane_view`]'s own doc
+/// requires of its callers.
+pub fn build_canvas_view(app: &App, condensed: bool) -> CanvasView {
     let rows = rail_view::visible_rows_with_layers(&app.graph, &app.layers, &app.fold_collapsed);
     let mut bands: Vec<Vec<NodeId>> = Vec::new();
     let mut row_of: HashMap<NodeId, RailRow> = HashMap::new();
@@ -710,7 +805,7 @@ pub fn build_canvas_view(app: &App) -> CanvasView {
     let layout = sugiyama::layout(&bands, &edges, |id| {
         row_of
             .get(id)
-            .map(|row| plain_row_text(app, row, &labels))
+            .map(|row| plain_row_text(app, row, &labels, condensed))
             .unwrap_or_else(|| id.to_string())
     });
     let channels = canvas::route_channels(&layout, &app.focus);
@@ -720,6 +815,7 @@ pub fn build_canvas_view(app: &App) -> CanvasView {
         edges,
         row_of,
         labels,
+        condensed,
     }
 }
 
@@ -733,11 +829,22 @@ pub fn build_canvas_view(app: &App) -> CanvasView {
 /// format string. `labels` is [`rail_view::disambiguated_labels`]'s output
 /// -- same map [`build_canvas_view`] stores for [`canvas_label_line`]'s use
 /// at actual draw time, so the width estimate and the drawn text always
-/// agree on which name each row renders.
-fn plain_row_text(app: &App, row: &RailRow, labels: &HashMap<NodeId, String>) -> String {
+/// agree on which name each row renders. `condensed` picks
+/// [`condensed_node_line`]/[`condensed_collapsed_row_spans`] over the
+/// full-badge originals -- see those functions' own docs.
+fn plain_row_text(
+    app: &App,
+    row: &RailRow,
+    labels: &HashMap<NodeId, String>,
+    condensed: bool,
+) -> String {
     let label = labels.get(row.id()).map(String::as_str).unwrap_or("");
     let spans = match row {
+        RailRow::Node(id) if condensed => condensed_node_line(app, id, label).spans,
         RailRow::Node(id) => node_line(app, id, label).spans,
+        RailRow::Collapsed { module_count, .. } if condensed => {
+            condensed_collapsed_row_spans(label, *module_count)
+        }
         RailRow::Collapsed {
             module_count,
             changed_count,
@@ -757,8 +864,12 @@ fn plain_row_text(app: &App, row: &RailRow, labels: &HashMap<NodeId, String>) ->
 /// `crate::graph::layout::rows_with_x_centers`'s pixel ones.
 pub type CanvasFocusRows = Vec<Vec<(NodeId, f32)>>;
 
-pub fn canvas_focus_grid(app: &App) -> (Vec<Vec<NodeId>>, CanvasFocusRows) {
-    let view = build_canvas_view(app);
+/// `condensed` must match whatever [`draw_canvas_graph`] and the event
+/// loop's auto-pan used for this same frame -- see [`build_canvas_view`]'s
+/// doc for why disagreeing would desync the focus grid from the painted
+/// layout.
+pub fn canvas_focus_grid(app: &App, condensed: bool) -> (Vec<Vec<NodeId>>, CanvasFocusRows) {
+    let view = build_canvas_view(app, condensed);
     let layers: Vec<Vec<NodeId>> = view
         .layout
         .bands
@@ -893,7 +1004,13 @@ fn canvas_label_line(app: &App, view: &CanvasView, band_idx: usize) -> Line<'sta
             SlotId::Real(id) => {
                 let label = view.labels.get(id).map(String::as_str).unwrap_or("");
                 let mut node_spans = match view.row_of.get(id) {
+                    Some(RailRow::Node(nid)) if view.condensed => {
+                        condensed_node_line(app, nid, label).spans
+                    }
                     Some(RailRow::Node(nid)) => node_line(app, nid, label).spans,
+                    Some(RailRow::Collapsed { module_count, .. }) if view.condensed => {
+                        condensed_collapsed_row_spans(label, *module_count)
+                    }
                     Some(RailRow::Collapsed {
                         module_count,
                         changed_count,
@@ -960,8 +1077,9 @@ fn draw_canvas_graph(
     app: &App,
     canvas_scroll: usize,
     canvas_scroll_x: usize,
+    condensed: bool,
 ) -> usize {
-    let view = build_canvas_view(app);
+    let view = build_canvas_view(app, condensed);
     let lines_index = build_canvas_lines(&view);
     let dropped_edges: usize = view.channels.iter().map(|c| c.dropped).sum();
     if lines_index.is_empty() {
@@ -1059,7 +1177,15 @@ pub struct PlaneView {
 /// to that row and permanently soft-lock there, indistinguishable from no
 /// candidate existing at all (same symptom as issue #21, a second distinct
 /// cause).
-pub fn build_plane_view(app: &App) -> PlaneView {
+///
+/// `condensed` (issue #24's "zoom out") feeds both `plane::layout` closures:
+/// [`plane_leaf_label`] drops badges/markers and truncates, and the box
+/// title closure below truncates the namespace's `display_name` the same
+/// way -- so the layout this function returns already reflects condensed
+/// geometry end to end, and every caller (the renderer, the focus grid, the
+/// event loop's auto-pan) that's handed the *same* `condensed` value for a
+/// given frame stays in agreement about where every row/box actually is.
+pub fn build_plane_view(app: &App, condensed: bool) -> PlaneView {
     let visible_graph = app.visible_graph();
     let raw_rows = rail_view::visible_rows(&visible_graph, &app.layers, &app.fold_collapsed);
     let labels = rail_view::disambiguated_labels(&visible_graph, &raw_rows);
@@ -1069,7 +1195,19 @@ pub fn build_plane_view(app: &App) -> PlaneView {
         &app.layers,
         &app.fold_collapsed,
         &drilled,
-        |id| plane_leaf_label(app, id, &labels),
+        |id| plane_leaf_label(app, id, &labels, condensed),
+        |id| {
+            let name = app
+                .graph
+                .node(id)
+                .map(|n| n.display_name.clone())
+                .unwrap_or_else(|| id.to_string());
+            if condensed {
+                truncate_label(&name, CONDENSED_LABEL_MAX_CHARS)
+            } else {
+                name
+            }
+        },
     );
     let mut edges = rail_view::collapse_edges(&app.graph, &app.graph.edges, &app.fold_collapsed);
     // Function-level static-call edges, appended alongside the existing
@@ -1172,8 +1310,9 @@ fn plane_leaf_spans(
     app: &App,
     id: &NodeId,
     labels: &HashMap<NodeId, String>,
+    condensed: bool,
 ) -> Vec<Span<'static>> {
-    if let Some(spans) = function_row_spans(app, id) {
+    if let Some(spans) = function_row_spans(app, id, condensed) {
         return spans;
     }
     let label = labels
@@ -1183,7 +1322,13 @@ fn plane_leaf_spans(
         .unwrap_or_else(|| id.to_string());
     if app.fold_collapsed.contains(id) {
         let (module_count, changed_count) = rail_view::namespace_stats(&app.graph, id);
-        collapsed_row_spans(&label, module_count, changed_count)
+        if condensed {
+            condensed_collapsed_row_spans(&label, module_count)
+        } else {
+            collapsed_row_spans(&label, module_count, changed_count)
+        }
+    } else if condensed {
+        condensed_node_line(app, id, &label).spans
     } else {
         node_line(app, id, &label).spans
     }
@@ -1205,7 +1350,7 @@ fn plane_leaf_spans(
 /// among whatever unchanged callers/callees came along for static-call
 /// context. Visibility (`public`/private) is deliberately not styled at all
 /// here either -- see [`function_row_label`]'s doc.
-fn function_row_spans(app: &App, id: &NodeId) -> Option<Vec<Span<'static>>> {
+fn function_row_spans(app: &App, id: &NodeId, condensed: bool) -> Option<Vec<Span<'static>>> {
     let owner = crate::graph::functions::function_owner(id)?;
     let row = app
         .fn_index
@@ -1217,13 +1362,23 @@ fn function_row_spans(app: &App, id: &NodeId) -> Option<Vec<Span<'static>>> {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    Some(vec![Span::styled(function_row_label(row), style)])
+    let text = if condensed {
+        truncate_label(&function_row_label(row), CONDENSED_LABEL_MAX_CHARS)
+    } else {
+        function_row_label(row)
+    };
+    Some(vec![Span::styled(text, style)])
 }
 
 /// The plain-text content of [`plane_leaf_spans`] -- what [`build_plane_view`]
 /// feeds [`plane::layout`] as each row's label width.
-fn plane_leaf_label(app: &App, id: &NodeId, labels: &HashMap<NodeId, String>) -> String {
-    plane_leaf_spans(app, id, labels)
+fn plane_leaf_label(
+    app: &App,
+    id: &NodeId,
+    labels: &HashMap<NodeId, String>,
+    condensed: bool,
+) -> String {
+    plane_leaf_spans(app, id, labels, condensed)
         .iter()
         .map(|s| s.content.as_ref())
         .collect()
@@ -1232,9 +1387,12 @@ fn plane_leaf_label(app: &App, id: &NodeId, labels: &HashMap<NodeId, String>) ->
 /// The `(layers, rows)` pair [`crate::core::focus::move_focus`] needs for
 /// plane-mode spatial `h`/`j`/`k`/`l` -- [`plane::focus_grid`] over a freshly
 /// built [`PlaneView`]'s layout, mirroring [`canvas_focus_grid`]'s own role
-/// for the canvas view exactly.
-pub fn plane_focus_grid(app: &App) -> (Vec<Vec<NodeId>>, plane::FocusRows) {
-    let view = build_plane_view(app);
+/// for the canvas view exactly. `condensed` must be the same value
+/// [`draw_plane_graph`] and the event loop's auto-pan both used for this
+/// frame -- see [`build_plane_view`]'s doc for why all three call sites
+/// disagreeing would desync the focus grid from what's actually painted.
+pub fn plane_focus_grid(app: &App, condensed: bool) -> (Vec<Vec<NodeId>>, plane::FocusRows) {
+    let view = build_plane_view(app, condensed);
     plane::focus_grid(&view.layout)
 }
 
@@ -1360,8 +1518,9 @@ fn draw_plane_graph(
     app: &App,
     scroll_y: usize,
     scroll_x: usize,
+    condensed: bool,
 ) -> usize {
-    let view = build_plane_view(app);
+    let view = build_plane_view(app, condensed);
     if view.layout.rows.is_empty() && view.layout.boxes.is_empty() {
         frame.render_widget(
             Paragraph::new("(no visible nodes)").alignment(Alignment::Center),
@@ -1397,10 +1556,19 @@ fn draw_plane_graph(
     // instead of the usual dim color -- see `rect_contains`'s doc.
     let focus_rect = view.layout.rows.get(&app.focus).copied();
     for (id, rect) in &view.layout.boxes {
-        let name = app
-            .graph
-            .node(id)
-            .map(|n| n.display_name.clone())
+        // The exact string `crate::graph::plane::layout`'s `title_label`
+        // closure returned for this box, stored in `PlaneLayout::titles` --
+        // *not* re-derived from `app.graph` here, so the measured width
+        // (`title_min_w`, computed against this same string) and the
+        // painted text can never drift apart (see [`PlaneLayout::titles`]'s
+        // own doc for the bug class this avoids: a condensed-mode title
+        // shorter than `display_name` would otherwise measure one string
+        // and paint another).
+        let name = view
+            .layout
+            .titles
+            .get(id)
+            .cloned()
             .unwrap_or_else(|| id.to_string());
         let is_focused_box = focus_rect.is_some_and(|fr| rect_contains(rect, &fr));
         let border_color = if is_focused_box {
@@ -1437,7 +1605,7 @@ fn draw_plane_graph(
         if rect.y < start_y || rect.y >= end_y {
             continue;
         }
-        let mut spans = plane_leaf_spans(app, id, &view.labels);
+        let mut spans = plane_leaf_spans(app, id, &view.labels, condensed);
         if id == &app.focus {
             for span in &mut spans {
                 span.style = span.style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
@@ -1751,11 +1919,11 @@ fn draw_legend(
                             .to_string()
                     }
                     ViewMode::Canvas => {
-                        "` rail  h/j/k/l move  zc/zo fold/unfold  zM/zR fold/unfold all  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
+                        "` rail  h/j/k/l move  zc/zo fold/unfold  zM/zR fold/unfold all  - zoom  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
                             .to_string()
                     }
                     ViewMode::Plane => {
-                        "` canvas  h/j/k/l move  zc/zo fold/unfold  zM/zR fold/unfold all  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  zf fns  q quit"
+                        "` canvas  h/j/k/l move  zc/zo fold/unfold  zM/zR fold/unfold all  - zoom  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  zf fns  q quit"
                             .to_string()
                     }
                 };
@@ -1957,6 +2125,7 @@ mod tests {
                         canvas_x: 0,
                     },
                     ViewMode::Rail,
+                    false,
                     None,
                 )
             })
@@ -2022,6 +2191,7 @@ mod tests {
                         canvas_x: 0,
                     },
                     ViewMode::Rail,
+                    false,
                     None,
                 )
             })
@@ -2676,7 +2846,7 @@ mod tests {
     #[test]
     fn canvas_view_lays_out_a_diamond_with_two_bands() {
         let app = app_for(diamond_graph_fixture(), "child");
-        let view = build_canvas_view(&app);
+        let view = build_canvas_view(&app, false);
         assert_eq!(view.layout.bands.len(), 2);
         assert_eq!(view.layout.bands[0].len(), 2, "p1/p2 share the top band");
         assert_eq!(
@@ -2703,6 +2873,7 @@ mod tests {
                         canvas_x: 0,
                     },
                     ViewMode::Canvas,
+                    false,
                     None,
                 )
             })
@@ -2749,6 +2920,7 @@ mod tests {
                         canvas_x: 0,
                     },
                     ViewMode::Canvas,
+                    false,
                     None,
                 )
             })
@@ -2769,6 +2941,7 @@ mod tests {
                         canvas_x: 20,
                     },
                     ViewMode::Canvas,
+                    false,
                     None,
                 )
             })
@@ -2811,6 +2984,7 @@ mod tests {
                         canvas_x: 0,
                     },
                     ViewMode::Canvas,
+                    false,
                     None,
                 )
             })
@@ -2825,6 +2999,10 @@ mod tests {
         assert!(text.contains('`'), "expected the view-toggle hint");
         assert!(text.contains("zc/zo"), "expected the fold-chord hint");
         assert!(text.contains("zM/zR"), "expected the fold-all-chord hint");
+        assert!(
+            text.contains("- zoom"),
+            "expected the condensed-toggle hint"
+        );
     }
 
     #[test]
@@ -2837,6 +3015,10 @@ mod tests {
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("zc/zo"), "expected the fold-chord hint");
         assert!(text.contains("zM/zR"), "expected the fold-all-chord hint");
+        assert!(
+            text.contains("- zoom"),
+            "expected the condensed-toggle hint"
+        );
     }
 
     #[test]
@@ -2898,6 +3080,7 @@ mod tests {
                         canvas_x: 0,
                     },
                     ViewMode::Canvas,
+                    false,
                     None,
                 )
             })
@@ -2915,7 +3098,7 @@ mod tests {
     #[test]
     fn focus_canvas_line_and_canvas_line_count_agree_with_the_rendered_band() {
         let app = app_for(diamond_graph_fixture(), "child");
-        let view = build_canvas_view(&app);
+        let view = build_canvas_view(&app, false);
         let focus_line = focus_canvas_line(&view, &NodeId::from("child")).expect("child visible");
         // `child`'s band is the second one, after the top band's own label
         // line plus the channel between them.
@@ -2926,7 +3109,7 @@ mod tests {
     #[test]
     fn canvas_focus_grid_matches_move_focus_over_the_diamond() {
         let app = app_for(diamond_graph_fixture(), "p1");
-        let (layers, rows) = canvas_focus_grid(&app);
+        let (layers, rows) = canvas_focus_grid(&app, false);
         let target = crate::core::focus::move_focus(
             &layers,
             &rows,
@@ -2948,6 +3131,7 @@ mod tests {
         height: u16,
         scroll_y: usize,
         scroll_x: usize,
+        condensed: bool,
     ) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
         terminal
@@ -2962,6 +3146,7 @@ mod tests {
                         canvas_x: scroll_x,
                     },
                     ViewMode::Plane,
+                    condensed,
                     None,
                 )
             })
@@ -2973,7 +3158,7 @@ mod tests {
     fn plane_graph_renders_a_nested_box_with_its_children_and_labels() {
         let (graph, _ns_id) = namespaced_graph_fixture();
         let app = app_for_plane(graph, "a");
-        let text = render_plane_to_string(&app, 80, 24, 0, 0);
+        let text = render_plane_to_string(&app, 80, 24, 0, 0, false);
         assert!(text.contains("ns"), "missing namespace title, got:\n{text}");
         assert!(text.contains('a'), "missing child a, got:\n{text}");
         assert!(text.contains('b'), "missing child b, got:\n{text}");
@@ -3004,6 +3189,7 @@ mod tests {
                         canvas_x: 0,
                     },
                     ViewMode::Plane,
+                    false,
                     None,
                 )
             })
@@ -3026,12 +3212,13 @@ mod tests {
     fn plane_graph_vertical_panning_changes_rendered_content() {
         let (graph, _ns_id) = namespaced_graph_fixture();
         let app = app_for_plane(graph, "a");
-        let view = build_plane_view(&app);
+        let view = build_plane_view(&app, false);
         let total_height = plane_view_height(&view);
         assert!(total_height > 1, "fixture must have more than one row");
 
-        let text_at_top = render_plane_to_string(&app, 80, 8, 0, 0);
-        let text_scrolled = render_plane_to_string(&app, 80, 8, total_height.saturating_sub(1), 0);
+        let text_at_top = render_plane_to_string(&app, 80, 8, 0, 0, false);
+        let text_scrolled =
+            render_plane_to_string(&app, 80, 8, total_height.saturating_sub(1), 0, false);
         assert_ne!(
             text_at_top, text_scrolled,
             "vertical scroll must change what's rendered"
@@ -3042,12 +3229,13 @@ mod tests {
     fn plane_graph_horizontal_panning_changes_rendered_content() {
         let (graph, _ns_id) = namespaced_graph_fixture();
         let app = app_for_plane(graph, "a");
-        let view = build_plane_view(&app);
+        let view = build_plane_view(&app, false);
         let total_width = view.layout.width;
         assert!(total_width > 1, "fixture must have more than one column");
 
-        let text_at_left = render_plane_to_string(&app, 6, 24, 0, 0);
-        let text_panned = render_plane_to_string(&app, 6, 24, 0, total_width.saturating_sub(1));
+        let text_at_left = render_plane_to_string(&app, 6, 24, 0, 0, false);
+        let text_panned =
+            render_plane_to_string(&app, 6, 24, 0, total_width.saturating_sub(1), false);
         assert_ne!(
             text_at_left, text_panned,
             "horizontal scroll must change what's rendered"
@@ -3057,7 +3245,7 @@ mod tests {
     #[test]
     fn plane_graph_draws_an_edge_between_dependent_columns() {
         let app = app_for_plane(diamond_graph_fixture(), "child");
-        let text = render_plane_to_string(&app, 80, 24, 0, 0);
+        let text = render_plane_to_string(&app, 80, 24, 0, 0, false);
         assert!(text.contains("p1"), "missing p1, got:\n{text}");
         assert!(text.contains("p2"), "missing p2, got:\n{text}");
         assert!(text.contains("child"), "missing child, got:\n{text}");
@@ -3073,7 +3261,7 @@ mod tests {
     #[test]
     fn plane_edges_route_between_the_correct_absolute_columns() {
         let app = app_for_plane(diamond_graph_fixture(), "child");
-        let view = build_plane_view(&app);
+        let view = build_plane_view(&app, false);
         let child_rect = view
             .layout
             .rows
@@ -3153,7 +3341,7 @@ mod tests {
         );
         app.fn_expanded.insert(child);
 
-        let text = render_plane_to_string(&app, 80, 24, 0, 0);
+        let text = render_plane_to_string(&app, 80, 24, 0, 0, false);
         assert!(
             text.contains("changed_fn/0"),
             "missing changed function row, got:\n{text}"
@@ -3209,7 +3397,7 @@ mod tests {
             },
             "nobody",
         );
-        let text = render_plane_to_string(&app, 40, 10, 0, 0);
+        let text = render_plane_to_string(&app, 40, 10, 0, 0, false);
         assert!(text.contains("no visible nodes"));
     }
 
@@ -3307,6 +3495,7 @@ mod tests {
                         canvas_x: 0,
                     },
                     ViewMode::Plane,
+                    false,
                     None,
                 )
             })
@@ -3340,6 +3529,7 @@ mod tests {
                         canvas_x: 0,
                     },
                     ViewMode::Plane,
+                    false,
                     None,
                 )
             })
@@ -3363,6 +3553,7 @@ mod tests {
                         canvas_x: 0,
                     },
                     ViewMode::Plane,
+                    false,
                     None,
                 )
             })
@@ -3382,7 +3573,7 @@ mod tests {
     fn plane_graph_accents_the_box_containing_the_focused_row() {
         let graph = two_namespace_graph_fixture();
         let app = app_for_plane(graph, "a");
-        let view = build_plane_view(&app);
+        let view = build_plane_view(&app, false);
         let ns1_rect = *view
             .layout
             .boxes
@@ -3407,6 +3598,7 @@ mod tests {
                         canvas_x: 0,
                     },
                     ViewMode::Plane,
+                    false,
                     None,
                 )
             })
@@ -3431,7 +3623,7 @@ mod tests {
     fn plane_graph_accents_a_drawn_namespace_s_own_box_when_it_is_itself_focused() {
         let graph = two_namespace_graph_fixture();
         let app = app_for_plane(graph, "ns1");
-        let view = build_plane_view(&app);
+        let view = build_plane_view(&app, false);
         let ns1_rect = *view
             .layout
             .boxes
@@ -3451,6 +3643,7 @@ mod tests {
                         canvas_x: 0,
                     },
                     ViewMode::Plane,
+                    false,
                     None,
                 )
             })
@@ -3480,6 +3673,7 @@ mod tests {
                         canvas_x: 0,
                     },
                     ViewMode::Canvas,
+                    false,
                     None,
                 )
             })
@@ -3502,7 +3696,7 @@ mod tests {
         // whichever's x-nearest -- with one entry per row, that's simply
         // the next one in sequence.
         let app = app_for_plane(diamond_graph_fixture(), "p1");
-        let (layers, rows) = plane_focus_grid(&app);
+        let (layers, rows) = plane_focus_grid(&app, false);
         let target = crate::core::focus::move_focus(
             &layers,
             &rows,
@@ -3510,5 +3704,239 @@ mod tests {
             crate::core::focus::Direction::Down,
         );
         assert_eq!(target, NodeId::from("p2"));
+    }
+
+    // -- Issue #24's condensed render mode -----------------------------
+
+    #[test]
+    fn truncate_label_leaves_short_strings_untouched() {
+        assert_eq!(truncate_label("short", 12), "short");
+        assert_eq!(truncate_label("exactly12chr", 12), "exactly12chr");
+    }
+
+    #[test]
+    fn truncate_label_cuts_long_strings_and_appends_an_ellipsis() {
+        let truncated = truncate_label("AVeryLongDisplayNameForTruncation", 12);
+        assert_eq!(truncated.chars().count(), 12);
+        assert!(truncated.ends_with('…'), "got: {truncated}");
+        assert!(truncated.starts_with("AVeryLongDi"), "got: {truncated}");
+    }
+
+    #[test]
+    fn truncate_label_handles_a_zero_width_budget() {
+        assert_eq!(truncate_label("anything", 0), "");
+    }
+
+    /// A single drawn leaf with a display name well past
+    /// [`CONDENSED_LABEL_MAX_CHARS`] -- the shape every condensed-mode
+    /// truncation test below needs (a name short enough to fit whole would
+    /// make the assertion vacuous).
+    fn long_name_graph_fixture() -> ProjectGraph {
+        let id = NodeId::from("leaf");
+        let node = ModuleNode {
+            id: id.clone(),
+            display_name: "AVeryLongDisplayNameForTruncation".to_string(),
+            parent: None,
+            children: vec![],
+            status: GitStatus::Modified,
+            files: vec![FileRef {
+                path: PathBuf::from("leaf.rs"),
+                base_blob: Some("b".to_string()),
+                head_blob: Some("h".to_string()),
+            }],
+        };
+        let mut nodes = HashMap::new();
+        nodes.insert(id.clone(), node);
+        ProjectGraph {
+            roots: vec![id],
+            nodes,
+            edges: vec![],
+        }
+    }
+
+    #[test]
+    fn condensed_plane_leaf_row_truncates_and_drops_marker_and_badges() {
+        let app = app_for_plane(long_name_graph_fixture(), "leaf");
+        let condensed_text = render_plane_to_string(&app, 80, 24, 0, 0, true);
+        assert!(
+            !condensed_text.contains('●'),
+            "condensed mode must drop the status marker, got:\n{condensed_text}"
+        );
+        assert!(
+            condensed_text.contains('…'),
+            "expected the truncated label's ellipsis, got:\n{condensed_text}"
+        );
+        assert!(
+            !condensed_text.contains("AVeryLongDisplayNameForTruncation"),
+            "the full, untruncated name must not appear, got:\n{condensed_text}"
+        );
+
+        let full_text = render_plane_to_string(&app, 80, 24, 0, 0, false);
+        assert!(
+            full_text.contains('●'),
+            "sanity: the non-condensed render keeps its marker"
+        );
+    }
+
+    #[test]
+    fn condensed_plane_row_width_matches_the_condensed_label() {
+        let app = app_for_plane(long_name_graph_fixture(), "leaf");
+        let view = build_plane_view(&app, true);
+        let rect = view.layout.rows.get(&NodeId::from("leaf")).unwrap();
+        let expected = truncate_label(
+            "AVeryLongDisplayNameForTruncation",
+            CONDENSED_LABEL_MAX_CHARS,
+        );
+        assert_eq!(rect.w, expected.chars().count());
+    }
+
+    #[test]
+    fn condensed_plane_focused_row_still_carries_reversed() {
+        let app = app_for_plane(long_name_graph_fixture(), "leaf");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Plane,
+                    true,
+                    None,
+                )
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let reversed = (0..buffer.area.height).any(|y| {
+            (0..buffer.area.width).any(|x| {
+                let cell = &buffer[(x, y)];
+                cell.symbol() == "A"
+                    && cell
+                        .style()
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::REVERSED)
+            })
+        });
+        assert!(
+            reversed,
+            "focused row's condensed label must still carry REVERSED"
+        );
+    }
+
+    #[test]
+    fn condensed_plane_collapsed_namespace_shows_the_short_form() {
+        let (graph, ns_id) = namespaced_graph_fixture();
+        let mut app = app_for_plane(graph, "a");
+        app.fold_collapsed.insert(ns_id);
+        let condensed_text = render_plane_to_string(&app, 80, 24, 0, 0, true);
+        assert!(
+            condensed_text.contains("ns/ (2)") || condensed_text.contains("ns/ ("),
+            "expected the short collapsed form, got:\n{condensed_text}"
+        );
+        assert!(
+            !condensed_text.contains("modules,"),
+            "condensed mode must drop the changed-count clause, got:\n{condensed_text}"
+        );
+    }
+
+    #[test]
+    fn plane_focus_grid_condensed_matches_build_plane_view_condensed() {
+        // Guards the three-call-site invariant (issue #24's own design
+        // note): `draw_plane_graph`, `plane_focus_grid`, and the event
+        // loop's auto-pan all call `build_plane_view` and must agree on
+        // `condensed`, or the focus grid navigates over different
+        // geometry than what's actually painted. This checks
+        // `plane_focus_grid`/`build_plane_view` pairwise -- same ids, and
+        // each grid row's own x-center actually matches its rect's.
+        let app = app_for_plane(long_name_graph_fixture(), "leaf");
+        let (layers, rows) = plane_focus_grid(&app, true);
+        let view = build_plane_view(&app, true);
+        let grid_ids: HashSet<NodeId> = layers.into_iter().flatten().collect();
+        let layout_ids: HashSet<NodeId> = view.layout.rows.keys().cloned().collect();
+        assert_eq!(
+            grid_ids, layout_ids,
+            "plane_focus_grid(app, true) must reach exactly the same ids build_plane_view(app, true) laid out"
+        );
+        for group in &rows {
+            for (id, x_center) in group {
+                let rect = view.layout.rows.get(id).expect("id must be laid out");
+                assert_eq!(
+                    *x_center,
+                    rect.x_center(),
+                    "{id}'s focus-grid x-center must match its own layout rect"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn condensed_canvas_leaf_row_truncates_and_drops_marker() {
+        let app = app_for(long_name_graph_fixture(), "leaf");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Canvas,
+                    true,
+                    None,
+                )
+            })
+            .expect("draw");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            !text.contains('●'),
+            "condensed canvas must drop the status marker, got:\n{text}"
+        );
+        assert!(
+            text.contains('…'),
+            "expected the truncated label's ellipsis, got:\n{text}"
+        );
+        assert!(
+            !text.contains("AVeryLongDisplayNameForTruncation"),
+            "the full, untruncated name must not appear, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn condensed_canvas_collapsed_namespace_shows_the_short_form() {
+        let (graph, ns_id) = namespaced_graph_fixture();
+        let mut app = app_for(graph, "a");
+        app.fold_collapsed.insert(ns_id);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: 0,
+                        canvas_x: 0,
+                    },
+                    ViewMode::Canvas,
+                    true,
+                    None,
+                )
+            })
+            .expect("draw");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            !text.contains("modules,"),
+            "condensed mode must drop the changed-count clause, got:\n{text}"
+        );
     }
 }

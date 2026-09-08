@@ -132,6 +132,14 @@ const BOX_MARGIN: usize = 2;
 pub struct PlaneLayout {
     pub rows: HashMap<NodeId, Rect>,
     pub boxes: HashMap<NodeId, Rect>,
+    /// Every expanded namespace's exact title text, as returned by
+    /// [`layout`]'s `title_label` closure -- the same string
+    /// [`assemble_box`] measured `box_rect.w` against, stored here so the
+    /// renderer never re-derives (and risks disagreeing with) the text it
+    /// paints into the box's own top border. Keyed the same as
+    /// [`Self::boxes`] (one entry per box, never populated for a plain
+    /// [`Self::rows`] leaf).
+    pub titles: HashMap<NodeId, String>,
     pub children_of: HashMap<NodeId, Vec<NodeId>>,
     pub top_level: Vec<NodeId>,
     /// The layout's overall bounding size: `width` is the rightmost edge
@@ -149,6 +157,11 @@ struct Item {
     id: NodeId,
     rect: Rect,
     kind: ItemKind,
+    /// This item's exact box-title text (see [`PlaneLayout::titles`]),
+    /// `None` for a [`ItemKind::Leaf`] -- only [`assemble_box`] ever sets
+    /// this, to the same string it measured `rect.w`'s `title_min_w` floor
+    /// against.
+    title: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -186,13 +199,20 @@ struct BuildCtx<'a> {
 /// caller -- `crate::tui::render` -- is expected to reuse the same
 /// status-glyph/badge text the rail/canvas views already render, so all
 /// three views' widths and content agree; see that module's
-/// `plane_leaf_label`).
+/// `plane_leaf_label`). `title_label` is the box-title counterpart:
+/// [`assemble_box`] calls it once per expanded namespace to get the exact
+/// text it both measures `title_min_w` against and stores in
+/// [`PlaneLayout::titles`] -- letting the caller shrink box titles (e.g.
+/// the TUI's condensed render mode, issue #24) without this module knowing
+/// anything about *why* the text it's handed is shorter than the node's
+/// full `display_name`.
 pub fn layout(
     graph: &ProjectGraph,
     layers: &[Vec<NodeId>],
     collapsed: &HashSet<NodeId>,
     drilled: &HashMap<NodeId, Vec<(NodeId, String)>>,
     leaf_label: impl Fn(&NodeId) -> String,
+    title_label: impl Fn(&NodeId) -> String,
 ) -> PlaneLayout {
     let leaf_layer: HashMap<NodeId, usize> = layers
         .iter()
@@ -225,7 +245,7 @@ pub fn layout(
 
     let items: Vec<Item> = roots
         .iter()
-        .map(|id| build_item(&mut ctx, id, &leaf_label))
+        .map(|id| build_item(&mut ctx, id, &leaf_label, &title_label))
         .collect();
     let packed = shelf_pack(items);
 
@@ -319,7 +339,12 @@ fn is_visible(
 /// (recursively built, then shelf-packed) children. Only ever called on an
 /// `id` [`is_visible`] already accepted -- see that function's doc for why
 /// a node failing it must never reach here.
-fn build_item(ctx: &mut BuildCtx, id: &NodeId, leaf_label: &impl Fn(&NodeId) -> String) -> Item {
+fn build_item(
+    ctx: &mut BuildCtx,
+    id: &NodeId,
+    leaf_label: &impl Fn(&NodeId) -> String,
+    title_label: &impl Fn(&NodeId) -> String,
+) -> Item {
     let is_collapsed = ctx.collapsed.contains(id);
     let is_leaf_like = is_collapsed
         || ctx
@@ -339,7 +364,7 @@ fn build_item(ctx: &mut BuildCtx, id: &NodeId, leaf_label: &impl Fn(&NodeId) -> 
                 if !rows.is_empty() {
                     let mut child_items = vec![self_item];
                     child_items.extend(function_leaf_items(rows));
-                    return assemble_box(ctx.graph, id, child_items);
+                    return assemble_box(id, child_items, title_label);
                 }
             }
         }
@@ -362,7 +387,7 @@ fn build_item(ctx: &mut BuildCtx, id: &NodeId, leaf_label: &impl Fn(&NodeId) -> 
 
     let mut child_items: Vec<Item> = children
         .iter()
-        .map(|child| build_item(ctx, child, leaf_label))
+        .map(|child| build_item(ctx, child, leaf_label, title_label))
         .collect();
     // A *drawn* namespace (a real module with its own backing file that also
     // has children -- `crate::graph::builder`'s "real defmodule takes
@@ -393,7 +418,7 @@ fn build_item(ctx: &mut BuildCtx, id: &NodeId, leaf_label: &impl Fn(&NodeId) -> 
             }
         }
     }
-    assemble_box(ctx.graph, id, child_items)
+    assemble_box(id, child_items, title_label)
 }
 
 /// One label-row [`Item`] for `id`: height 1, width the caller-supplied
@@ -410,6 +435,7 @@ fn leaf_item(id: &NodeId, leaf_label: &impl Fn(&NodeId) -> String) -> Item {
             h: 1,
         },
         kind: ItemKind::Leaf,
+        title: None,
     }
 }
 
@@ -427,6 +453,7 @@ fn function_leaf_items(rows: &[(NodeId, String)]) -> Vec<Item> {
                 h: 1,
             },
             kind: ItemKind::Leaf,
+            title: None,
         })
         .collect()
 }
@@ -437,20 +464,27 @@ fn function_leaf_items(rows: &[(NodeId, String)]) -> Vec<Item> {
 /// expanded-namespace path and the drilled-leaf/drilled-namespace paths in
 /// [`build_item`] -- box assembly itself doesn't care whether `child_items`
 /// came from real module children, function rows, or both.
-fn assemble_box(graph: &ProjectGraph, id: &NodeId, child_items: Vec<Item>) -> Item {
+fn assemble_box(
+    id: &NodeId,
+    child_items: Vec<Item>,
+    title_label: &impl Fn(&NodeId) -> String,
+) -> Item {
     let packed = shelf_pack(child_items);
     let (children_w, children_h) = bounding_size(&packed);
 
-    let name = graph
-        .node(id)
-        .map(|n| n.display_name.clone())
-        .unwrap_or_else(|| id.to_string());
+    // `title_label` supplies the exact text (see [`layout`]'s doc for why
+    // this is a caller-supplied closure rather than `graph.node(id)
+    // .display_name` directly) -- stored on the `Item` below so
+    // [`flatten`] can hand the same string into [`PlaneLayout::titles`],
+    // guaranteeing the width measured here and the text a renderer later
+    // paints can never drift apart.
+    let title = title_label(id);
     // Conservative minimum so the box is always at least wide enough for a
     // one-line title (`"\u{256d}\u{2500} name \u{2500}\u{256e}"`-shaped --
     // see `crate::tui::render`'s border-painting code for the exact glyphs);
     // the renderer is the one that actually draws the border text, this
     // just reserves the room for it.
-    let title_min_w = name.chars().count() + 8;
+    let title_min_w = title.chars().count() + 8;
     let box_w = (children_w + 2 * BOX_MARGIN).max(title_min_w);
     let box_h = children_h + 2 * BOX_MARGIN;
 
@@ -474,6 +508,7 @@ fn assemble_box(graph: &ProjectGraph, id: &NodeId, child_items: Vec<Item>) -> It
             h: box_h,
         },
         kind: ItemKind::Box(offset_children),
+        title: Some(title),
     }
 }
 
@@ -547,6 +582,9 @@ fn flatten(item: &Item, offset: (usize, usize), out: &mut PlaneLayout) {
         }
         ItemKind::Box(children) => {
             out.boxes.insert(item.id.clone(), abs);
+            if let Some(title) = &item.title {
+                out.titles.insert(item.id.clone(), title.clone());
+            }
             out.children_of.insert(
                 item.id.clone(),
                 children.iter().map(|c| c.id.clone()).collect(),
@@ -650,6 +688,15 @@ mod tests {
         format!("* {id}")
     }
 
+    /// The box-title counterpart of [`label`] for every existing test that
+    /// doesn't care what a box's title text actually says -- none of them
+    /// assert on [`PlaneLayout::titles`]'s contents, only on rect geometry,
+    /// so any deterministic function satisfies `layout`'s new `title_label`
+    /// parameter without changing a single existing assertion's outcome.
+    fn title(id: &NodeId) -> String {
+        id.to_string()
+    }
+
     /// `ns` (namespace) containing `a`, `b`, plus a standalone root `c` --
     /// enough shape to exercise nesting, top-level packing, and multiple
     /// items in one container.
@@ -714,6 +761,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             label,
+            title,
         );
 
         let box_rect = *layout.boxes.get(&ns_id).expect("ns renders as a box");
@@ -759,7 +807,7 @@ mod tests {
             ],
         );
 
-        let layout = layout(&g, &[], &HashSet::new(), &drilled, label);
+        let layout = layout(&g, &[], &HashSet::new(), &drilled, label, title);
 
         let box_rect = *layout
             .boxes
@@ -796,6 +844,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             label,
+            title,
         );
         assert!(layout.rows.contains_key(&NodeId::from("a")));
         assert!(!layout.boxes.contains_key(&NodeId::from("a")));
@@ -819,7 +868,7 @@ mod tests {
         drilled.insert(leaf_id.clone(), vec![(fn_a.clone(), "* a/0".to_string())]);
         let collapsed = HashSet::from([leaf_id.clone()]);
 
-        let layout = layout(&g, &[], &collapsed, &drilled, label);
+        let layout = layout(&g, &[], &collapsed, &drilled, label, title);
 
         assert!(layout.rows.contains_key(&leaf_id));
         assert!(!layout.boxes.contains_key(&leaf_id));
@@ -853,7 +902,7 @@ mod tests {
         let mut drilled = HashMap::new();
         drilled.insert(ns_id.clone(), vec![(fn_x.clone(), "* x/0".to_string())]);
 
-        let layout = layout(&g, &[], &HashSet::new(), &drilled, label);
+        let layout = layout(&g, &[], &HashSet::new(), &drilled, label, title);
 
         assert!(layout.rows.contains_key(&ns_id));
         assert!(layout.rows.contains_key(&fn_x));
@@ -892,7 +941,7 @@ mod tests {
             ],
         );
 
-        let layout = layout(&g, &[], &HashSet::new(), &drilled, label);
+        let layout = layout(&g, &[], &HashSet::new(), &drilled, label, title);
         let (layers, rows) = focus_grid(&layout);
         let all_grid_ids: HashSet<NodeId> = rows
             .iter()
@@ -917,6 +966,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             label,
+            title,
         );
         let a_rect = layout.rows.get(&NodeId::from("a")).expect("a is a row");
         assert_eq!(a_rect.h, 1);
@@ -932,6 +982,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             label,
+            title,
         );
         let ns_box = layout.boxes.get(&NodeId::from("ns")).expect("ns is a box");
         let a_rect = layout.rows.get(&NodeId::from("a")).expect("a is a row");
@@ -946,11 +997,65 @@ mod tests {
         assert!(a_rect.bottom() < ns_box.bottom());
     }
 
+    /// Proves `title_label` actually controls `title_min_w` (and therefore
+    /// `box_w`): a namespace whose packed children are already wide enough
+    /// that `title_min_w` isn't the binding constraint would make this test
+    /// vacuous, so `nested_fixture`'s `ns` (two short one-char-ish leaves)
+    /// is exactly the shape where the title is what decides the box's
+    /// width -- the caller-facing invariant issue #24's condensed render
+    /// mode depends on (a shrunk title must yield a narrower box, letting
+    /// more boxes fit on one screen).
+    #[test]
+    fn a_shorter_title_label_yields_a_strictly_narrower_box() {
+        let g = nested_fixture();
+        let long_title = |_id: &NodeId| "AVeryLongNamespaceTitleIndeed".to_string();
+        let short_title = |_id: &NodeId| "Ns".to_string();
+        let long_layout = layout(
+            &g,
+            &layers_fixture(),
+            &HashSet::new(),
+            &HashMap::new(),
+            label,
+            long_title,
+        );
+        let short_layout = layout(
+            &g,
+            &layers_fixture(),
+            &HashSet::new(),
+            &HashMap::new(),
+            label,
+            short_title,
+        );
+        let long_box = long_layout.boxes.get(&NodeId::from("ns")).unwrap();
+        let short_box = short_layout.boxes.get(&NodeId::from("ns")).unwrap();
+        assert!(
+            short_box.w < long_box.w,
+            "short title box ({}) must be narrower than long title box ({})",
+            short_box.w,
+            long_box.w
+        );
+        assert_eq!(
+            long_layout
+                .titles
+                .get(&NodeId::from("ns"))
+                .map(String::as_str),
+            Some("AVeryLongNamespaceTitleIndeed"),
+            "the exact title_label text must be stored for the renderer to paint"
+        );
+    }
+
     #[test]
     fn collapsed_namespace_renders_as_a_single_row_not_a_box() {
         let g = nested_fixture();
         let collapsed = HashSet::from([NodeId::from("ns")]);
-        let layout = layout(&g, &layers_fixture(), &collapsed, &HashMap::new(), label);
+        let layout = layout(
+            &g,
+            &layers_fixture(),
+            &collapsed,
+            &HashMap::new(),
+            label,
+            title,
+        );
         assert!(layout.rows.contains_key(&NodeId::from("ns")));
         assert!(!layout.boxes.contains_key(&NodeId::from("ns")));
         assert!(!layout.rows.contains_key(&NodeId::from("a")));
@@ -966,6 +1071,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             label,
+            title,
         );
         let ns_box = layout.boxes.get(&NodeId::from("ns")).unwrap();
         let c_rect = layout.rows.get(&NodeId::from("c")).unwrap();
@@ -981,6 +1087,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             label,
+            title,
         );
         let a_rect = layout.rows.get(&NodeId::from("a")).unwrap();
         let b_rect = layout.rows.get(&NodeId::from("b")).unwrap();
@@ -991,8 +1098,8 @@ mod tests {
     fn layout_is_deterministic_across_repeated_calls() {
         let g = nested_fixture();
         let layers = layers_fixture();
-        let first = layout(&g, &layers, &HashSet::new(), &HashMap::new(), label);
-        let second = layout(&g, &layers, &HashSet::new(), &HashMap::new(), label);
+        let first = layout(&g, &layers, &HashSet::new(), &HashMap::new(), label, title);
+        let second = layout(&g, &layers, &HashSet::new(), &HashMap::new(), label, title);
         assert_eq!(first, second);
     }
 
@@ -1008,6 +1115,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             label,
+            title,
         );
         let children = layout.children_of.get(&NodeId::from("ns")).unwrap();
         assert_eq!(children, &vec![NodeId::from("a"), NodeId::from("b")]);
@@ -1029,7 +1137,7 @@ mod tests {
         };
         // Both in the same (only) layer -- name must decide the order.
         let layers = vec![vec![NodeId::from("zeta"), NodeId::from("alpha")]];
-        let layout = layout(&g, &layers, &HashSet::new(), &HashMap::new(), label);
+        let layout = layout(&g, &layers, &HashSet::new(), &HashMap::new(), label, title);
         let children = layout.children_of.get(&ns_id).unwrap();
         assert_eq!(children, &vec![NodeId::from("alpha"), NodeId::from("zeta")]);
     }
@@ -1043,6 +1151,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             label,
+            title,
         );
         // `c` is layer 0, `ns`'s minimum descendant layer is `a`'s (layer 0
         // too) -- tie, so name decides: "C" < "Ns"? Compare by node id
@@ -1083,7 +1192,7 @@ mod tests {
             nodes,
             edges: vec![],
         };
-        let layout = layout(&g, &[], &HashSet::new(), &HashMap::new(), label);
+        let layout = layout(&g, &[], &HashSet::new(), &HashMap::new(), label, title);
         let mut ys: Vec<usize> = child_ids
             .iter()
             .map(|c| layout.rows.get(&NodeId::from(c.as_str())).unwrap().y)
@@ -1103,7 +1212,7 @@ mod tests {
             nodes: HashMap::new(),
             edges: vec![],
         };
-        let layout = layout(&g, &[], &HashSet::new(), &HashMap::new(), label);
+        let layout = layout(&g, &[], &HashSet::new(), &HashMap::new(), label, title);
         assert!(layout.rows.is_empty());
         assert!(layout.boxes.is_empty());
         assert_eq!(layout.width, 0);
@@ -1119,6 +1228,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             label,
+            title,
         );
         let (layers, rows) = focus_grid(&layout);
         assert_eq!(layers.len(), rows.len());
@@ -1164,7 +1274,7 @@ mod tests {
             edges: vec![],
         };
 
-        let layout = layout(&g, &[], &HashSet::new(), &HashMap::new(), label);
+        let layout = layout(&g, &[], &HashSet::new(), &HashMap::new(), label, title);
 
         assert!(
             !layout.rows.contains_key(&orphan_id),
@@ -1201,7 +1311,7 @@ mod tests {
             edges: vec![],
         };
         let collapsed = HashSet::from([ns_id.clone()]);
-        let layout = layout(&g, &[], &collapsed, &HashMap::new(), label);
+        let layout = layout(&g, &[], &collapsed, &HashMap::new(), label, title);
         assert!(layout.rows.contains_key(&ns_id));
     }
 
@@ -1283,6 +1393,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             label,
+            title,
         );
 
         assert!(
@@ -1339,6 +1450,39 @@ mod tests {
     /// childless, file-less namespaces sitting between real rows.
     #[test]
     fn every_row_is_reachable_and_focusable_via_hjkl() {
+        assert_hjkl_connectivity_holds(label, title);
+    }
+
+    /// The same connectivity property, but with a short/truncating
+    /// label+title pair standing in for the TUI's condensed render mode
+    /// (issue #24): narrower boxes and rows change [`shelf_pack`]'s
+    /// wrapping and [`focus_grid`]'s y-grouping outright (a box that used
+    /// to force its own shelf row might now sit alongside a neighbor), so
+    /// connectivity has to be re-proven under condensed geometry rather
+    /// than merely assumed to carry over from the full-label case above.
+    #[test]
+    fn every_row_is_reachable_and_focusable_via_hjkl_when_condensed() {
+        fn short_label(id: &NodeId) -> String {
+            let full = format!("* {id}");
+            full.chars().take(3).collect()
+        }
+        fn short_title(id: &NodeId) -> String {
+            id.to_string().chars().take(2).collect()
+        }
+        assert_hjkl_connectivity_holds(short_label, short_title);
+    }
+
+    /// Shared body for [`every_row_is_reachable_and_focusable_via_hjkl`]
+    /// and its condensed-geometry twin: build each connectivity fixture,
+    /// lay it out with the given `label_fn`/`title_fn`, and BFS every row
+    /// via [`move_focus`] from every possible starting row, asserting it
+    /// reaches every other row -- and that every row it reaches (indeed,
+    /// every row `layout` emitted at all) is one `Msg::FocusSet` would
+    /// actually accept (see [`focus_set_would_accept`]).
+    fn assert_hjkl_connectivity_holds(
+        label_fn: impl Fn(&NodeId) -> String,
+        title_fn: impl Fn(&NodeId) -> String,
+    ) {
         use crate::core::focus::{move_focus, Direction};
 
         let fixtures: Vec<ProjectGraph> = vec![
@@ -1350,7 +1494,7 @@ mod tests {
 
         for g in fixtures {
             let collapsed = HashSet::new();
-            let layout = layout(&g, &[], &collapsed, &HashMap::new(), label);
+            let layout = layout(&g, &[], &collapsed, &HashMap::new(), &label_fn, &title_fn);
             let (layers, rows) = focus_grid(&layout);
             let all_ids: HashSet<NodeId> = layout.rows.keys().cloned().collect();
             assert!(!all_ids.is_empty(), "fixture must have at least one row");
