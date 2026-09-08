@@ -1751,11 +1751,11 @@ fn draw_legend(
                             .to_string()
                     }
                     ViewMode::Canvas => {
-                        "` rail  h/j/k/l move  zc/zo fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
+                        "` rail  h/j/k/l move  zc/zo fold/unfold  zM/zR fold/unfold all  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  q quit"
                             .to_string()
                     }
                     ViewMode::Plane => {
-                        "` canvas  h/j/k/l move  zc/zo fold/unfold  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  zf fns  q quit"
+                        "` canvas  h/j/k/l move  zc/zo fold/unfold  zM/zR fold/unfold all  gd/gr follow deps  Enter open  d diff  t tests  v review  c comment  gt test  Ctrl-e edit  zf fns  q quit"
                             .to_string()
                     }
                 };
@@ -2824,6 +2824,19 @@ mod tests {
         }
         assert!(text.contains('`'), "expected the view-toggle hint");
         assert!(text.contains("zc/zo"), "expected the fold-chord hint");
+        assert!(text.contains("zM/zR"), "expected the fold-all-chord hint");
+    }
+
+    #[test]
+    fn plane_legend_advertises_the_fold_all_chord() {
+        let app = app_for_plane(diamond_graph_fixture(), "child");
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test backend");
+        terminal
+            .draw(|frame| draw_legend(frame, frame.area(), &app, None, 0, ViewMode::Plane))
+            .expect("draw");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("zc/zo"), "expected the fold-chord hint");
+        assert!(text.contains("zM/zR"), "expected the fold-all-chord hint");
     }
 
     #[test]

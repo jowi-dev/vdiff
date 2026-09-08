@@ -61,7 +61,8 @@ including the embedded Neovim, on the same `--no-nvim` opt-out -- but its
 graph screen has three interchangeable views, cycled with backtick
 (`` ` ``) in `plane -> canvas -> rail -> plane` order -- all three share the
 same fold-by-namespace "zoom out" mechanic (`h`/`l` in rail mode, `zc`/`zo`
-in canvas/plane mode) and every other binding (`gd`/`gr`, `gt`, `t`, `v`,
+in canvas/plane mode, plus `zM`/`zR` in canvas/plane mode to fold/unfold
+every namespace at once) and every other binding (`gd`/`gr`, `gt`, `t`, `v`,
 `c`, `Enter`, `d`, `q`, `Esc`):
 
 - **Plane** (the default) -- a true 2D nested layout: expanded namespaces
@@ -119,6 +120,7 @@ zoom is a 2D-canvas-only concept):
 | `` ` ``  | Cycle graph view: plane -> canvas -> rail -> plane               |
 | `h` `j` `k` `l` | Move focus spatially (plane/canvas) or fold/step rows (rail) |
 | `zc` `zo`| Collapse/expand the focused namespace (plane/canvas only)       |
+| `zM` `zR`| Fold/unfold all namespaces (plane/canvas only)                   |
 | `zf`     | Drill the focused changed module into its changed functions (plane view only; static calls only) |
 | `h` `l`  | Collapse/expand the focused row's namespace (rail only)         |
 
