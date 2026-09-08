@@ -432,13 +432,14 @@ fn load_comments(git_dir: &Path, graph: &ProjectGraph) -> Comments {
 /// than the already-open [`Git2Repo`] from `run`, which doesn't expose its
 /// inner `git2::Repository`) and derive the `repo`/`branch` display pair
 /// shared by every headless comments command (`--export-comments`,
-/// `--comments-status`): the repo's actual git directory (see
-/// [`vdiff::pipeline::repo::GitRepo::git_dir`]'s doc for why this can't be
-/// `<worktree>/.git` joined by hand) drives current branch name via
-/// `HEAD`'s shorthand (`"HEAD"` for a detached head), and the workdir's
+/// `--comments-status`): the branch name comes from `HEAD`'s shorthand
+/// (`"HEAD"` for a detached head), and the workdir's
 /// last path component names the repo, falling back to `"(bare
 /// repository)"` when there's no workdir at all. Returns the opened
-/// [`git2::Repository`] alongside so callers can also get at `.path()` for
+/// [`git2::Repository`] alongside so callers can also get at `.path()` --
+/// the repo's actual git directory (see
+/// [`vdiff::pipeline::repo::GitRepo::git_dir`]'s doc for why this can't be
+/// `<worktree>/.git` joined by hand) -- for
 /// [`vdiff::review::store::load`].
 fn discover_repo_and_branch(
     repo_path: &Path,
