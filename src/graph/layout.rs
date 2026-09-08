@@ -20,7 +20,9 @@ use std::collections::HashMap;
 use crate::graph::labels::abbreviated_label;
 use crate::graph::layers::assign_layers;
 use crate::graph::model::{DepEdge, NodeId, ProjectGraph};
-use crate::graph::test_modules::TestStrip;
+use crate::graph::test_modules::{
+    group_matched_test_modules, hide_test_modules, test_strips, TestStrip,
+};
 
 /// Floor on a node's box width -- also the width used for a short label
 /// (see [`node_size`]).
@@ -190,6 +192,26 @@ pub fn layout_with_test_strips(
     test_strips: &HashMap<NodeId, TestStrip>,
 ) -> LayoutResult {
     layout_from_layers(graph, assign_layers(graph), test_strips)
+}
+
+/// Lay out `graph` as it's actually drawn under `show_tests` -- the full
+/// pipeline every fresh layout pass needs, in one place so no caller can
+/// forget half of it: prune the graph the same way
+/// [`crate::core::app::App::visible_graph`] does (all test modules hidden
+/// when off; only *matched* ones grouped away when on), and, when tests are
+/// shown, size each tested node's box for its attached strip via
+/// [`layout_with_test_strips`] over [`test_strips`]. Passing a plain
+/// [`layout`] over the pruned graph instead (the pre-GH-26 shape) left every
+/// combined box `LEAF_H` tall while [`crate::ui::graph_view`] painted a
+/// strip onto it. Strips are computed from the *unpruned* `graph` -- same as
+/// `crate::ui::graph_view::GraphViewCache::rebuild` -- though today
+/// [`test_strips`]'s keys are non-test nodes, which both prunes keep.
+pub fn layout_as_drawn(graph: &ProjectGraph, show_tests: bool) -> LayoutResult {
+    if show_tests {
+        layout_with_test_strips(&group_matched_test_modules(graph), &test_strips(graph))
+    } else {
+        layout(&hide_test_modules(graph).0)
+    }
 }
 
 /// [`layout_with_test_strips`], but placing `layers` as given instead of
@@ -532,6 +554,64 @@ mod tests {
         let precomputed = layout_from_layers(&graph, assign_layers(&graph), &HashMap::new());
 
         assert_eq!(derived, precomputed);
+    }
+
+    #[test]
+    fn layout_as_drawn_with_tests_shown_sizes_the_tested_box_for_its_strip() {
+        // `Lead`/`LeadTest` share the top-level root `elixir:App`, so the
+        // test module is *matched*: with tests shown it's pruned as a
+        // standalone node and drawn as a strip on `Lead`'s box instead,
+        // which must therefore be sized `LEAF_H + TEST_STRIP_H` -- the
+        // GH-26 bug was the initial layout sizing it plain `LEAF_H`.
+        let graph = graph_from(
+            vec![
+                leaf("elixir:App.Lead", "Lead", Some("elixir:App")),
+                leaf("elixir:App.LeadTest", "LeadTest", Some("elixir:App")),
+            ],
+            vec!["elixir:App.Lead", "elixir:App.LeadTest"],
+        );
+
+        let result = layout_as_drawn(&graph, true);
+
+        assert!(!result
+            .rects
+            .contains_key(&NodeId::from("elixir:App.LeadTest")));
+        let lead = result.rects[&NodeId::from("elixir:App.Lead")];
+        assert_eq!(lead.size.h, LEAF_H + TEST_STRIP_H);
+    }
+
+    #[test]
+    fn layout_as_drawn_with_tests_shown_keeps_an_unmatched_test_standalone() {
+        // No `Orphan` sibling exists, so `OrphanTest` stays its own plain
+        // `LEAF_H` box -- no strip, no pruning.
+        let graph = graph_from(
+            vec![leaf("elixir:App.OrphanTest", "OrphanTest", None)],
+            vec!["elixir:App.OrphanTest"],
+        );
+
+        let result = layout_as_drawn(&graph, true);
+
+        let orphan = result.rects[&NodeId::from("elixir:App.OrphanTest")];
+        assert_eq!(orphan.size.h, LEAF_H);
+    }
+
+    #[test]
+    fn layout_as_drawn_with_tests_hidden_prunes_tests_and_sizes_plain_boxes() {
+        let graph = graph_from(
+            vec![
+                leaf("elixir:App.Lead", "Lead", Some("elixir:App")),
+                leaf("elixir:App.LeadTest", "LeadTest", Some("elixir:App")),
+            ],
+            vec!["elixir:App.Lead", "elixir:App.LeadTest"],
+        );
+
+        let result = layout_as_drawn(&graph, false);
+
+        assert!(!result
+            .rects
+            .contains_key(&NodeId::from("elixir:App.LeadTest")));
+        let lead = result.rects[&NodeId::from("elixir:App.Lead")];
+        assert_eq!(lead.size.h, LEAF_H);
     }
 
     #[test]
