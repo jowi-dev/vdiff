@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::graph::builder::{self, rust_crate_root_dir, FileInput, Lang};
-use crate::graph::model::{FileRef, GitStatus, ProjectGraph};
+use crate::graph::model::{DiffTotals, FileRef, GitStatus, ProjectGraph};
 use crate::pipeline::changed_files::ChangeSet;
 use crate::pipeline::crate_names::crate_name_for;
 use crate::pipeline::error::Result;
@@ -82,7 +82,7 @@ pub fn build_graph(repo: &dyn GitRepo, opts: &PipelineOptions) -> Result<Project
             path: path.clone(),
             base_blob: repo.base_blob_oid(&base_oid, &path)?,
             head_blob: repo.head_blob_oid(&path)?,
-            stats: None,
+            stats: changes.stats_for(&path),
         };
 
         let defs = match lang {
@@ -104,7 +104,28 @@ pub fn build_graph(repo: &dyn GitRepo, opts: &PipelineOptions) -> Result<Project
         });
     }
 
-    Ok(builder::build(files, &changes, &crate_names))
+    let mut graph = builder::build(files, &changes, &crate_names);
+    graph.totals = totals_from_deltas(&deltas);
+    Ok(graph)
+}
+
+/// Sum every delta's stats into one [`DiffTotals`] -- deltas are per-path
+/// (never repeated), so no dedupe is needed here, unlike
+/// [`ProjectGraph::subtree_totals`] which has to dedupe by path across
+/// several nodes backed by the same file.
+fn totals_from_deltas(deltas: &[crate::pipeline::repo::FileDelta]) -> DiffTotals {
+    let mut totals = DiffTotals {
+        files: deltas.len(),
+        ..Default::default()
+    };
+    for delta in deltas {
+        totals.added += delta.stats.added;
+        totals.deleted += delta.stats.deleted;
+        if delta.stats.binary {
+            totals.binary += 1;
+        }
+    }
+    totals
 }
 
 /// Deleted files are read from the diff base; everything else from head.
@@ -134,7 +155,7 @@ fn detect_lang(path: &Path) -> Lang {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::model::{DepKind, FileStats, NodeId};
+    use crate::graph::model::{DepKind, DiffTotals, FileStats, NodeId};
     use crate::pipeline::repo::{Change, FakeRepo, FileDelta};
     use std::collections::HashMap;
 
@@ -176,22 +197,38 @@ mod tests {
                 FileDelta {
                     path: PathBuf::from("lib/my_app/accounts.ex"),
                     change: Change::Modified,
-                    stats: FileStats::default(),
+                    stats: FileStats {
+                        added: 1,
+                        deleted: 0,
+                        binary: false,
+                    },
                 },
                 FileDelta {
                     path: PathBuf::from("lib/my_app/repo.ex"),
                     change: Change::Added,
-                    stats: FileStats::default(),
+                    stats: FileStats {
+                        added: 2,
+                        deleted: 0,
+                        binary: false,
+                    },
                 },
                 FileDelta {
                     path: PathBuf::from("lib/my_app/mailer.ex"),
                     change: Change::Deleted,
-                    stats: FileStats::default(),
+                    stats: FileStats {
+                        added: 0,
+                        deleted: 2,
+                        binary: false,
+                    },
                 },
                 FileDelta {
                     path: PathBuf::from("README.md"),
                     change: Change::Modified,
-                    stats: FileStats::default(),
+                    stats: FileStats {
+                        added: 1,
+                        deleted: 1,
+                        binary: false,
+                    },
                 },
             ],
             base_files,
@@ -258,6 +295,50 @@ mod tests {
         let readme = graph.node(&NodeId::from("file:README.md")).unwrap();
         assert_eq!(readme.status, GitStatus::Modified);
         assert!(graph.roots.contains(&NodeId::from("file:README.md")));
+    }
+
+    #[test]
+    fn changed_files_stats_land_on_their_file_refs_and_unchanged_files_have_none() {
+        let repo = elixir_scenario();
+        let graph = build_graph(&repo, &PipelineOptions::default()).unwrap();
+
+        let accounts = graph.node(&NodeId::from("elixir:MyApp.Accounts")).unwrap();
+        let accounts_file = accounts
+            .files
+            .iter()
+            .find(|f| f.path == Path::new("lib/my_app/accounts.ex"))
+            .unwrap();
+        assert_eq!(
+            accounts_file.stats,
+            Some(FileStats {
+                added: 1,
+                deleted: 0,
+                binary: false,
+            })
+        );
+
+        let unchanged = graph.node(&NodeId::from("elixir:MyApp.Unchanged")).unwrap();
+        let unchanged_file = &unchanged.files[0];
+        assert_eq!(
+            unchanged_file.stats, None,
+            "unchanged tracked file carries no stats"
+        );
+    }
+
+    #[test]
+    fn graph_totals_sum_every_deltas_stats() {
+        let repo = elixir_scenario();
+        let graph = build_graph(&repo, &PipelineOptions::default()).unwrap();
+
+        assert_eq!(
+            graph.totals,
+            DiffTotals {
+                files: 4,
+                added: 4,
+                deleted: 3,
+                binary: 0,
+            }
+        );
     }
 
     #[test]
