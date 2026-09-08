@@ -678,12 +678,7 @@ fn should_fold_by_default(visible_node_count: usize, edge_count: usize) -> bool 
 fn default_fold_seed(
     graph: &crate::graph::model::ProjectGraph,
 ) -> std::collections::HashSet<crate::graph::model::NodeId> {
-    graph
-        .roots
-        .iter()
-        .filter(|id| graph.node(id).is_some_and(|node| !node.children.is_empty()))
-        .cloned()
-        .collect()
+    crate::core::app::fold_all_seed(graph)
 }
 
 /// The one-time notice [`run`] seeds [`TuiState::notice`] with when
