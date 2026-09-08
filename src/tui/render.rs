@@ -1795,7 +1795,15 @@ fn draw_legend(
     let (reviewed, total) = app.review_progress();
     let status = format!("{reviewed}/{total} changed modules reviewed");
     let block = Block::default().borders(Borders::ALL).title(" vdiff ");
-    let text = vec![Line::from(hint), Line::from(status)];
+    let mut text = vec![Line::from(hint), Line::from(status)];
+    // `app.graph` (not `app.visible_graph()`) is deliberate -- `totals`
+    // describes the whole diff regardless of fold/focus state (see
+    // `ProjectGraph::totals`'s doc), and a no-change diff would otherwise
+    // print the useless `+0 / -0 across 0 files`, so the line is omitted
+    // entirely rather than shown empty.
+    if app.graph.totals.files > 0 {
+        text.push(Line::from(app.graph.totals.summary_line()));
+    }
     frame.render_widget(
         Paragraph::new(text).block(block).wrap(Wrap { trim: true }),
         area,
@@ -1852,7 +1860,7 @@ mod tests {
     use super::*;
     use crate::core::app::EdgePicker;
     use crate::graph::layout::layout;
-    use crate::graph::model::{DepEdge, DepKind, FileRef, ModuleNode, ProjectGraph};
+    use crate::graph::model::{DepEdge, DepKind, DiffTotals, FileRef, ModuleNode, ProjectGraph};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::collections::{HashMap, HashSet};
@@ -2209,6 +2217,43 @@ mod tests {
         assert!(text.contains("reviewed"));
         assert!(text.contains("q quit"));
         assert!(text.contains("h/l fold/unfold"));
+    }
+
+    /// [`App::graph`]'s [`crate::graph::model::ProjectGraph::totals`]
+    /// describes the whole diff regardless of focus/fold state (see that
+    /// field's doc), so the legend's third line reads it straight off
+    /// `app.graph`, not `app.visible_graph()`.
+    #[test]
+    fn legend_shows_overall_diff_totals_when_the_graph_has_changes() {
+        let mut app = app_at("leaf");
+        app.graph.totals = DiffTotals {
+            files: 2,
+            added: 12,
+            deleted: 3,
+            binary: 0,
+        };
+        // Wide enough that the hint line doesn't wrap onto the legend's
+        // free third interior line -- see the plane-legend tests' own
+        // width-220 precedent for the same reason.
+        let text = render_to_string_at(&app, 220, 24, 0);
+        assert!(
+            text.contains("+12 / -3 across 2 files"),
+            "expected the overall diff summary line, got: {text}"
+        );
+    }
+
+    /// A no-op diff (nothing changed, e.g. base == head) would otherwise
+    /// print the useless `+0 / -0 across 0 files` -- the legend omits the
+    /// line entirely in that case rather than showing it.
+    #[test]
+    fn legend_omits_diff_totals_line_when_the_graph_has_no_changes() {
+        let app = app_at("leaf");
+        assert_eq!(app.graph.totals, DiffTotals::default());
+        let text = render_to_string(&app);
+        assert!(
+            !text.contains("across 0 files"),
+            "a no-change diff should not render a totals line, got: {text}"
+        );
     }
 
     #[test]
