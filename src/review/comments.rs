@@ -136,9 +136,11 @@ fn civil_from_unix_seconds(total_secs: u64) -> (i64, u32, u32, u32, u32, u32) {
 /// load from disk, which is always saved sorted) as the markdown
 /// `--export-comments` prints: a header naming `repo`/`branch`, then one
 /// `### path:start[-end]` section per comment (an `(node: ...)` suffix when
-/// present), the comment's text below it. Empty `comments` still gets the
-/// header, followed by a "No comments." line, and exit-0 is the CLI's job
-/// (this function has no exit-code concept).
+/// present, followed by an `(addressed <timestamp>)` suffix when
+/// [`Comment::resolved_at`] is set -- see [`set_resolved`]'s doc for how
+/// vdiff itself sets it), the comment's text below it. Empty `comments`
+/// still gets the header, followed by a "No comments." line, and exit-0 is
+/// the CLI's job (this function has no exit-code concept).
 pub fn render_markdown(comments: &[Comment], repo: &str, branch: &str) -> String {
     let mut out = format!("# vdiff review comments — {repo} @ {branch}\n\n");
     if comments.is_empty() {
@@ -156,9 +158,14 @@ pub fn render_markdown(comments: &[Comment], repo: &str, branch: &str) -> String
             .as_ref()
             .map(|node| format!(" (node: {node})"))
             .unwrap_or_default();
+        let addressed_suffix = comment
+            .resolved_at
+            .as_ref()
+            .map(|ts| format!(" (addressed {ts})"))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "### {}:{}{}\n\n{}\n\n",
-            comment.path, range, node_suffix, comment.text
+            "### {}:{}{}{}\n\n{}\n\n",
+            comment.path, range, node_suffix, addressed_suffix, comment.text
         ));
     }
     out
@@ -448,6 +455,30 @@ mod tests {
         c.node = Some("rust:crate".to_string());
         let out = render_markdown(&[c], "vdiff", "main");
         assert!(out.contains("### src/lib.rs:1 (node: rust:crate)\n"));
+    }
+
+    #[test]
+    fn render_markdown_marks_resolved_comment_addressed_exactly_once() {
+        let mut resolved = comment("src/lib.rs", 1, 1);
+        resolved.resolved_at = Some("2026-08-19T00:00:00Z".to_string());
+        let unresolved = comment("src/lib.rs", 5, 5);
+        let out = render_markdown(&[resolved, unresolved], "vdiff", "main");
+        assert_eq!(
+            out.matches("(addressed 2026-08-19T00:00:00Z)").count(),
+            1,
+            "expected the addressed marker exactly once, got: {out}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_addressed_marker_follows_node_suffix() {
+        let mut c = comment("src/lib.rs", 1, 1);
+        c.node = Some("rust:crate".to_string());
+        c.resolved_at = Some("2026-08-19T00:00:00Z".to_string());
+        let out = render_markdown(&[c], "vdiff", "main");
+        assert!(
+            out.contains("### src/lib.rs:1 (node: rust:crate) (addressed 2026-08-19T00:00:00Z)\n")
+        );
     }
 
     #[test]
