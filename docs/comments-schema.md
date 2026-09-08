@@ -48,15 +48,16 @@ The file is a JSON array of comment objects, pretty-printed, sorted by
 
 ### Fields
 
-| Field        | Type   | Notes                                                                                          |
-|--------------|--------|--------------------------------------------------------------------------------------------------|
-| `id`         | string | Short, stable identifier: `"c<n>"`, one more than the highest existing `n`. Lets a comment be referenced (e.g. manual deletion by hand-editing the JSON) without relying on array position. |
-| `path`       | string | Repo-relative path the comment is anchored to.                                                  |
-| `start_line` | number | 1-based, inclusive: first line of the commented range.                                          |
-| `end_line`   | number | 1-based, inclusive: last line of the commented range. Equal to `start_line` for a single line.   |
-| `text`       | string | The comment body. Multi-line text is valid even though a given compose UI may only produce single-line text. |
-| `node`       | string | *Optional* — omitted entirely (not `null`) when absent. Set only for a node-level ("architecture") comment anchored to a whole graph node rather than a specific line range. |
-| `created_at` | string | ISO-8601 UTC timestamp, set once at creation, never updated.                                     |
+| Field         | Type   | Notes                                                                                          |
+|---------------|--------|--------------------------------------------------------------------------------------------------|
+| `id`          | string | Short, stable identifier: `"c<n>"`, one more than the highest existing `n`. Lets a comment be referenced (e.g. manual deletion by hand-editing the JSON) without relying on array position. |
+| `path`        | string | Repo-relative path the comment is anchored to.                                                  |
+| `start_line`  | number | 1-based, inclusive: first line of the commented range.                                          |
+| `end_line`    | number | 1-based, inclusive: last line of the commented range. Equal to `start_line` for a single line.   |
+| `text`        | string | The comment body. Multi-line text is valid even though a given compose UI may only produce single-line text. |
+| `node`        | string | *Optional* — omitted entirely (not `null`) when absent. Set only for a node-level ("architecture") comment anchored to a whole graph node rather than a specific line range. |
+| `created_at`  | string | ISO-8601 UTC timestamp, set once at creation, never updated.                                     |
+| `resolved_at` | string | *Optional* — omitted entirely (not `null`) when the comment is unaddressed. ISO-8601 UTC timestamp set when the comment is marked addressed; cleared (field removed again) if it's un-marked. |
 
 Ordering and pretty-printing are part of the contract, not incidental: the
 store is always re-sorted and re-serialized in `(path, start_line)` order on
@@ -68,9 +69,20 @@ it) stays readable instead of reordering itself on every write.
 - **`vdiff.nvim`** owns *writing*: `:VdiffComment`, its compose UI, and the
   `require('vdiff').comment_range(start_line, end_line, {node = ...})` API
   vdiff's embedded Neovim session calls for graph-node ("architecture")
-  comments. It also owns rendering comment extmarks in the buffer.
-- **`vdiff`** owns *reading*: `vdiff --export-comments` renders the store as
-  markdown; nothing in vdiff itself writes to this file.
+  comments. It also owns comment creation, text edits, and deletion, plus
+  rendering comment extmarks in the buffer.
+- **`vdiff`** owns *reading*, plus exactly one narrow write: `resolved_at`
+  toggling. `vdiff --export-comments` renders the store as markdown, and the
+  graph pane's `m` key toggles a comment's (or a node's comments')
+  `resolved_at` between `Some(now)` and `None` (issue #14) — the only field
+  vdiff itself ever mutates. It never touches `text`, never creates or
+  deletes a comment.
+
+**Lockstep requirement:** because both projects write to the same file,
+`vdiff.nvim` must round-trip `resolved_at` (and any other field it doesn't
+recognize) unchanged whenever it re-saves a comment it didn't itself
+resolve — losing it on a save from the nvim side would silently un-resolve
+a comment vdiff had just marked addressed.
 
 ## Versioning
 

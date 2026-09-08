@@ -41,6 +41,16 @@ pub struct Comment {
     /// rather than a visual selection inside nvim.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub node: Option<String>,
+    /// ISO-8601 UTC timestamp (see [`format_iso8601`]) at which this
+    /// comment was marked addressed, or `None` if it's still unaddressed.
+    /// The additive v1 lifecycle field from issue #14: unlike every other
+    /// field on [`Comment`], `vdiff` itself sets and clears this one (from
+    /// the graph pane's resolve toggle -- see [`set_resolved`]) rather than
+    /// only reading it; `vdiff.nvim` still owns every other write (text,
+    /// creation, deletion) and must round-trip this field untouched when it
+    /// re-saves a comment it didn't resolve.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub resolved_at: Option<String>,
     /// ISO-8601 UTC timestamp (see [`format_iso8601`]), set once at
     /// creation.
     pub created_at: String,
@@ -154,6 +164,37 @@ pub fn render_markdown(comments: &[Comment], repo: &str, branch: &str) -> String
     out
 }
 
+/// The number of `comments` still unaddressed (`resolved_at.is_none()`) --
+/// what the graph's comment badge counts (issue #14) so a node with every
+/// comment already resolved shows no badge at all rather than a stale
+/// total.
+pub fn unresolved_count(comments: &[Comment]) -> usize {
+    comments.iter().filter(|c| c.resolved_at.is_none()).count()
+}
+
+/// Set or clear `resolved_at` on every comment in `comments` whose `id` is
+/// in `ids` -- `resolved_at` some timestamp to mark addressed, `None` to
+/// unmark. This is the *only* mutation vdiff itself ever performs on the
+/// comment store (see [`Comment::resolved_at`]'s doc): a narrow writer,
+/// resolution only, never touching text/creation/deletion, which stay
+/// `vdiff.nvim`'s alone. Returns whether anything actually changed --
+/// `false` if every matched comment was already in the requested state (a
+/// no-op toggle shouldn't, say, trigger a save), so callers can skip
+/// writing the store back to disk when there's nothing new to persist.
+pub fn set_resolved(comments: &mut [Comment], ids: &[String], resolved_at: Option<&str>) -> bool {
+    let mut changed = false;
+    for comment in comments.iter_mut() {
+        if ids.contains(&comment.id) {
+            let new_value = resolved_at.map(|ts| ts.to_string());
+            if comment.resolved_at != new_value {
+                comment.resolved_at = new_value;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// Attach every comment in `comments` to the node(s) it's about, same
 /// spirit as [`crate::review::findings::map_findings`]: a comment with
 /// [`Comment::node`] set attaches directly to that node (an unknown id --
@@ -211,6 +252,7 @@ mod tests {
             end_line: end,
             text: "some text".to_string(),
             node: None,
+            resolved_at: None,
             created_at: "2026-08-18T00:00:00Z".to_string(),
         }
     }
@@ -232,6 +274,89 @@ mod tests {
             !json.contains("\"node\""),
             "node key should be omitted when None: {json}"
         );
+    }
+
+    #[test]
+    fn serde_parses_absent_resolved_at_as_none() {
+        let json = r#"{
+            "id": "c1",
+            "path": "src/lib.rs",
+            "start_line": 1,
+            "end_line": 1,
+            "text": "some text",
+            "created_at": "2026-08-18T00:00:00Z"
+        }"#;
+        let parsed: Comment = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(parsed.resolved_at, None);
+        let reserialized = serde_json::to_string(&parsed).expect("serialize");
+        assert!(
+            !reserialized.contains("resolved_at"),
+            "resolved_at key should be omitted when None: {reserialized}"
+        );
+    }
+
+    #[test]
+    fn serde_round_trips_present_resolved_at() {
+        let mut c = comment("src/lib.rs", 1, 1);
+        c.resolved_at = Some("2026-08-19T00:00:00Z".to_string());
+        let json = serde_json::to_string(&c).expect("serialize");
+        assert!(json.contains("resolved_at"));
+        let back: Comment = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(c, back);
+    }
+
+    #[test]
+    fn unresolved_count_counts_only_none() {
+        let mut resolved = comment("a.rs", 1, 1);
+        resolved.resolved_at = Some("2026-08-19T00:00:00Z".to_string());
+        let unresolved = comment("b.rs", 1, 1);
+        let comments = vec![resolved, unresolved];
+        assert_eq!(unresolved_count(&comments), 1);
+    }
+
+    #[test]
+    fn set_resolved_marks_matching_ids_resolved() {
+        let mut a = comment("a.rs", 1, 1);
+        a.id = "c1".to_string();
+        let mut b = comment("b.rs", 1, 1);
+        b.id = "c2".to_string();
+        let mut comments = vec![a, b];
+        let changed = set_resolved(
+            &mut comments,
+            &["c1".to_string()],
+            Some("2026-08-19T00:00:00Z"),
+        );
+        assert!(changed);
+        assert_eq!(
+            comments[0].resolved_at,
+            Some("2026-08-19T00:00:00Z".to_string())
+        );
+        assert_eq!(comments[1].resolved_at, None);
+    }
+
+    #[test]
+    fn set_resolved_can_clear_back_to_unresolved() {
+        let mut a = comment("a.rs", 1, 1);
+        a.id = "c1".to_string();
+        a.resolved_at = Some("2026-08-19T00:00:00Z".to_string());
+        let mut comments = vec![a];
+        let changed = set_resolved(&mut comments, &["c1".to_string()], None);
+        assert!(changed);
+        assert_eq!(comments[0].resolved_at, None);
+    }
+
+    #[test]
+    fn set_resolved_returns_false_when_already_in_requested_state() {
+        let mut a = comment("a.rs", 1, 1);
+        a.id = "c1".to_string();
+        a.resolved_at = Some("2026-08-19T00:00:00Z".to_string());
+        let mut comments = vec![a];
+        let changed = set_resolved(
+            &mut comments,
+            &["c1".to_string()],
+            Some("2026-08-19T00:00:00Z"),
+        );
+        assert!(!changed);
     }
 
     #[test]
