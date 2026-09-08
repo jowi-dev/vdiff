@@ -46,6 +46,7 @@ use git2::{
     Delta, DiffFindOptions, DiffOptions, ObjectType, Oid, Repository, TreeWalkMode, TreeWalkResult,
 };
 
+use crate::graph::model::FileStats;
 use crate::pipeline::error::{PipelineError, Result};
 use crate::pipeline::repo::{Change, FileDelta, GitRepo};
 
@@ -202,6 +203,7 @@ impl GitRepo for Git2Repo {
                         deltas.push(FileDelta {
                             path,
                             change: Change::Added,
+                            stats: FileStats::default(),
                         });
                     }
                 }
@@ -210,6 +212,7 @@ impl GitRepo for Git2Repo {
                         deltas.push(FileDelta {
                             path,
                             change: Change::Deleted,
+                            stats: FileStats::default(),
                         });
                     }
                 }
@@ -218,6 +221,7 @@ impl GitRepo for Git2Repo {
                         deltas.push(FileDelta {
                             path,
                             change: Change::Renamed { from },
+                            stats: FileStats::default(),
                         });
                     }
                 }
@@ -229,6 +233,7 @@ impl GitRepo for Git2Repo {
                         deltas.push(FileDelta {
                             path,
                             change: Change::Modified,
+                            stats: FileStats::default(),
                         });
                     }
                 }

@@ -134,7 +134,7 @@ fn detect_lang(path: &Path) -> Lang {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::model::{DepKind, NodeId};
+    use crate::graph::model::{DepKind, FileStats, NodeId};
     use crate::pipeline::repo::{Change, FakeRepo, FileDelta};
     use std::collections::HashMap;
 
@@ -176,18 +176,22 @@ mod tests {
                 FileDelta {
                     path: PathBuf::from("lib/my_app/accounts.ex"),
                     change: Change::Modified,
+                    stats: FileStats::default(),
                 },
                 FileDelta {
                     path: PathBuf::from("lib/my_app/repo.ex"),
                     change: Change::Added,
+                    stats: FileStats::default(),
                 },
                 FileDelta {
                     path: PathBuf::from("lib/my_app/mailer.ex"),
                     change: Change::Deleted,
+                    stats: FileStats::default(),
                 },
                 FileDelta {
                     path: PathBuf::from("README.md"),
                     change: Change::Modified,
+                    stats: FileStats::default(),
                 },
             ],
             base_files,

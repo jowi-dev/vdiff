@@ -546,10 +546,7 @@ mod tests {
             deleted: 34,
             binary: 2,
         };
-        assert_eq!(
-            totals.summary_line(),
-            "+12 / -34 across 5 files (2 binary)"
-        );
+        assert_eq!(totals.summary_line(), "+12 / -34 across 5 files (2 binary)");
     }
 
     /// FileRef backing a node, with explicit stats -- unlike `leaf_node`'s
@@ -591,8 +588,7 @@ mod tests {
             deleted: 1,
             binary: false,
         });
-        let (parent_id, parent_node) =
-            namespace_root("ns", "Ns", &["ns.leaf_a", "ns.leaf_b"]);
+        let (parent_id, parent_node) = namespace_root("ns", "Ns", &["ns.leaf_a", "ns.leaf_b"]);
         let (leaf_a_id, leaf_a) =
             leaf_node_with_stats("ns.leaf_a", Some("ns"), "lib/shared.ex", stats);
         let (leaf_b_id, leaf_b) =

@@ -399,7 +399,7 @@ fn path_to_id(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::model::DepKind;
+    use crate::graph::model::{DepKind, FileStats};
     use crate::pipeline::extract::DepRef;
     use crate::pipeline::repo::{Change, FileDelta};
     use std::path::PathBuf;
@@ -649,6 +649,7 @@ mod tests {
         let deltas = vec![FileDelta {
             path: PathBuf::from("lib/my_app.ex"),
             change: Change::Modified,
+            stats: FileStats::default(),
         }];
         let graph = build(files, &changes(deltas), &HashMap::new());
 
@@ -723,10 +724,12 @@ mod tests {
             FileDelta {
                 path: PathBuf::from("Foo/src/lib.rs"),
                 change: Change::Modified,
+                stats: FileStats::default(),
             },
             FileDelta {
                 path: PathBuf::from("lib/foo.ex"),
                 change: Change::Added,
+                stats: FileStats::default(),
             },
         ];
         let graph = build(files, &changes(deltas), &HashMap::new());
@@ -767,14 +770,17 @@ mod tests {
             FileDelta {
                 path: PathBuf::from("crate_a/src/lib.rs"),
                 change: Change::Modified,
+                stats: FileStats::default(),
             },
             FileDelta {
                 path: PathBuf::from("crate_a/src/added.rs"),
                 change: Change::Added,
+                stats: FileStats::default(),
             },
             FileDelta {
                 path: PathBuf::from("crate_a/src/deleted.rs"),
                 change: Change::Deleted,
+                stats: FileStats::default(),
             },
         ];
         let graph = build(files, &changes(deltas), &HashMap::new());
@@ -822,10 +828,12 @@ mod tests {
             FileDelta {
                 path: PathBuf::from("crate_a/src/foo.rs"),
                 change: Change::Deleted,
+                stats: FileStats::default(),
             },
             FileDelta {
                 path: PathBuf::from("crate_a/src/foo/mod.rs"),
                 change: Change::Added,
+                stats: FileStats::default(),
             },
         ];
         let graph = build(files, &changes(deltas), &HashMap::new());

@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::graph::model::FileStats;
 use crate::pipeline::error::Result;
 
 /// How a file changed between the diff base and head.
@@ -28,6 +29,11 @@ pub struct FileDelta {
     /// The file's path at head (or, for a pure deletion, at base).
     pub path: PathBuf,
     pub change: Change,
+    /// Added/deleted line counts for this file. A delta is by definition
+    /// part of the change set, so this is never `None` (unlike
+    /// [`crate::graph::model::FileRef::stats`]) -- a pure rename with no
+    /// content change reports all-zero counts.
+    pub stats: FileStats,
 }
 
 /// Everything the pipeline needs from a git repository. Implemented for real
@@ -187,20 +193,37 @@ mod tests {
                 FileDelta {
                     path: PathBuf::from("src/added.rs"),
                     change: Change::Added,
+                    stats: FileStats {
+                        added: 3,
+                        deleted: 0,
+                        binary: false,
+                    },
                 },
                 FileDelta {
                     path: PathBuf::from("src/modified.rs"),
                     change: Change::Modified,
+                    stats: FileStats {
+                        added: 2,
+                        deleted: 1,
+                        binary: false,
+                    },
                 },
                 FileDelta {
                     path: PathBuf::from("src/deleted.rs"),
                     change: Change::Deleted,
+                    stats: FileStats {
+                        added: 0,
+                        deleted: 1,
+                        binary: false,
+                    },
                 },
                 FileDelta {
                     path: PathBuf::from("src/new_name.rs"),
                     change: Change::Renamed {
                         from: PathBuf::from("src/old_name.rs"),
                     },
+                    // A pure rename with no content change: zero counts.
+                    stats: FileStats::default(),
                 },
             ],
             base_files,
@@ -240,7 +263,39 @@ mod tests {
             change: Change::Renamed {
                 from: PathBuf::from("src/old_name.rs")
             },
+            stats: FileStats::default(),
         }));
+    }
+
+    #[test]
+    fn changed_files_round_trips_each_deltas_stats() {
+        let repo = scenario();
+        let deltas = repo.changed_files("deadbeef").unwrap();
+        let modified = deltas
+            .iter()
+            .find(|d| d.path == Path::new("src/modified.rs"))
+            .expect("modified delta present");
+        assert_eq!(
+            modified.stats,
+            FileStats {
+                added: 2,
+                deleted: 1,
+                binary: false,
+            }
+        );
+
+        let deleted = deltas
+            .iter()
+            .find(|d| d.path == Path::new("src/deleted.rs"))
+            .expect("deleted delta present");
+        assert_eq!(
+            deleted.stats,
+            FileStats {
+                added: 0,
+                deleted: 1,
+                binary: false,
+            }
+        );
     }
 
     #[test]

@@ -57,11 +57,13 @@ fn status_of(change: &Change) -> GitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::model::FileStats;
 
     fn delta(path: &str, change: Change) -> FileDelta {
         FileDelta {
             path: PathBuf::from(path),
             change,
+            stats: FileStats::default(),
         }
     }
 
