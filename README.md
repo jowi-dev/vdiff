@@ -90,6 +90,17 @@ embedded session (`ZZ`, `:q`) is not one of those cases: it returns you to
 the graph, and the next `Enter`/`d` spawns a fresh session (re-running any
 `--nvim-cmd` commands) rather than downgrading the rest of the run.
 
+Both frontends also show the size of the change before you dive into any
+file. The overall `+added / -deleted across K files` readout is always
+visible -- on the TUI's legend strip and the GUI's pinned hint row -- and
+the focused node's own rollup follows focus: the TUI's graph views carve a
+right-hand stats sidebar (with a per-file breakdown when a module or folded
+namespace is backed by several changed files), the GUI adds a line to the
+bottom-right focus chip. A rollup sums everything drawn under the focused
+node, counting a file shared by several modules only once; binary files are
+labeled `binary` rather than given fake line counts, and a pure rename
+shows as `+0 / -0` (the file still counts as changed).
+
 `--pr <url>` (reviewing a GitHub PR directly) is on the roadmap, not
 available yet.
 

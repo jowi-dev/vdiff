@@ -3830,7 +3830,7 @@ mod tests {
 
     #[test]
     fn focus_sidebar_shows_rollup_and_no_breakdown_for_a_single_file_node() {
-        let (graph, ns_id) = sidebar_graph_fixture();
+        let (graph, _ns_id) = sidebar_graph_fixture();
         let child_a = NodeId::from("ns::child_a");
         let sidebar = build_focus_sidebar(&graph, &child_a, 10);
         assert_eq!(sidebar.title, "child_a");
@@ -3840,7 +3840,6 @@ mod tests {
             "a single-file node has no per-file breakdown, got {:?}",
             sidebar.files
         );
-        let _ = ns_id;
     }
 
     #[test]
@@ -3915,10 +3914,9 @@ mod tests {
 
     #[test]
     fn plane_view_renders_the_focus_sidebar_when_wide_enough() {
-        let (graph, ns_id) = sidebar_graph_fixture();
+        let (graph, _ns_id) = sidebar_graph_fixture();
         let app = app_for_plane(graph, "ns::child_a");
         let text = render_plane_to_string(&app, 120, 24, 0, 0);
-        let _ = ns_id;
         assert!(
             text.contains("child_a"),
             "expected the focused node's name in the sidebar, got:\n{text}"
@@ -3931,7 +3929,7 @@ mod tests {
 
     #[test]
     fn plane_view_moving_focus_changes_the_sidebar_rollup() {
-        let (graph, ns_id) = sidebar_graph_fixture();
+        let (graph, _ns_id) = sidebar_graph_fixture();
         let app = app_for_plane(graph, "ns::child_a");
         let text_a = render_plane_to_string(&app, 120, 24, 0, 0);
         assert!(text_a.contains("+5 / -1 across 1 file"));
@@ -3950,7 +3948,6 @@ mod tests {
             text_ns.contains("binary)"),
             "expected the binary-file count, got:\n{text_ns}"
         );
-        let _ = ns_id;
     }
 
     #[test]
