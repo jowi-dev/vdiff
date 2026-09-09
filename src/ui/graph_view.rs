@@ -115,7 +115,7 @@ impl Transform {
 /// caller (`crate::ui::eframe_app::VdiffApp`) builds this once via
 /// [`GraphViewCache::rebuild`] at construction and again whenever it
 /// executes a `Cmd::Relayout`, and hands it to [`show`] by reference.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GraphViewCache {
     /// How many test modules [`hide_test_modules`] would prune -- the
     /// legend's "N test modules hidden/showing" hint (see
@@ -130,6 +130,13 @@ pub struct GraphViewCache {
     /// info moves from `changed_test_nodes`'s badge to this attached strip
     /// once tests are shown).
     pub strips: HashMap<NodeId, TestStrip>,
+    /// [`App::visible_graph`] -- the pruned graph the view is actually laid
+    /// out and drawn from. Cached here rather than recomputed by
+    /// [`paint_focus_status`] on every repaint for the same reason every
+    /// other field on this struct is cached (see the struct doc): it's a
+    /// full clone+prune of `app.graph`, and `show` runs at repaint
+    /// frequency, not input-event frequency.
+    pub visible_graph: ProjectGraph,
 }
 
 impl GraphViewCache {
@@ -148,6 +155,7 @@ impl GraphViewCache {
             hidden_test_count,
             changed_test_nodes,
             strips,
+            visible_graph: app.visible_graph(),
         }
     }
 }
@@ -234,7 +242,7 @@ pub fn show(
         response.rect,
         cache.hidden_test_count,
     );
-    paint_focus_status(&painter, app, response.rect);
+    paint_focus_status(&painter, app, response.rect, &cache.visible_graph);
 }
 
 /// Drag pans the view; scroll zooms around the pointer position.
@@ -809,16 +817,44 @@ fn paint_hint_row(
     );
 }
 
+/// Pure data for the focus chip's optional stats line (issue #25): the
+/// focused node's subtree rollup, [`crate::graph::model::DiffTotals::summary_line`]'s
+/// format, reusing [`ProjectGraph::subtree_totals`]'s dedupe-by-path walk so
+/// a folded namespace's line agrees with the sum of its changed descendants.
+/// `None` for an unchanged node (zero changed files in its subtree) or an
+/// unknown id, so [`paint_focus_status`] skips the line entirely rather than
+/// printing `+0 / -0 across 0 files`. `graph` must be the same pruned graph
+/// the view was laid out from ([`GraphViewCache::visible_graph`]), not the
+/// raw [`App::graph`], so the rollup matches what's actually drawn under
+/// `focus` -- mirrors `crate::tui::render::build_focus_sidebar`'s contract.
+fn focus_stats_line(graph: &ProjectGraph, focus: &NodeId) -> Option<String> {
+    let totals = graph.subtree_totals(focus);
+    if totals.files == 0 {
+        return None;
+    }
+    Some(totals.summary_line())
+}
+
 /// The focused-node status readout, anchored to the bottom-RIGHT corner of
 /// the screen (screen space, like [`paint_legend`] -- stays put regardless
-/// of pan/zoom): the focused node's full, untruncated qualified name plus
-/// its first backing file's path, over a [`theme::overlay_chip_bg`] chip.
+/// of pan/zoom): the focused node's full, untruncated qualified name, its
+/// first backing file's path, and (issue #25) its subtree diff-size rollup
+/// (see [`focus_stats_line`]), over a [`theme::overlay_chip_bg`] chip.
 /// Exists because [`paint_node`]'s own label is abbreviated/truncated to fit
 /// the node's box -- this is always the full story, updating as focus
 /// moves. A no-op if the focused node somehow isn't in `app.graph` (a
 /// synthetic/unknown id shouldn't be focusable, but this is rendering code,
-/// so it defends rather than panics).
-fn paint_focus_status(painter: &egui::Painter, app: &App, viewport: EguiRect) {
+/// so it defends rather than panics). `visible_graph` must be the same
+/// pruned graph the view was laid out from ([`GraphViewCache::visible_graph`])
+/// so the rollup agrees with what's actually drawn under the focused node --
+/// the name/path lines still read from `app.graph` since those describe the
+/// node itself, not its (possibly test-pruned) subtree.
+fn paint_focus_status(
+    painter: &egui::Painter,
+    app: &App,
+    viewport: EguiRect,
+    visible_graph: &ProjectGraph,
+) {
     let Some(node) = app.graph.node(&app.focus) else {
         return;
     };
@@ -830,6 +866,7 @@ fn paint_focus_status(painter: &egui::Painter, app: &App, viewport: EguiRect) {
         .first()
         .map(|f| f.path.display().to_string())
         .unwrap_or_default();
+    let stats_text = focus_stats_line(visible_graph, &app.focus);
 
     let name_galley = painter.layout_no_wrap(
         app.focus.to_string(),
@@ -841,12 +878,17 @@ fn paint_focus_status(painter: &egui::Painter, app: &App, viewport: EguiRect) {
     } else {
         Some(painter.layout_no_wrap(path_text, FontId::proportional(11.0), PATH_COLOR))
     };
+    let stats_galley =
+        stats_text.map(|text| painter.layout_no_wrap(text, FontId::proportional(11.0), PATH_COLOR));
 
     let content_w = name_galley
         .size()
         .x
-        .max(path_galley.as_ref().map_or(0.0, |g| g.size().x));
-    let content_h = name_galley.size().y + path_galley.as_ref().map_or(0.0, |g| g.size().y + 2.0);
+        .max(path_galley.as_ref().map_or(0.0, |g| g.size().x))
+        .max(stats_galley.as_ref().map_or(0.0, |g| g.size().x));
+    let content_h = name_galley.size().y
+        + path_galley.as_ref().map_or(0.0, |g| g.size().y + 2.0)
+        + stats_galley.as_ref().map_or(0.0, |g| g.size().y + 2.0);
 
     let chip_rect = EguiRect::from_min_size(
         Pos2::new(
@@ -866,6 +908,11 @@ fn paint_focus_status(painter: &egui::Painter, app: &App, viewport: EguiRect) {
     painter.galley(Pos2::new(text_x, text_y), name_galley, name_color);
     text_y += name_h + 2.0;
     if let Some(galley) = path_galley {
+        let h = galley.size().y;
+        painter.galley(Pos2::new(text_x, text_y), galley, PATH_COLOR);
+        text_y += h + 2.0;
+    }
+    if let Some(galley) = stats_galley {
         painter.galley(Pos2::new(text_x, text_y), galley, PATH_COLOR);
     }
 }
@@ -904,6 +951,148 @@ fn label_color(_status: GitStatus) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::model::{FileRef, FileStats, ModuleNode};
+    use std::path::PathBuf;
+
+    /// A leaf node backed by one file, with explicit stats -- used by the
+    /// `focus_stats_line` tests below.
+    fn leaf_node(
+        id: &str,
+        parent: Option<&str>,
+        path: &str,
+        stats: Option<FileStats>,
+    ) -> ModuleNode {
+        ModuleNode {
+            id: NodeId::from(id),
+            display_name: id.to_string(),
+            parent: parent.map(NodeId::from),
+            children: vec![],
+            status: GitStatus::Modified,
+            files: vec![FileRef {
+                path: PathBuf::from(path),
+                base_blob: Some("b".to_string()),
+                head_blob: Some("h".to_string()),
+                stats,
+            }],
+        }
+    }
+
+    /// A childless namespace/root node with no backing files of its own.
+    fn namespace_node(id: &str, children: &[&str]) -> ModuleNode {
+        ModuleNode {
+            id: NodeId::from(id),
+            display_name: id.to_string(),
+            parent: None,
+            children: children.iter().map(|c| NodeId::from(*c)).collect(),
+            status: GitStatus::Unchanged,
+            files: vec![],
+        }
+    }
+
+    #[test]
+    fn focus_stats_line_shows_counts_for_a_changed_leaf_node() {
+        let node = leaf_node(
+            "a",
+            None,
+            "src/a.rs",
+            Some(FileStats {
+                added: 3,
+                deleted: 1,
+                binary: false,
+            }),
+        );
+        let graph = ProjectGraph {
+            nodes: [(NodeId::from("a"), node)].into_iter().collect(),
+            roots: vec![NodeId::from("a")],
+            edges: vec![],
+            totals: Default::default(),
+        };
+
+        assert_eq!(
+            focus_stats_line(&graph, &NodeId::from("a")),
+            Some("+3 / -1 across 1 file".to_string())
+        );
+    }
+
+    #[test]
+    fn focus_stats_line_sums_deduped_totals_for_a_namespace() {
+        let root = namespace_node("ns", &["ns.a", "ns.b"]);
+        let a = leaf_node(
+            "ns.a",
+            Some("ns"),
+            "lib/a.ex",
+            Some(FileStats {
+                added: 2,
+                deleted: 0,
+                binary: false,
+            }),
+        );
+        let b = leaf_node(
+            "ns.b",
+            Some("ns"),
+            "lib/b.ex",
+            Some(FileStats {
+                added: 5,
+                deleted: 2,
+                binary: false,
+            }),
+        );
+        let graph = ProjectGraph {
+            nodes: [
+                (NodeId::from("ns"), root),
+                (NodeId::from("ns.a"), a),
+                (NodeId::from("ns.b"), b),
+            ]
+            .into_iter()
+            .collect(),
+            roots: vec![NodeId::from("ns")],
+            edges: vec![],
+            totals: Default::default(),
+        };
+
+        assert_eq!(
+            focus_stats_line(&graph, &NodeId::from("ns")),
+            Some("+7 / -2 across 2 files".to_string())
+        );
+    }
+
+    #[test]
+    fn focus_stats_line_none_for_an_unchanged_node() {
+        let node = leaf_node("a", None, "src/a.rs", None);
+        let graph = ProjectGraph {
+            nodes: [(NodeId::from("a"), node)].into_iter().collect(),
+            roots: vec![NodeId::from("a")],
+            edges: vec![],
+            totals: Default::default(),
+        };
+
+        assert_eq!(focus_stats_line(&graph, &NodeId::from("a")), None);
+    }
+
+    #[test]
+    fn focus_stats_line_shows_binary_suffix_for_a_binary_only_node() {
+        let node = leaf_node(
+            "a",
+            None,
+            "assets/logo.png",
+            Some(FileStats {
+                added: 0,
+                deleted: 0,
+                binary: true,
+            }),
+        );
+        let graph = ProjectGraph {
+            nodes: [(NodeId::from("a"), node)].into_iter().collect(),
+            roots: vec![NodeId::from("a")],
+            edges: vec![],
+            totals: Default::default(),
+        };
+
+        assert_eq!(
+            focus_stats_line(&graph, &NodeId::from("a")),
+            Some("+0 / -0 across 1 file (1 binary)".to_string())
+        );
+    }
 
     #[test]
     fn fit_label_leaves_a_short_label_untouched() {
