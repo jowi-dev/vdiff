@@ -755,9 +755,11 @@ fn paint_root_legend(
 
 /// Row 2: the `Enter`/`d`/`c`/`v` pane-open/comment/review hint, the review
 /// progress readout ("N/M changed modules reviewed" -- see
-/// [`App::review_progress`]), the test-module hidden/shown hint (only drawn
-/// once there are any test modules to mention at all), then the two
-/// edge-color swatches.
+/// [`App::review_progress`]), the whole-diff size readout
+/// ([`crate::graph::model::DiffTotals::summary_line`], only drawn when
+/// `app.graph.totals.files > 0` -- an unchanged diff has nothing to
+/// summarize), the test-module hidden/shown hint (only drawn once there are
+/// any test modules to mention at all), then the two edge-color swatches.
 fn paint_hint_row(
     painter: &egui::Painter,
     app: &App,
@@ -781,6 +783,11 @@ fn paint_hint_row(
     if total_changed > 0 {
         let progress = format!("{reviewed_count}/{total_changed} changed modules reviewed");
         cursor_x = paint_text(painter, &progress, cursor_x, text_y, HINT_COLOR) + 20.0;
+    }
+
+    if app.graph.totals.files > 0 {
+        let summary = app.graph.totals.summary_line();
+        cursor_x = paint_text(painter, &summary, cursor_x, text_y, HINT_COLOR) + 20.0;
     }
 
     if hidden_count > 0 {
