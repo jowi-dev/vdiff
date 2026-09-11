@@ -41,6 +41,7 @@ use crate::graph::rails::{self, RailRole};
 use crate::graph::sugiyama::{self, SlotId};
 use crate::review::findings::Severity;
 use crate::tui::highlight;
+use crate::tui::minimap;
 use crate::tui::ViewMode;
 
 /// Warm accent for a rail cell belonging to the focused node's own outgoing
@@ -1345,6 +1346,64 @@ fn plane_box_bottom(width: usize) -> String {
     format!("\u{2570}{}\u{256f}", "\u{2500}".repeat(width - 2))
 }
 
+/// Glyph for a map cell at least one layout row lands in -- dense enough to
+/// read as "content here" at map scale, distinct from every glyph the graph
+/// views themselves paint (so tests, and eyes, can find the map
+/// unambiguously).
+const MINIMAP_OCCUPIED_GLYPH: char = '\u{25aa}'; // ▪
+
+/// Paint `map` as a bordered overlay in `area`'s top-right corner, on top of
+/// whatever the graph view already painted there this frame -- the same
+/// widget-over-widget move [`draw_picker`] uses, just corner-anchored
+/// instead of centered (and painted *before* the picker, so an open picker
+/// still wins the cells). Occupied cells get [`MINIMAP_OCCUPIED_GLYPH`] in
+/// [`BOX_BORDER_DIM`], the focused row's cell [`BOX_BORDER_FOCUSED`], and
+/// the viewport outline ring `Modifier::REVERSED` -- the house focus
+/// convention, readable on spaces and dots alike. Skipped entirely when the
+/// bordered map would take more than half the graph area in either
+/// dimension: on a terminal that cramped the map costs more orientation
+/// than it buys (the issue's "worth its screen cost" question, answered by
+/// a fit rule rather than a config knob).
+fn draw_minimap(frame: &mut Frame, area: Rect, map: &minimap::Minimap) {
+    let total_w = map.width as u16 + 2;
+    let total_h = map.height as u16 + 2;
+    if total_w > area.width / 2 || total_h > area.height / 2 {
+        return;
+    }
+    let popup = Rect {
+        x: area.x + area.width - total_w,
+        y: area.y,
+        width: total_w,
+        height: total_h,
+    };
+    let mut lines: Vec<Line> = Vec::with_capacity(map.height);
+    for y in 0..map.height {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(map.width);
+        for x in 0..map.width {
+            let glyph = if map.occupied.contains(&(x, y)) {
+                MINIMAP_OCCUPIED_GLYPH
+            } else {
+                ' '
+            };
+            let color = if map.focused == Some((x, y)) {
+                BOX_BORDER_FOCUSED
+            } else {
+                BOX_BORDER_DIM
+            };
+            let mut style = Style::default().fg(color);
+            if map.on_viewport_outline(x, y) {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            spans.push(Span::styled(glyph.to_string(), style));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL)),
+        popup,
+    );
+}
+
 /// Compose the plane view's full char canvas as styled [`Line`]s, windowed
 /// to the visible `[scroll_y, scroll_y + area.height)` row range up front
 /// (so a graph thousands of rows tall never allocates more than one
@@ -1471,6 +1530,28 @@ fn draw_plane_graph(
         .collect();
 
     frame.render_widget(Paragraph::new(lines), area);
+
+    // The corner minimap (issue #31), from the same `view` this frame just
+    // painted -- never a second `build_plane_view`, so the map can't desync
+    // from the graph under it.
+    let row_rects: Vec<plane::Rect> = view.layout.rows.values().copied().collect();
+    if let Some(map) = minimap::build(
+        view.layout.width,
+        view.layout.height,
+        &row_rects,
+        focus_rect,
+        plane::Rect {
+            x: scroll_x,
+            y: scroll_y,
+            w: area.width as usize,
+            h: area.height as usize,
+        },
+        minimap::MAX_INTERIOR_WIDTH,
+        minimap::MAX_INTERIOR_HEIGHT,
+    ) {
+        draw_minimap(frame, area, &map);
+    }
+
     view.edges.hidden
 }
 
@@ -3497,5 +3578,185 @@ mod tests {
             crate::core::focus::Direction::Down,
         );
         assert_eq!(target, NodeId::from("p2"));
+    }
+
+    // -- The corner minimap overlay (issue #31) ------------------------------
+
+    /// The exact [`minimap::build`] call the plane draw path makes for this
+    /// `app`/viewport -- the tests' oracle for where the map's cells land on
+    /// screen, so assertions stay exact without hardcoding the scale math.
+    fn plane_minimap_oracle(
+        app: &App,
+        area_w: u16,
+        area_h: u16,
+        scroll_y: usize,
+        scroll_x: usize,
+    ) -> Option<minimap::Minimap> {
+        let view = build_plane_view(app);
+        let rects: Vec<plane::Rect> = view.layout.rows.values().copied().collect();
+        minimap::build(
+            view.layout.width,
+            view.layout.height,
+            &rects,
+            view.layout.rows.get(&app.focus).copied(),
+            plane::Rect {
+                x: scroll_x,
+                y: scroll_y,
+                w: area_w as usize,
+                h: area_h as usize,
+            },
+            minimap::MAX_INTERIOR_WIDTH,
+            minimap::MAX_INTERIOR_HEIGHT,
+        )
+    }
+
+    fn render_plane_buffer(
+        app: &App,
+        width: u16,
+        height: u16,
+        scroll_y: usize,
+        scroll_x: usize,
+    ) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: scroll_y,
+                        canvas_x: scroll_x,
+                    },
+                    ViewMode::Plane,
+                    None,
+                )
+            })
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn plane_minimap_appears_top_right_when_the_layout_exceeds_the_viewport() {
+        let app = app_for_plane(chain_graph(200), "n0");
+        let (w, h) = (60u16, 30u16);
+        let main_h = h - LEGEND_HEIGHT;
+        let map = plane_minimap_oracle(&app, w, main_h, 0, 0)
+            .expect("fixture layout must exceed the viewport");
+
+        let buffer = render_plane_buffer(&app, w, h, 0, 0);
+        assert_eq!(
+            buffer[(w - 1, 0)].symbol(),
+            "┐",
+            "expected the map's border corner at the area's top-right cell"
+        );
+        let popup_x = w - (map.width as u16 + 2);
+        let (fx, fy) = map.focused.expect("focused row has a rect");
+        let focused_cell = &buffer[(popup_x + 1 + fx as u16, 1 + fy as u16)];
+        assert_eq!(
+            focused_cell.symbol(),
+            "▪",
+            "the focused row's map cell must be occupied"
+        );
+        assert_eq!(
+            focused_cell.style().fg,
+            Some(BOX_BORDER_FOCUSED),
+            "the focused row's map cell must carry the focus accent"
+        );
+        let (ox, oy) = *map
+            .occupied
+            .iter()
+            .find(|cell| Some(**cell) != map.focused)
+            .expect("more than one occupied cell");
+        assert_eq!(
+            buffer[(popup_x + 1 + ox as u16, 1 + oy as u16)].symbol(),
+            "▪",
+            "occupied layout rows must show as map dots"
+        );
+    }
+
+    #[test]
+    fn plane_minimap_is_absent_when_the_layout_fits_the_viewport() {
+        let app = app_for_plane(two_namespace_graph_fixture(), "a");
+        let (w, h) = (80u16, 24u16);
+        assert!(
+            plane_minimap_oracle(&app, w, h - LEGEND_HEIGHT, 0, 0).is_none(),
+            "fixture layout must fit the viewport"
+        );
+        let buffer = render_plane_buffer(&app, w, h, 0, 0);
+        assert_ne!(buffer[(w - 1, 0)].symbol(), "┐", "no map border expected");
+        assert!(
+            !buffer_text(&buffer).contains('▪'),
+            "no map dots expected when the layout fits"
+        );
+    }
+
+    #[test]
+    fn plane_minimap_is_skipped_when_it_would_dominate_a_tiny_terminal() {
+        let app = app_for_plane(chain_graph(40), "n0");
+        let (w, h) = (20u16, 10u16);
+        assert!(
+            plane_minimap_oracle(&app, w, h - LEGEND_HEIGHT, 0, 0).is_some(),
+            "the layout does exceed this viewport -- only the fit rule may skip"
+        );
+        let buffer = render_plane_buffer(&app, w, h, 0, 0);
+        assert_ne!(
+            buffer[(w - 1, 0)].symbol(),
+            "┐",
+            "a map taller/wider than half the graph area must not draw"
+        );
+        assert!(!buffer_text(&buffer).contains('▪'));
+    }
+
+    #[test]
+    fn plane_minimap_outline_tracks_the_scrolled_viewport() {
+        let app = app_for_plane(chain_graph(200), "n0");
+        let (w, h) = (60u16, 30u16);
+        let main_h = h - LEGEND_HEIGHT;
+
+        let at_origin = plane_minimap_oracle(&app, w, main_h, 0, 0).expect("map shows");
+        let buffer = render_plane_buffer(&app, w, h, 0, 0);
+        let popup_x = w - (at_origin.width as u16 + 2);
+        let vp = at_origin.viewport;
+        let top_left = &buffer[(popup_x + 1 + vp.x as u16, 1 + vp.y as u16)];
+        assert!(
+            top_left.style().add_modifier.contains(Modifier::REVERSED),
+            "the viewport rect's corner must be outlined"
+        );
+        assert!(
+            vp.w >= 3 && vp.h >= 3,
+            "fixture viewport must be big enough to have an interior"
+        );
+        let interior = &buffer[(popup_x + 1 + (vp.x + 1) as u16, 1 + (vp.y + 1) as u16)];
+        assert!(
+            !interior.style().add_modifier.contains(Modifier::REVERSED),
+            "cells inside the outline ring must stay unmarked"
+        );
+
+        let scroll_x = 10usize;
+        let scrolled = plane_minimap_oracle(&app, w, main_h, 0, scroll_x).expect("map shows");
+        assert_ne!(
+            scrolled.viewport.x, vp.x,
+            "fixture scroll must actually move the mapped viewport"
+        );
+        let buffer = render_plane_buffer(&app, w, h, 0, scroll_x);
+        let popup_x = w - (scrolled.width as u16 + 2);
+        let moved = &buffer[(
+            popup_x + 1 + scrolled.viewport.x as u16,
+            1 + scrolled.viewport.y as u16,
+        )];
+        assert!(
+            moved.style().add_modifier.contains(Modifier::REVERSED),
+            "the outline must follow the scrolled viewport"
+        );
+        let vacated = &buffer[(
+            popup_x + 1 + vp.x as u16,
+            1 + (scrolled.viewport.y + 1) as u16,
+        )];
+        assert!(
+            !vacated.style().add_modifier.contains(Modifier::REVERSED),
+            "cells the viewport scrolled away from must lose the outline"
+        );
     }
 }
