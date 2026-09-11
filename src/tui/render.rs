@@ -103,8 +103,10 @@ pub fn file_view_visible_rows(terminal_rows: u16) -> usize {
 
 /// Paint one frame for the current `app` state: the graph screen (the rail
 /// DAG or file pane, per [`App::pane`]) or the full-screen diff pane, per
-/// [`App::screen`], plus the bottom legend strip and any open edge-picker
-/// overlay. `notice`, when set, takes over the legend strip's hint line for
+/// [`App::screen`], plus the bottom legend strip, any open edge-picker
+/// overlay, and -- on the plane/canvas views, whenever the layout overflows
+/// the terminal -- the corner minimap (see [`draw_minimap`]).
+/// `notice`, when set, takes over the legend strip's hint line for
 /// this one frame -- see `crate::tui::TuiState::notice`'s doc for why the
 /// TUI needs this display-only glue state at all (in short: `eprintln!` is
 /// invisible/garbled while the alternate screen owns the terminal).

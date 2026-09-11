@@ -80,6 +80,14 @@ in canvas/plane mode) and every other binding (`gd`/`gr`, `gt`, `t`, `v`,
   move down/up the row list; `h`/`l` collapse/expand the focused row's
   namespace directly (no `z` chord).
 
+When a plane or canvas layout is bigger than the terminal in either
+dimension, a small minimap appears in the graph area's top-right corner:
+the full layout at map scale (a `▪` per occupied region, the focused row
+accented), with the currently visible window outlined so panning never
+loses the big picture. It shows up only when there's actually something
+off-screen, and stays hidden on terminals too small to give it a corner
+without dominating the view.
+
 All three keep vdiff's change sets (usually 15-40 visible modules) readable
 without folding anything by default. The hand-rolled read-only file viewer
 and unified/side-by-side diff screen, plus `Ctrl-e`'s suspend-and-run
