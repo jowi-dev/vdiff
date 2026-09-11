@@ -59,6 +59,7 @@
 pub mod highlight;
 pub mod keys;
 pub mod loader;
+pub mod minimap;
 pub mod nvim_grid;
 pub mod nvim_handoff;
 pub mod nvim_keys;
