@@ -844,6 +844,60 @@ pub fn focused_slot_range(view: &CanvasView, focus: &NodeId) -> Option<(usize, u
         .map(|slot| (slot.x, slot.width))
 }
 
+/// The canvas view's [`minimap::build`] inputs, extracted from the same
+/// `view` [`draw_canvas_graph`] is about to paint: content height is
+/// [`build_canvas_lines`]'s full line count and content width the rightmost
+/// slot edge (the same extents the scroll clamps effectively pan over), each
+/// real slot contributes a one-line rect on its band's own label line, and
+/// the focused slot doubles as the map's focus cell. Dummy slots are edge
+/// routing, not content -- they'd read as phantom rows at map scale, so
+/// they're skipped (they still can't extend `content_w` past a band's real
+/// extent by more than their own single cell). `viewport` is the current
+/// scroll window in the same line/column space.
+fn canvas_minimap_model(
+    view: &CanvasView,
+    focus: &NodeId,
+    viewport: plane::Rect,
+) -> Option<minimap::Minimap> {
+    let lines_index = build_canvas_lines(view);
+    let mut label_line = vec![0usize; view.layout.bands.len()];
+    for (idx, line) in lines_index.iter().enumerate() {
+        if let CanvasLine::Label(band_idx) = line {
+            label_line[*band_idx] = idx;
+        }
+    }
+    let mut content_w = 0usize;
+    let mut rects = Vec::new();
+    let mut focus_rect = None;
+    for (band_idx, band) in view.layout.bands.iter().enumerate() {
+        for slot in band {
+            content_w = content_w.max(slot.x + slot.width.max(1));
+            let Some(id) = slot.id.real_id() else {
+                continue;
+            };
+            let rect = plane::Rect {
+                x: slot.x,
+                y: label_line[band_idx],
+                w: slot.width.max(1),
+                h: 1,
+            };
+            if id == focus {
+                focus_rect = Some(rect);
+            }
+            rects.push(rect);
+        }
+    }
+    minimap::build(
+        content_w,
+        lines_index.len(),
+        &rects,
+        focus_rect,
+        viewport,
+        minimap::MAX_INTERIOR_WIDTH,
+        minimap::MAX_INTERIOR_HEIGHT,
+    )
+}
+
 fn canvas_role_color(role: CanvasRole) -> Color {
     match role {
         CanvasRole::Normal => RAIL_DIM,
@@ -992,6 +1046,22 @@ fn draw_canvas_graph(
         ));
     }
     frame.render_widget(Paragraph::new(lines), area);
+
+    // The corner minimap (issue #31), from the same `view` this frame just
+    // painted -- see `draw_plane_graph`'s twin call site.
+    if let Some(map) = canvas_minimap_model(
+        &view,
+        &app.focus,
+        plane::Rect {
+            x: canvas_scroll_x,
+            y: canvas_scroll,
+            w: area.width as usize,
+            h: area.height as usize,
+        },
+    ) {
+        draw_minimap(frame, area, &map);
+    }
+
     dropped_edges
 }
 
@@ -3758,5 +3828,109 @@ mod tests {
             !vacated.style().add_modifier.contains(Modifier::REVERSED),
             "cells the viewport scrolled away from must lose the outline"
         );
+    }
+
+    fn render_canvas_buffer(
+        app: &App,
+        width: u16,
+        height: u16,
+        scroll_y: usize,
+        scroll_x: usize,
+    ) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    app,
+                    None,
+                    ScrollOffsets {
+                        rail: 0,
+                        canvas: scroll_y,
+                        canvas_x: scroll_x,
+                    },
+                    ViewMode::Canvas,
+                    None,
+                )
+            })
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn canvas_minimap_appears_and_tracks_the_scrolled_viewport() {
+        let app = app_for(chain_graph(30), "n0");
+        let (w, h) = (60u16, 30u16);
+        let main_h = (h - LEGEND_HEIGHT) as usize;
+        let view = build_canvas_view(&app);
+        let viewport = |y: usize| plane::Rect {
+            x: 0,
+            y,
+            w: w as usize,
+            h: main_h,
+        };
+        let map = canvas_minimap_model(&view, &app.focus, viewport(0))
+            .expect("fixture canvas must exceed the viewport");
+
+        let buffer = render_canvas_buffer(&app, w, h, 0, 0);
+        assert_eq!(
+            buffer[(w - 1, 0)].symbol(),
+            "┐",
+            "expected the map's border corner at the area's top-right cell"
+        );
+        let popup_x = w - (map.width as u16 + 2);
+        let (fx, fy) = map.focused.expect("focused slot has a rect");
+        let focused_cell = &buffer[(popup_x + 1 + fx as u16, 1 + fy as u16)];
+        assert_eq!(focused_cell.symbol(), "▪");
+        assert_eq!(focused_cell.style().fg, Some(BOX_BORDER_FOCUSED));
+        let corner = &buffer[(
+            popup_x + 1 + map.viewport.x as u16,
+            1 + map.viewport.y as u16,
+        )];
+        assert!(
+            corner.style().add_modifier.contains(Modifier::REVERSED),
+            "the viewport rect's corner must be outlined"
+        );
+
+        let scroll_y = 20usize;
+        let scrolled = canvas_minimap_model(&view, &app.focus, viewport(scroll_y))
+            .expect("fixture canvas must exceed the viewport");
+        assert_ne!(
+            scrolled.viewport.y, map.viewport.y,
+            "fixture scroll must actually move the mapped viewport"
+        );
+        let buffer = render_canvas_buffer(&app, w, h, scroll_y, 0);
+        let moved = &buffer[(
+            popup_x + 1 + scrolled.viewport.x as u16,
+            1 + scrolled.viewport.y as u16,
+        )];
+        assert!(
+            moved.style().add_modifier.contains(Modifier::REVERSED),
+            "the outline must follow the scrolled viewport"
+        );
+    }
+
+    #[test]
+    fn canvas_minimap_is_absent_when_the_content_fits_the_viewport() {
+        let app = app_for(diamond_graph_fixture(), "child");
+        let (w, h) = (80u16, 24u16);
+        let view = build_canvas_view(&app);
+        assert!(
+            canvas_minimap_model(
+                &view,
+                &app.focus,
+                plane::Rect {
+                    x: 0,
+                    y: 0,
+                    w: w as usize,
+                    h: (h - LEGEND_HEIGHT) as usize,
+                },
+            )
+            .is_none(),
+            "fixture canvas must fit the viewport"
+        );
+        let buffer = render_canvas_buffer(&app, w, h, 0, 0);
+        assert_ne!(buffer[(w - 1, 0)].symbol(), "┐", "no map border expected");
+        assert!(!buffer_text(&buffer).contains('▪'));
     }
 }
