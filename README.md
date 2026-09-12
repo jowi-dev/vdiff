@@ -61,7 +61,8 @@ including the embedded Neovim, on the same `--no-nvim` opt-out -- but its
 graph screen has three interchangeable views, cycled with backtick
 (`` ` ``) in `plane -> canvas -> rail -> plane` order -- all three share the
 same fold-by-namespace "zoom out" mechanic (`h`/`l` in rail mode, `zc`/`zo`
-in canvas/plane mode) and every other binding (`gd`/`gr`, `gt`, `t`, `v`,
+in canvas/plane mode, plus `zM`/`zR` in canvas/plane mode to fold/unfold
+every namespace at once) and every other binding (`gd`/`gr`, `gt`, `t`, `v`,
 `c`, `Enter`, `d`, `q`, `Esc`):
 
 - **Plane** (the default) -- a true 2D nested layout: expanded namespaces
@@ -79,6 +80,12 @@ in canvas/plane mode) and every other binding (`gd`/`gr`, `gt`, `t`, `v`,
   gutter on the left drawing the dependency edges between rows. `j`/`k`
   move down/up the row list; `h`/`l` collapse/expand the focused row's
   namespace directly (no `z` chord).
+
+Plane and canvas also share a condensed ("zoom out") rendering mode,
+toggled with `-`: a terminal can't scale its font down the way the GUI's
+pixel zoom can, so condensed mode instead drops each row's status marker
+and badges and truncates its label, fitting far more of the graph on
+screen at once (rail is untouched -- it's already one row per module).
 
 All three keep vdiff's change sets (usually 15-40 visible modules) readable
 without folding anything by default. The hand-rolled read-only file viewer
@@ -130,8 +137,10 @@ zoom is a 2D-canvas-only concept):
 | `` ` ``  | Cycle graph view: plane -> canvas -> rail -> plane               |
 | `h` `j` `k` `l` | Move focus spatially (plane/canvas) or fold/step rows (rail) |
 | `zc` `zo`| Collapse/expand the focused namespace (plane/canvas only)       |
+| `zM` `zR`| Fold/unfold all namespaces (plane/canvas only)                   |
 | `zf`     | Drill the focused changed module into its changed functions (plane view only; static calls only) |
 | `h` `l`  | Collapse/expand the focused row's namespace (rail only)         |
+| `-`      | Toggle condensed rendering — abbreviated labels, more of the map on screen (plane/canvas) |
 
 ## Tuning your Neovim config for the review pane
 

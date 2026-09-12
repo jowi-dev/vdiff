@@ -468,6 +468,48 @@ pub enum Msg {
     /// existence. Only acted on on [`Screen::Graph`]/[`Pane::Graph`] with no
     /// picker open.
     ExpandFocusedNamespace,
+    /// `zM` on the `--tui` plane/canvas views: fold *every* childful
+    /// top-level namespace in one keypress, the "zoom all the way out"
+    /// counterpart to [`Msg::CollapseFocusedNamespace`]'s one-namespace-at-
+    /// a-time climb (issue #24). Wholesale-replaces
+    /// [`App::fold_collapsed`] with [`fold_all_seed`] run over
+    /// [`App::visible_graph`] -- not a union with whatever was already
+    /// folded -- which both seeds every root and, as a side effect, prunes
+    /// any stale deeper fold entry a prior [`Msg::CollapseFocusedNamespace`]
+    /// left behind (the same round-trip guarantee that handler maintains by
+    /// hand with `is_descendant_of`, here just free from replacing the
+    /// whole set). Does not touch `focus` itself: [`update`]'s central
+    /// fold-aware remap (see its own doc) runs after every dispatch and
+    /// re-seats `focus` onto the nearest now-collapsed ancestor -- covering
+    /// the function-row-owner case too -- so this handler doesn't need its
+    /// own reseat logic. Leaves [`App::fn_expanded`] untouched; a stale
+    /// entry there is documented harmless (see that field's own doc). Only
+    /// acted on on [`Screen::Graph`]/[`Pane::Graph`] with no picker open,
+    /// same guard as every other fold message.
+    CollapseAllNamespaces,
+    /// `zR` on the `--tui` plane/canvas views: unfold everything
+    /// [`Msg::CollapseAllNamespaces`] (or any accumulation of
+    /// [`Msg::CollapseFocusedNamespace`]) folded, in one keypress. A no-op
+    /// if [`App::fold_collapsed`] is already empty. Clears the whole set
+    /// rather than walking it one namespace at a time the way
+    /// [`Msg::ExpandFocusedNamespace`] does -- there's no "one level" to
+    /// preserve here, the point of `zR` is getting back to the fully
+    /// expanded graph in a single press. Reseats focus only when the old
+    /// focus itself named a collapsed namespace row (about to disappear):
+    /// mirrors [`Msg::ExpandFocusedNamespace`]'s own reseat, landing on
+    /// [`rail_view::first_visible_descendant`] of that namespace against
+    /// the now-empty fold set, falling back to the first row of the first
+    /// layer if that namespace happens to have no visible descendant at all
+    /// (possible when the startup dense-fold seed folded a namespace whose
+    /// only children are raw-graph-only, e.g. hidden test modules). A focus
+    /// that was already a plain drawn row, or a drilled-in function row, is
+    /// left untouched -- nothing about it becomes invalid by unfolding.
+    /// Because this handler clears `fold_collapsed` to empty itself,
+    /// [`update`]'s central remap (gated on `!fold_collapsed.is_empty()`)
+    /// never runs for this dispatch, so the reseat above is this handler's
+    /// job alone, not something to rely on the remap for. Only acted on on
+    /// [`Screen::Graph`]/[`Pane::Graph`] with no picker open.
+    ExpandAllNamespaces,
     /// The `--tui` plane view's function-level drill-in key (issue #6
     /// milestone 4): expand or collapse the focused module into its changed
     /// functions.
@@ -826,6 +868,8 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Cmd) {
         Msg::RailFocusMove(dir) => rail_focus_move(app, dir),
         Msg::CollapseFocusedNamespace => collapse_focused_namespace(app),
         Msg::ExpandFocusedNamespace => expand_focused_namespace(app),
+        Msg::CollapseAllNamespaces => collapse_all_namespaces(app),
+        Msg::ExpandAllNamespaces => expand_all_namespaces(app),
         Msg::ToggleFunctionDrill => toggle_function_drill(app),
     }
 }
@@ -926,6 +970,55 @@ fn expand_focused_namespace(mut app: App) -> (App, Cmd) {
         rail_view::first_visible_descendant(&visible, &namespace, &app.fold_collapsed)
     {
         app.focus = reseated;
+    }
+    (app, Cmd::None)
+}
+
+/// The set [`Msg::CollapseAllNamespaces`] installs wholesale into
+/// [`App::fold_collapsed`], and the same predicate `crate::tui`'s
+/// startup dense-fold seed (`default_fold_seed`) delegates to: every root
+/// in `graph.roots` that actually has children -- a childless root has
+/// nothing to collapse into one row, so seeding it would be a no-op entry.
+/// Takes whichever [`ProjectGraph`] the caller considers "visible" --
+/// `default_fold_seed` passes the raw `App::graph` at startup (by design,
+/// before layout/test-hiding is even in the picture), while
+/// [`collapse_all_namespaces`] passes [`App::visible_graph`] (see that
+/// handler's own doc for why the raw graph would be wrong there).
+pub fn fold_all_seed(graph: &ProjectGraph) -> HashSet<NodeId> {
+    graph
+        .roots
+        .iter()
+        .filter(|id| graph.node(id).is_some_and(|node| !node.children.is_empty()))
+        .cloned()
+        .collect()
+}
+
+/// Handle [`Msg::CollapseAllNamespaces`]. See that message's own doc.
+fn collapse_all_namespaces(mut app: App) -> (App, Cmd) {
+    if !on_graph_with_no_picker_and_graph_pane(&app) {
+        return (app, Cmd::None);
+    }
+    let visible = app.visible_graph();
+    app.fold_collapsed = fold_all_seed(&visible);
+    (app, Cmd::None)
+}
+
+/// Handle [`Msg::ExpandAllNamespaces`]. See that message's own doc.
+fn expand_all_namespaces(mut app: App) -> (App, Cmd) {
+    if !on_graph_with_no_picker_and_graph_pane(&app) {
+        return (app, Cmd::None);
+    }
+    if app.fold_collapsed.is_empty() {
+        return (app, Cmd::None);
+    }
+    let focus_was_collapsed_namespace = app.fold_collapsed.contains(&app.focus);
+    let namespace = app.focus.clone();
+    app.fold_collapsed.clear();
+    if focus_was_collapsed_namespace {
+        let visible = app.visible_graph();
+        app.focus = rail_view::first_visible_descendant(&visible, &namespace, &app.fold_collapsed)
+            .or_else(|| app.layers.first().and_then(|l| l.first()).cloned())
+            .unwrap_or(namespace);
     }
     (app, Cmd::None)
 }
@@ -3379,5 +3472,130 @@ mod tests {
 
         assert_eq!(app.focus, fn_id);
         assert_eq!(cmd, Cmd::None);
+    }
+
+    // -- GH-24: zM/zR fold-all/unfold-all ---------------------------------
+
+    #[test]
+    fn collapse_all_namespaces_folds_every_childful_root_and_remaps_focus() {
+        // `app_for_fold`'s graph fixture: `root` (childful) parents
+        // `leaf_a`/`leaf_b`; `target_x/y/z` are childless top-level roots,
+        // so they must be excluded from the seed.
+        let app = app_for_fold();
+        let (app, cmd) = update(app, Msg::CollapseAllNamespaces);
+
+        assert_eq!(app.fold_collapsed, HashSet::from([NodeId::from("root")]));
+        assert_eq!(
+            app.focus,
+            NodeId::from("root"),
+            "update's central remap must climb the old leaf_a focus onto the collapsed root"
+        );
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn collapse_all_namespaces_replaces_stale_deeper_fold_entries() {
+        // Pre-seed a nested namespace (`inner`) into `fold_collapsed` --
+        // the wholesale replacement must drop it in favor of the root seed
+        // (`outer`), not leave it stranded alongside.
+        let mut app = app_for_nested_fold("leaf1");
+        app.fold_collapsed.insert(NodeId::from("inner"));
+
+        let (app, _) = update(app, Msg::CollapseAllNamespaces);
+
+        assert_eq!(app.fold_collapsed, HashSet::from([NodeId::from("outer")]));
+    }
+
+    #[test]
+    fn collapse_all_namespaces_noop_when_picker_open() {
+        let mut app = app_for_fold();
+        app.picker = Some(EdgePicker {
+            candidates: vec![NodeId::from("target_x")],
+            selected: 0,
+        });
+        let (app, _) = update(app, Msg::CollapseAllNamespaces);
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
+        assert!(app.fold_collapsed.is_empty());
+    }
+
+    #[test]
+    fn collapse_all_namespaces_from_a_function_row_reseats_onto_the_collapsed_root() {
+        let mut app = app_for_fold();
+        let fn_id = seed_one_function_row(&mut app, "leaf_a");
+        app.fn_expanded.insert(NodeId::from("leaf_a"));
+        app.focus = fn_id;
+
+        let (app, cmd) = update(app, Msg::CollapseAllNamespaces);
+
+        assert_eq!(app.focus, NodeId::from("root"));
+        assert!(app.fold_collapsed.contains(&NodeId::from("root")));
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn expand_all_namespaces_clears_folds_and_reseats_off_the_collapsed_row() {
+        let app = app_for_fold();
+        let (app, _) = update(app, Msg::CollapseAllNamespaces);
+        assert_eq!(app.focus, NodeId::from("root"));
+
+        let (app, cmd) = update(app, Msg::ExpandAllNamespaces);
+
+        assert!(app.fold_collapsed.is_empty());
+        assert!(
+            app.is_drawn(&app.focus),
+            "focus must reseat onto a real drawn row once its collapsed namespace unfolds"
+        );
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn expand_all_namespaces_keeps_a_drawn_focus() {
+        // Focus is `leaf_direct`, a plain drawn leaf; the fold is on the
+        // unrelated `inner` namespace. Unfolding everything must not move
+        // a focus that was never itself a collapsed row.
+        let mut app = app_for_nested_fold("leaf_direct");
+        app.fold_collapsed.insert(NodeId::from("inner"));
+
+        let (app, _) = update(app, Msg::ExpandAllNamespaces);
+
+        assert!(app.fold_collapsed.is_empty());
+        assert_eq!(app.focus, NodeId::from("leaf_direct"));
+    }
+
+    #[test]
+    fn expand_all_namespaces_noop_when_nothing_folded() {
+        let app = app_for_fold();
+        let (app, cmd) = update(app, Msg::ExpandAllNamespaces);
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
+        assert!(app.fold_collapsed.is_empty());
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn expand_all_namespaces_noop_when_picker_open() {
+        let mut app = app_for_fold();
+        app.fold_collapsed.insert(NodeId::from("root"));
+        app.focus = NodeId::from("root");
+        app.picker = Some(EdgePicker {
+            candidates: vec![NodeId::from("target_x")],
+            selected: 0,
+        });
+        let (app, _) = update(app, Msg::ExpandAllNamespaces);
+        assert_eq!(app.focus, NodeId::from("root"));
+        assert!(app.fold_collapsed.contains(&NodeId::from("root")));
+    }
+
+    #[test]
+    fn collapse_all_then_expand_all_round_trips_without_stranding_focus() {
+        let app = app_for_fold();
+        let (app, _) = update(app, Msg::CollapseAllNamespaces);
+        let (app, _) = update(app, Msg::ExpandAllNamespaces);
+
+        assert!(app.fold_collapsed.is_empty());
+        let rows = rail_view::visible_rows(&app.graph, &app.layers, &app.fold_collapsed);
+        assert!(
+            rows.iter().any(|row| row.id() == &app.focus),
+            "focus must land on a row rail_view::visible_rows actually renders"
+        );
     }
 }

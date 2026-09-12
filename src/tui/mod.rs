@@ -258,6 +258,25 @@ struct TuiState {
     /// that completes one -- there's no chord that survives an unrelated
     /// keypress.
     canvas_fold_pending: bool,
+    /// Whether the canvas/plane views should render condensed (issue #24's
+    /// "zoom out"), toggled by `-` -- see [`should_toggle_condensed`]'s
+    /// doc. Display-only state, deliberately *not* on `core::App`: like
+    /// [`Self::view_mode`], it's purely which text/geometry a renderer
+    /// paints for the same underlying `App::graph`/`App::layers`/
+    /// `App::fold_collapsed` state, never something a `core` reducer needs
+    /// to reason about. Unlike [`Self::view_mode`] the GUI has no exact
+    /// counterpart to toggle in lockstep with -- it already has real pixel
+    /// zoom via `crate::ui::graph_view::Transform`, so shrinking glyph text
+    /// on top of that would be redundant; a terminal can't scale fonts at
+    /// all, so this flag is condensed rendering's *only* lever. Every
+    /// consumer (the renderer, the focus grid, the event loop's auto-pan)
+    /// recomputes its own layout fresh from this same flag each frame --
+    /// see [`render::build_plane_view`]'s doc for why every call site must
+    /// agree on the value for a given frame. Rail view ignores it entirely
+    /// (already one row per module -- there's nothing left to abbreviate),
+    /// so toggling it while rail is showing is a harmless no-op rather than
+    /// a guarded dead key.
+    condensed: bool,
     /// The `nvim` handoff target [`TuiState::execute`]'s `Cmd::CommentNode`
     /// arm just computed, if any -- [`handle_key`] reads this back out
     /// immediately after dispatching `Msg::CommentNode` and turns it into
@@ -678,12 +697,7 @@ fn should_fold_by_default(visible_node_count: usize, edge_count: usize) -> bool 
 fn default_fold_seed(
     graph: &crate::graph::model::ProjectGraph,
 ) -> std::collections::HashSet<crate::graph::model::NodeId> {
-    graph
-        .roots
-        .iter()
-        .filter(|id| graph.node(id).is_some_and(|node| !node.children.is_empty()))
-        .cloned()
-        .collect()
+    crate::core::app::fold_all_seed(graph)
 }
 
 /// The one-time notice [`run`] seeds [`TuiState::notice`] with when
@@ -796,6 +810,7 @@ pub fn run(app: App, config: TuiConfig) -> io::Result<()> {
         canvas_scroll: 0,
         canvas_scroll_x: 0,
         canvas_fold_pending: false,
+        condensed: false,
         comment_target: None,
         nvim,
         nvim_init_cmds: config.nvim_init_cmds,
@@ -858,7 +873,7 @@ fn event_loop(
                     );
                 }
                 ViewMode::Canvas => {
-                    let view = render::build_canvas_view(&state.app);
+                    let view = render::build_canvas_view(&state.app, state.condensed);
                     // A focus with no line at all (nothing visible yet)
                     // leaves the vertical scroll wherever it already was
                     // rather than snapping to line 0 -- the same "missing
@@ -899,7 +914,7 @@ fn event_loop(
                     // fields' own doc) -- the plane view is never showing at
                     // the same time as the canvas view, so there's no
                     // cross-talk between the two modes' auto-pan.
-                    let view = render::build_plane_view(&state.app);
+                    let view = render::build_plane_view(&state.app, state.condensed);
                     let total_height = render::plane_view_height(&view);
                     if let Some(rect) = render::focused_plane_rect(&view, &state.app.focus) {
                         state.canvas_scroll = render::clamp_scroll(
@@ -991,6 +1006,7 @@ fn event_loop(
                     canvas_x: state.canvas_scroll_x,
                 },
                 state.view_mode,
+                state.condensed,
                 nvim_grid_guard.as_deref(),
             )
         })?;
@@ -1107,6 +1123,12 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
 
     if should_toggle_view_mode(state, input) {
         state.view_mode = state.view_mode.next();
+        state.canvas_fold_pending = false;
+        return KeyAction::Continue;
+    }
+
+    if should_toggle_condensed(state, input) {
+        state.condensed = !state.condensed;
         state.canvas_fold_pending = false;
         return KeyAction::Continue;
     }
@@ -1325,6 +1347,23 @@ fn should_toggle_view_mode(state: &TuiState, input: KeyInput) -> bool {
         && state.pending_key.is_none()
 }
 
+/// Whether `input` is the condensed-render ("zoom out") toggle: `-`, same
+/// guard as [`should_toggle_view_mode`]'s backtick (graph screen, graph
+/// pane, no picker/chord in progress) -- unlike that toggle, this one is
+/// deliberately *not* gated on [`TuiState::view_mode`] at all: it flips
+/// [`TuiState::condensed`] regardless of which of the three graph screens
+/// is currently showing, since the flag is checked fresh by whichever
+/// screen the user switches to next (see that field's own doc for why
+/// toggling it under the rail view -- which has no use for it -- is a
+/// harmless no-op rather than something worth guarding against here).
+fn should_toggle_condensed(state: &TuiState, input: KeyInput) -> bool {
+    input == KeyInput::Char('-')
+        && state.app.screen == Screen::Graph
+        && state.app.pane == Pane::Graph
+        && state.app.picker.is_none()
+        && state.pending_key.is_none()
+}
+
 /// The canvas-view message `input` should dispatch directly, bypassing
 /// `map_key`, mirroring [`rail_key_msg`]'s precedent for the rail view but
 /// with entirely different keys/semantics per the maintainer override: in
@@ -1353,6 +1392,10 @@ fn canvas_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
         return match input {
             KeyInput::Char('c') => Some(Msg::CollapseFocusedNamespace),
             KeyInput::Char('o') => Some(Msg::ExpandFocusedNamespace),
+            // `zM`/`zR`: fold-all/unfold-all (issue #24), the same chord
+            // completing onto the wholesale variants of `zc`/`zo` above.
+            KeyInput::Char('M') => Some(Msg::CollapseAllNamespaces),
+            KeyInput::Char('R') => Some(Msg::ExpandAllNamespaces),
             _ => None,
         };
     }
@@ -1369,7 +1412,7 @@ fn canvas_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
                 'k' => Direction::Up,
                 _ => Direction::Down,
             };
-            let (layers, rows) = render::canvas_focus_grid(&state.app);
+            let (layers, rows) = render::canvas_focus_grid(&state.app, state.condensed);
             let target = move_focus(&layers, &rows, &state.app.focus, dir);
             Some(Msg::FocusSet(target))
         }
@@ -1411,6 +1454,10 @@ fn plane_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
             // own doc), so this arm lives here rather than in the
             // `canvas_key_msg` twin above.
             KeyInput::Char('f') => Some(Msg::ToggleFunctionDrill),
+            // `zM`/`zR`: fold-all/unfold-all (issue #24), the same chord
+            // completing onto the wholesale variants of `zc`/`zo` above.
+            KeyInput::Char('M') => Some(Msg::CollapseAllNamespaces),
+            KeyInput::Char('R') => Some(Msg::ExpandAllNamespaces),
             _ => None,
         };
     }
@@ -1427,7 +1474,7 @@ fn plane_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
                 'k' => Direction::Up,
                 _ => Direction::Down,
             };
-            let (layers, rows) = render::plane_focus_grid(&state.app);
+            let (layers, rows) = render::plane_focus_grid(&state.app, state.condensed);
             let target = move_focus(&layers, &rows, &state.app.focus, dir);
             Some(Msg::FocusSet(target))
         }
@@ -1533,6 +1580,7 @@ mod tests {
             canvas_scroll: 0,
             canvas_scroll_x: 0,
             canvas_fold_pending: false,
+            condensed: false,
             comment_target: None,
             nvim: None,
             nvim_init_cmds: Vec::new(),
@@ -1670,6 +1718,7 @@ mod tests {
                         canvas_x: state.canvas_scroll_x,
                     },
                     state.view_mode,
+                    state.condensed,
                     None,
                 )
             })
@@ -1890,6 +1939,44 @@ mod tests {
     }
 
     #[test]
+    fn minus_toggles_condensed_mode_in_plane_and_canvas() {
+        let mut state = state_fixture();
+        assert_eq!(state.view_mode, ViewMode::Plane);
+        assert!(!state.condensed, "condensed starts off");
+        handle_key(&mut state, press('-'));
+        assert!(state.condensed, "- must flip condensed on in plane mode");
+        handle_key(&mut state, press('-'));
+        assert!(!state.condensed, "- must flip condensed back off");
+
+        state.view_mode = ViewMode::Canvas;
+        handle_key(&mut state, press('-'));
+        assert!(
+            state.condensed,
+            "- must also toggle condensed in canvas mode"
+        );
+        handle_key(&mut state, press('-'));
+        assert!(!state.condensed);
+    }
+
+    /// Mirrors [`zc_then_zo_collapses_then_expands_in_plane_mode`]'s own
+    /// "an unrelated key abandons the chord" precedent: `z` alone arms
+    /// [`TuiState::canvas_fold_pending`], and `-` (like backtick) is
+    /// intercepted centrally in `handle_key` *before* `plane_key_msg` ever
+    /// sees it -- so it must both clear the stale chord (rather than
+    /// leaving it armed for some unrelated later keypress to complete) and
+    /// still toggle condensed itself, exactly like
+    /// [`should_toggle_view_mode`]'s own backtick handler already does.
+    #[test]
+    fn minus_after_z_clears_the_pending_chord_and_toggles_condensed() {
+        let mut state = state_fixture();
+        handle_key(&mut state, press('z'));
+        assert!(state.canvas_fold_pending, "z alone arms the chord");
+        handle_key(&mut state, press('-'));
+        assert!(!state.canvas_fold_pending, "- must clear the pending chord");
+        assert!(state.condensed, "- must still toggle condensed itself");
+    }
+
+    #[test]
     fn in_rail_mode_h_and_l_still_fold_and_unfold_unchanged() {
         let mut state = state_with_layered_graph("leaf");
         state.view_mode = ViewMode::Rail;
@@ -2104,7 +2191,7 @@ mod tests {
     /// so the test using this fails loudly on a fixture/layout mismatch
     /// instead of silently asserting nothing.
     fn plane_key_stepping_from_to(state: &TuiState, from: &NodeId, to: &NodeId) -> char {
-        let (layers, rows) = render::plane_focus_grid(&state.app);
+        let (layers, rows) = render::plane_focus_grid(&state.app, state.condensed);
         for (c, dir) in [
             ('h', Direction::Left),
             ('l', Direction::Right),
@@ -2307,7 +2394,7 @@ mod tests {
         // accepted it) still got a full plane row despite being pruned from
         // `app.layers`, so it must be entirely absent from the plane layout
         // now that `build_plane_view` walks `App::visible_graph()` instead.
-        let (layers, rows) = render::plane_focus_grid(&state.app);
+        let (layers, rows) = render::plane_focus_grid(&state.app, state.condensed);
         let all_rows: std::collections::HashSet<NodeId> =
             rows.iter().flatten().map(|(id, _)| id.clone()).collect();
         assert!(
@@ -2353,6 +2440,56 @@ mod tests {
         let key = plane_key_stepping_from_to(&state, &dynamic_bids, &partners);
         handle_key(&mut state, press(key));
         assert_eq!(state.app.focus, partners);
+    }
+
+    #[test]
+    fn zm_folds_all_and_zr_unfolds_all_in_plane_mode() {
+        // `state_with_namespace_and_sibling`: a childful namespace `ns`
+        // (a fold candidate) plus a childless top-level sibling -- enough
+        // for `zM`/`zR` to actually fold/unfold something, unlike
+        // `state_with_layered_graph`'s two childless roots.
+        let mut state = state_with_namespace_and_sibling();
+        assert_eq!(state.view_mode, ViewMode::Plane);
+
+        handle_key(&mut state, press('z'));
+        assert!(state.canvas_fold_pending);
+        handle_key(&mut state, press('M'));
+        assert!(!state.canvas_fold_pending, "chord clears after completing");
+        assert_eq!(
+            state.app.fold_collapsed,
+            HashSet::from([NodeId::from("ns")]),
+            "zM must fold every childful namespace"
+        );
+
+        handle_key(&mut state, press('z'));
+        handle_key(&mut state, press('R'));
+        assert!(
+            state.app.fold_collapsed.is_empty(),
+            "zR must unfold everything"
+        );
+    }
+
+    #[test]
+    fn zm_folds_all_and_zr_unfolds_all_in_canvas_mode() {
+        let mut state = state_with_namespace_and_sibling();
+        state.view_mode = ViewMode::Canvas;
+
+        handle_key(&mut state, press('z'));
+        assert!(state.canvas_fold_pending);
+        handle_key(&mut state, press('M'));
+        assert!(!state.canvas_fold_pending, "chord clears after completing");
+        assert_eq!(
+            state.app.fold_collapsed,
+            HashSet::from([NodeId::from("ns")]),
+            "zM must fold every childful namespace"
+        );
+
+        handle_key(&mut state, press('z'));
+        handle_key(&mut state, press('R'));
+        assert!(
+            state.app.fold_collapsed.is_empty(),
+            "zR must unfold everything"
+        );
     }
 
     #[test]

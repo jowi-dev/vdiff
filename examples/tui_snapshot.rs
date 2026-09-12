@@ -5,7 +5,7 @@
 //!
 //! ```sh
 //! cargo run --example tui_snapshot --features tui -- \
-//!     <repo_path> [base_ref] [rail|canvas] [width] [height] [zo_count]
+//!     <repo_path> [base_ref] [rail|canvas] [width] [height] [zo_count] [condensed]
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -33,6 +33,10 @@ fn main() {
     let width: u16 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(190);
     let height: u16 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(50);
     let zo_count: usize = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Issue #24's condensed render mode -- a trailing `condensed` argv token
+    // stands in for pressing `-` in a real session, since this harness has
+    // no keyboard loop of its own.
+    let condensed = args.get(7).map(String::as_str) == Some("condensed");
 
     let repo = Git2Repo::open(std::path::Path::new(repo_path)).expect("open repo");
     let opts = PipelineOptions {
@@ -88,7 +92,17 @@ fn main() {
 
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
     terminal
-        .draw(|frame| draw(frame, &app, None, ScrollOffsets::default(), mode, None))
+        .draw(|frame| {
+            draw(
+                frame,
+                &app,
+                None,
+                ScrollOffsets::default(),
+                mode,
+                condensed,
+                None,
+            )
+        })
         .expect("draw");
     let buffer = terminal.backend().buffer();
     for y in 0..buffer.area.height {

@@ -58,7 +58,16 @@ pub fn crossterm_key_to_input(code: KeyCode, modifiers: KeyModifiers) -> Option<
             // anyway, rather than left as `None`, for the same reason
             // `Ctrl-e` is: so the interception check happens in the same
             // `KeyInput`-typed comparison as every other binding.
-            | '`' | 'o' | 'z'),
+            //
+            // `M`/`R` complete the same `z` chord as `c`/`o` do -- `zM`/`zR`
+            // fold-all/unfold-all (issue #24) -- so they need the same
+            // pass-through treatment.
+            //
+            // `-` is the condensed-render ("zoom out") toggle (issue #24,
+            // part 2 -- see `crate::tui::TuiState::condensed`'s doc),
+            // intercepted by `crate::tui::handle_key` the same way `` ` ``
+            // is, for the same reason.
+            | '`' | 'o' | 'z' | 'M' | 'R' | '-'),
         ) => Some(KeyInput::Char(c)),
         KeyCode::Enter => Some(KeyInput::Enter),
         KeyCode::Esc => Some(KeyInput::Esc),
