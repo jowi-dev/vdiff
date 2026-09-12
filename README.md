@@ -87,6 +87,14 @@ pixel zoom can, so condensed mode instead drops each row's status marker
 and badges and truncates its label, fitting far more of the graph on
 screen at once (rail is untouched -- it's already one row per module).
 
+When a plane or canvas layout is bigger than the graph area in either
+dimension, a small minimap appears in that area's top-right corner:
+the full layout at map scale (a `▪` per occupied region, the focused row
+accented), with the currently visible window outlined so panning never
+loses the big picture. It shows up only when there's actually something
+off-screen, and stays hidden on terminals too small to give it a corner
+without dominating the view.
+
 All three keep vdiff's change sets (usually 15-40 visible modules) readable
 without folding anything by default. The hand-rolled read-only file viewer
 and unified/side-by-side diff screen, plus `Ctrl-e`'s suspend-and-run
