@@ -13,7 +13,7 @@ use crate::core::file_view::FileViewState;
 use crate::core::focus::{dep_targets, dependent_sources, move_focus, Direction};
 use crate::core::rail_view::{self, RailDirection};
 use crate::core::review;
-use crate::graph::layout::{layout, rows_with_x_centers};
+use crate::graph::layout::{layout_as_drawn, rows_with_x_centers};
 use crate::graph::model::{NodeId, ProjectGraph};
 use crate::graph::test_modules::{
     group_matched_test_modules, hide_test_modules, matched_test_module,
@@ -1081,18 +1081,22 @@ fn toggle_reviewed(mut app: App) -> (App, Cmd) {
 }
 
 /// Handle [`Msg::ToggleTests`]: flip `show_tests`, recompute `layers`/`rows`
-/// from a full [`crate::graph::layout::layout`] pass over
-/// [`App::visible_graph`] (rather than calling `assign_layers` separately --
-/// this is also what keeps `layers`/`rows` from drifting out of sync with
-/// each other, since they're now two views of the same [`LayoutResult`]),
-/// and re-seat focus (see [`reseat_focus`]) if it's no longer drawn.
+/// from a full [`layout_as_drawn`] pass (rather than calling `assign_layers`
+/// separately -- this is also what keeps `layers`/`rows` from drifting out
+/// of sync with each other, since they're now two views of the same
+/// [`LayoutResult`]), and re-seat focus (see [`reseat_focus`]) if it's no
+/// longer drawn. `layout_as_drawn` prunes the same way [`App::visible_graph`]
+/// does *and* sizes tested nodes' boxes for their test strips, so the rows
+/// derived here wrap over exactly the box sizes the GUI paints (GH-26's
+/// "related" half: a strip-less `layout` here only agreed with the painted
+/// layout because strips happen not to affect box *width* today).
 fn toggle_tests(mut app: App) -> (App, Cmd) {
     if !on_graph_with_no_picker_and_graph_pane(&app) {
         return (app, Cmd::None);
     }
     app.show_tests = !app.show_tests;
     let old_layers = std::mem::take(&mut app.layers);
-    let result = layout(&app.visible_graph());
+    let result = layout_as_drawn(&app.graph, app.show_tests);
     app.rows = rows_with_x_centers(&result);
     app.layers = result.layers;
     if let Some(owner) = crate::graph::functions::function_owner(&app.focus) {
