@@ -594,7 +594,11 @@ pub fn display_line_count(rows: &[(RailRow, usize)]) -> usize {
 
 /// One node's rendered line: a status-colored bullet, `label`, and
 /// trailing badges -- changed-test checkmark, findings count/severity,
-/// comment count, reviewed mark. `label` is `id`'s
+/// local comment count (magenta `💬N`), unresolved GitHub PR review thread
+/// count (cyan `◆N`, issue #35), reviewed mark. Every view's label-width
+/// estimate ([`plain_row_text`], [`plane_leaf_label`]) is derived from
+/// these same spans, so a new badge needs no separate layout math.
+/// `label` is `id`'s
 /// [`rail_view::disambiguated_labels`] entry rather than
 /// `node.display_name` directly, so two distinct ids that happen to share
 /// a bare display name (e.g. two different `docs` directories) render
@@ -634,6 +638,13 @@ fn node_line(app: &App, id: &NodeId, label: &str) -> Line<'static> {
                 Style::default().fg(Color::Magenta),
             ));
         }
+    }
+    let unresolved_threads = app.threads.unresolved_for(id);
+    if unresolved_threads > 0 {
+        spans.push(Span::styled(
+            format!(" ◆{unresolved_threads}"),
+            Style::default().fg(Color::Cyan),
+        ));
     }
     if app.reviewed.contains(id) {
         spans.push(Span::styled(" ✔", Style::default().fg(Color::Cyan)));
@@ -2704,6 +2715,28 @@ mod tests {
             },
             ns_id,
         )
+    }
+
+    #[test]
+    fn node_line_shows_an_unresolved_github_thread_badge() {
+        let mut app = app_at("leaf");
+        app.threads.unresolved.insert(NodeId::from("target"), 2);
+        let line = node_line(&app, &NodeId::from("target"), "target");
+        let badge = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == " ◆2")
+            .expect("expected a ◆2 thread badge");
+        assert_eq!(badge.style.fg, Some(Color::Cyan));
+        assert!(render_to_string(&app).contains("◆2"));
+    }
+
+    #[test]
+    fn node_line_has_no_thread_badge_when_nothing_is_unresolved() {
+        let mut app = app_at("leaf");
+        app.threads.unresolved.insert(NodeId::from("target"), 0);
+        let line = node_line(&app, &NodeId::from("target"), "target");
+        assert!(!line.spans.iter().any(|s| s.content.contains('◆')));
     }
 
     #[test]
