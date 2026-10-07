@@ -8,7 +8,8 @@ use std::collections::HashMap;
 
 use crate::graph::model::{NodeId, ProjectGraph};
 use crate::review::gh_threads::{
-    drift_warning, list_entries, status_line, unresolved_counts, PrThreads, ThreadEntry,
+    drift_warning, format_entry, list_entries, status_line, unresolved_counts, PrThreads,
+    ThreadEntry,
 };
 
 /// Notice shown while a fetch is in flight.
@@ -74,9 +75,66 @@ impl ThreadsState {
         }
     }
 
+    /// Each panel row's text, in `entries` order.
+    pub fn row_labels(&self) -> Vec<String> {
+        let Some(data) = &self.data else {
+            return Vec::new();
+        };
+        self.entries
+            .iter()
+            .map(|&entry| format_entry(data, entry))
+            .collect()
+    }
+
     /// Move the highlight by `delta`, clamped to the rows.
     pub fn move_selection(&mut self, delta: i32) {
         let last = self.entries.len().saturating_sub(1) as i64;
         self.selected = (self.selected as i64 + i64::from(delta)).clamp(0, last) as usize;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::review::gh_threads::{ReviewThread, ThreadComment};
+
+    #[test]
+    fn row_labels_are_empty_before_any_threads_land() {
+        assert!(ThreadsState::default().row_labels().is_empty());
+    }
+
+    #[test]
+    fn row_labels_follow_entry_order() {
+        let graph = ProjectGraph {
+            nodes: HashMap::new(),
+            roots: vec![],
+            edges: vec![],
+        };
+        let thread = |path: &str, resolved: bool| ReviewThread {
+            id: path.to_string(),
+            path: path.to_string(),
+            line: Some(1),
+            is_resolved: resolved,
+            is_outdated: false,
+            comments: vec![ThreadComment {
+                author: "a".to_string(),
+                body: "b".to_string(),
+            }],
+        };
+        let mut state = ThreadsState::default();
+        state.apply_fetch(
+            &graph,
+            Ok(PrThreads {
+                pr_number: 1,
+                head_oid: "h".to_string(),
+                threads: vec![thread("z.rs", true), thread("y.rs", false)],
+                summaries: vec![],
+            }),
+            None,
+        );
+        assert_eq!(
+            state.row_labels(),
+            vec!["y.rs:1  @a  b", "z.rs:1  @a  b  [resolved]"]
+        );
     }
 }

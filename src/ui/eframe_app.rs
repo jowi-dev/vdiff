@@ -856,6 +856,47 @@ impl VdiffApp {
             });
     }
 
+    /// The GitHub review thread panel (issue #35), while
+    /// [`crate::core::threads::ThreadsState::panel_open`]: the fetch status, one
+    /// row per thread with the highlighted one selected and scrolled into
+    /// view, and the panel's keys. Anchored bottom-right rather than centered
+    /// like [`Self::show_picker`], so the graph focus each `j`/`k` moves stays
+    /// visible behind it.
+    fn show_thread_panel(&self, ctx: &Context) {
+        let threads = &self.app.threads;
+        if !threads.panel_open {
+            return;
+        }
+        egui::Window::new("GitHub threads")
+            .anchor(Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -40.0))
+            .resizable(false)
+            .collapsible(false)
+            .title_bar(true)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                if let Some(status) = &threads.status {
+                    ui.weak(status);
+                }
+                let rows = threads.row_labels();
+                if rows.is_empty() {
+                    ui.label("no threads");
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(280.0)
+                    .show(ui, |ui| {
+                        for (i, row) in rows.iter().enumerate() {
+                            let selected = i == threads.selected;
+                            let response = ui.selectable_label(selected, row);
+                            if selected {
+                                response.scroll_to_me(None);
+                            }
+                        }
+                    });
+                ui.separator();
+                ui.weak("j/k move   Enter open   r refresh   p/Esc close");
+            });
+    }
+
     /// [`Screen::Diff`]: the loaded diff pane via [`diff_view::show`], or a
     /// loading message while [`Cmd::LoadDiff`] is still in flight.
     fn show_diff(&self, ui: &mut egui::Ui) {
@@ -914,6 +955,7 @@ impl VdiffApp {
             }
         });
         self.show_picker(&ctx);
+        self.show_thread_panel(&ctx);
     }
 }
 
