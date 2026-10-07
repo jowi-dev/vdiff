@@ -57,6 +57,7 @@
 //! `request_repaint_after` loop can.
 
 pub mod highlight;
+pub mod inbox;
 pub mod keys;
 pub mod loader;
 pub mod minimap;
