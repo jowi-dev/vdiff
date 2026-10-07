@@ -53,6 +53,7 @@
 
 pub mod comments;
 pub mod findings;
+pub mod inbox;
 pub mod publish;
 pub mod review_state;
 pub mod store;
