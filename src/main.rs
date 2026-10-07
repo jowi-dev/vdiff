@@ -831,6 +831,7 @@ fn build_initial_app(
         fold_collapsed: std::collections::HashSet::new(),
         fn_index,
         fn_expanded: std::collections::HashSet::new(),
+        threads: Default::default(),
     };
     (app, review_store, layout_result)
 }

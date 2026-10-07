@@ -364,6 +364,9 @@ impl TuiState {
             },
             Cmd::CommentNode(node) => self.comment_node(&node),
             Cmd::PersistReviewState => self.persist_review_state(),
+            // Wired up properly in a later commit.
+            Cmd::LoadFileAt { node, .. } => self.execute(Cmd::LoadFile(node)),
+            Cmd::FetchThreads => {}
         }
     }
 
@@ -1181,6 +1184,7 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
         pane: state.app.pane,
         file_open: state.app.file_view.is_some(),
         picker_open: state.app.picker.is_some(),
+        threads_open: state.app.threads.panel_open,
         pending: state.pending_key,
     };
     let outcome = map_key(input, ctx);
@@ -1569,6 +1573,7 @@ mod tests {
             fold_collapsed: HashSet::new(),
             fn_index: crate::graph::functions::FunctionIndex::default(),
             fn_expanded: std::collections::HashSet::new(),
+            threads: Default::default(),
         };
         TuiState {
             app,

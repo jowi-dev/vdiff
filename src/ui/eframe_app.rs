@@ -359,6 +359,9 @@ impl VdiffApp {
             }
             Cmd::CommentNode(node) => self.comment_node(node),
             Cmd::PersistReviewState => self.persist_review_state(),
+            // Wired up properly in a later commit.
+            Cmd::LoadFileAt { node, .. } => self.load_file(node),
+            Cmd::FetchThreads => {}
         }
     }
 
@@ -517,6 +520,7 @@ impl VdiffApp {
                 pane: self.app.pane,
                 file_open: self.app.file_view.is_some(),
                 picker_open: self.app.picker.is_some(),
+                threads_open: self.app.threads.panel_open,
                 pending: self.pending_key,
             };
             let outcome = map_key(input, ctx);
@@ -1116,6 +1120,7 @@ mod tests {
             pane: Pane::Graph,
             file_open: true,
             picker_open: false,
+            threads_open: false,
             pending: None,
         };
         let mut outcomes = Vec::new();

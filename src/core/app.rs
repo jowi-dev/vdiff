@@ -13,6 +13,7 @@ use crate::core::file_view::FileViewState;
 use crate::core::focus::{dep_targets, dependent_sources, move_focus, Direction};
 use crate::core::rail_view::{self, RailDirection};
 use crate::core::review;
+use crate::core::threads::{ThreadsState, FETCHING_STATUS};
 use crate::graph::layout::{layout_as_drawn, rows_with_x_centers};
 use crate::graph::model::{NodeId, ProjectGraph};
 use crate::graph::test_modules::{
@@ -20,6 +21,7 @@ use crate::graph::test_modules::{
 };
 use crate::review::comments::Comment;
 use crate::review::findings::Finding;
+use crate::review::gh_threads::{inline_line, thread_nodes, ReviewThread, ThreadEntry};
 
 /// Which screen is currently shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +180,12 @@ pub struct App {
     /// owner before trusting a `fn_expanded` entry, rather than assuming
     /// membership alone means "currently visible."
     pub fn_expanded: HashSet<NodeId>,
+    /// GitHub PR review threads (issue #35): the graph's unresolved-thread
+    /// badges and the thread list panel (`p` on [`Pane::Graph`]). Empty
+    /// until the glue's background fetch reports back through
+    /// [`Msg::ThreadsFetched`]; never persisted -- GitHub is the source of
+    /// truth and [`Msg::RefreshThreads`] re-fetches.
+    pub threads: ThreadsState,
 }
 
 impl App {
@@ -552,6 +560,33 @@ pub enum Msg {
     /// TUI relayouts its plane view every frame from current `App` state
     /// rather than needing a one-shot [`Cmd::Relayout`] signal.
     ToggleFunctionDrill,
+    /// The glue's background GitHub thread fetch finished (see
+    /// [`crate::pipeline::gh_threads::ThreadFetcher`]). Folded into
+    /// [`App::threads`] via [`ThreadsState::apply_fetch`]: a success
+    /// replaces the threads and recomputes badges, a failure keeps the
+    /// previous threads and only updates the status. `local_head` feeds the
+    /// line-drift warning. Accepted in any state.
+    ThreadsFetched {
+        result: Result<crate::review::gh_threads::PrThreads, String>,
+        local_head: Option<String>,
+    },
+    /// `p` on [`Pane::Graph`] opens the thread list panel, focusing the
+    /// highlighted thread's node; `p` or `Esc` in the panel closes it.
+    /// Opening is only acted on on [`Screen::Graph`]/[`Pane::Graph`] with
+    /// no picker open.
+    ToggleThreadPanel,
+    /// `j`/`k` in the thread panel: move the highlight by `delta`, clamped,
+    /// and move graph focus to the highlighted thread's node when it has
+    /// a drawn one. A no-op with the panel closed.
+    ThreadMove(i32),
+    /// `Enter` in the thread panel: close it and open the highlighted
+    /// thread's file in [`Pane::File`] at the thread's line, via
+    /// [`Cmd::LoadFileAt`]. A no-op on a review summary or a thread whose
+    /// file isn't in the graph.
+    ThreadOpen,
+    /// `r` in the thread panel: re-fetch threads from GitHub, emitting
+    /// [`Cmd::FetchThreads`].
+    RefreshThreads,
 }
 
 /// I/O the caller should perform as a result of [`update`]. `update` never
@@ -591,6 +626,18 @@ pub enum Cmd {
     /// interrupted review resumes from the last mark) matters more here
     /// than avoiding a few extra small writes.
     PersistReviewState,
+    /// [`Msg::ThreadOpen`]: like [`Cmd::LoadFile`] for `node`, but show
+    /// `path` (one of `node`'s files) at 1-based `line` rather than the
+    /// first file from the top -- in the built-in viewer via
+    /// [`FileViewState::seek`], in nvim by opening `path` at `line`.
+    LoadFileAt {
+        node: NodeId,
+        path: std::path::PathBuf,
+        line: u32,
+    },
+    /// [`Msg::RefreshThreads`]: start a new background GitHub thread fetch,
+    /// reporting back via [`Msg::ThreadsFetched`].
+    FetchThreads,
 }
 
 /// Advance `app` in response to `msg`, returning the new state and any
@@ -871,6 +918,18 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Cmd) {
         Msg::CollapseAllNamespaces => collapse_all_namespaces(app),
         Msg::ExpandAllNamespaces => expand_all_namespaces(app),
         Msg::ToggleFunctionDrill => toggle_function_drill(app),
+        Msg::ThreadsFetched { result, local_head } => {
+            app.threads
+                .apply_fetch(&app.graph, result, local_head.as_deref());
+            (app, Cmd::None)
+        }
+        Msg::ToggleThreadPanel => toggle_thread_panel(app),
+        Msg::ThreadMove(delta) => thread_move(app, delta),
+        Msg::ThreadOpen => thread_open(app),
+        Msg::RefreshThreads => {
+            app.threads.status = Some(FETCHING_STATUS.to_string());
+            (app, Cmd::FetchThreads)
+        }
     }
 }
 
@@ -1161,10 +1220,10 @@ fn with_diff_pane(app: &mut App, f: impl FnOnce(&mut DiffPaneState)) {
 }
 
 /// Whether `app` is in the state [`Msg::OpenDiff`] requires: on
-/// [`Screen::Graph`], with no picker overlay open. Not pane-gated -- `d`
+/// [`Screen::Graph`], with no picker overlay open or thread panel open. Not pane-gated -- `d`
 /// opens the full-screen diff from either [`Pane::Graph`] or [`Pane::File`].
 fn on_graph_with_no_picker(app: &App) -> bool {
-    app.screen == Screen::Graph && app.picker.is_none()
+    app.screen == Screen::Graph && app.picker.is_none() && !app.threads.panel_open
 }
 
 /// Whether `app` is in the state [`Msg::FocusMove`]/[`Msg::FocusSet`]/
@@ -1332,6 +1391,80 @@ fn open_file(mut app: App) -> (App, Cmd) {
     (app, Cmd::LoadFile(focus))
 }
 
+/// Handle [`Msg::ToggleThreadPanel`]: closing always works; opening needs
+/// the graph pane with no picker, and focuses the highlighted thread's node.
+fn toggle_thread_panel(mut app: App) -> (App, Cmd) {
+    if app.threads.panel_open {
+        app.threads.panel_open = false;
+        return (app, Cmd::None);
+    }
+    if !on_graph_with_no_picker_and_graph_pane(&app) {
+        return (app, Cmd::None);
+    }
+    app.threads.panel_open = true;
+    focus_selected_thread(app)
+}
+
+/// Handle [`Msg::ThreadMove`].
+fn thread_move(mut app: App, delta: i32) -> (App, Cmd) {
+    if !app.threads.panel_open {
+        return (app, Cmd::None);
+    }
+    app.threads.move_selection(delta);
+    focus_selected_thread(app)
+}
+
+/// The highlighted thread and its graph node: the first of
+/// [`thread_nodes`] that can take focus, else the first at all (a test
+/// module hidden by [`App::show_tests`] can still have its file opened).
+/// `None` for a review summary or a thread whose file isn't in the graph.
+fn selected_thread(app: &App) -> Option<(&ReviewThread, NodeId)> {
+    let ThreadEntry::Thread(index) = app.threads.selected_entry()? else {
+        return None;
+    };
+    let thread = app.threads.data.as_ref()?.threads.get(index)?;
+    let nodes = thread_nodes(&app.graph, thread);
+    let node = nodes
+        .iter()
+        .find(|id| app.focus_acceptable(id))
+        .or(nodes.first())?
+        .clone();
+    Some((thread, node))
+}
+
+/// Move focus to the highlighted thread's node when it can take focus,
+/// reloading an open file pane the same way any other focus move does.
+fn focus_selected_thread(mut app: App) -> (App, Cmd) {
+    let Some((_, node)) = selected_thread(&app) else {
+        return (app, Cmd::None);
+    };
+    if !app.focus_acceptable(&node) {
+        return (app, Cmd::None);
+    }
+    let old_focus = std::mem::replace(&mut app.focus, node);
+    let cmd = reload_file_on_focus_change(&app, &old_focus);
+    (app, cmd)
+}
+
+/// Handle [`Msg::ThreadOpen`]: close the panel and open the highlighted
+/// thread's file at its line (line 1 for an outdated thread).
+fn thread_open(mut app: App) -> (App, Cmd) {
+    if !app.threads.panel_open {
+        return (app, Cmd::None);
+    }
+    let Some((thread, node)) = selected_thread(&app) else {
+        return (app, Cmd::None);
+    };
+    let path = std::path::PathBuf::from(&thread.path);
+    let line = inline_line(thread).unwrap_or(1);
+    app.threads.panel_open = false;
+    if app.focus_acceptable(&node) {
+        app.focus = node.clone();
+    }
+    app.pane = Pane::File;
+    (app, Cmd::LoadFileAt { node, path, line })
+}
+
 /// Handle [`Msg::GoToTest`]: only on [`Screen::Graph`]/[`Pane::Graph`] with
 /// no picker open, look up the focused node's matched test module and, if
 /// there is one, switch `pane` to [`Pane::File`] and emit [`Cmd::LoadFile`]
@@ -1461,6 +1594,7 @@ mod tests {
             fold_collapsed: HashSet::new(),
             fn_index: crate::graph::functions::FunctionIndex::default(),
             fn_expanded: HashSet::new(),
+            threads: Default::default(),
         }
     }
 
@@ -1699,6 +1833,7 @@ mod tests {
             fold_collapsed: HashSet::new(),
             fn_index: crate::graph::functions::FunctionIndex::default(),
             fn_expanded: HashSet::new(),
+            threads: Default::default(),
         };
 
         let (app, _) = update(app, Msg::FollowDependents);
@@ -2122,6 +2257,7 @@ mod tests {
             fold_collapsed: HashSet::new(),
             fn_index: crate::graph::functions::FunctionIndex::default(),
             fn_expanded: HashSet::new(),
+            threads: Default::default(),
         };
         assert!(!app
             .layers
@@ -2166,6 +2302,7 @@ mod tests {
             fold_collapsed: HashSet::new(),
             fn_index: crate::graph::functions::FunctionIndex::default(),
             fn_expanded: HashSet::new(),
+            threads: Default::default(),
         };
 
         let (app, cmd) = update(app, Msg::ToggleTests);
@@ -2349,6 +2486,7 @@ mod tests {
             fold_collapsed: HashSet::new(),
             fn_index: crate::graph::functions::FunctionIndex::default(),
             fn_expanded: HashSet::new(),
+            threads: Default::default(),
         }
     }
 
@@ -2754,6 +2892,7 @@ mod tests {
             fold_collapsed: HashSet::new(),
             fn_index: crate::graph::functions::FunctionIndex::default(),
             fn_expanded: HashSet::new(),
+            threads: Default::default(),
         }
     }
 
@@ -2891,6 +3030,7 @@ mod tests {
             fold_collapsed: HashSet::new(),
             fn_index: crate::graph::functions::FunctionIndex::default(),
             fn_expanded: HashSet::new(),
+            threads: Default::default(),
         };
         app.fold_collapsed.insert(outer.clone());
 
@@ -3076,6 +3216,7 @@ mod tests {
             fold_collapsed: HashSet::new(),
             fn_index: crate::graph::functions::FunctionIndex::default(),
             fn_expanded: HashSet::new(),
+            threads: Default::default(),
         }
     }
 
@@ -3601,5 +3742,191 @@ mod tests {
             rows.iter().any(|row| row.id() == &app.focus),
             "focus must land on a row rail_view::visible_rows actually renders"
         );
+    }
+
+    // --- GitHub review threads (issue #35) ---
+
+    use crate::review::gh_threads::{
+        PrThreads, ReviewSummary, ReviewThread, ThreadComment, ThreadEntry,
+    };
+
+    fn gh_thread(id: &str, path: &str, line: u32, resolved: bool) -> ReviewThread {
+        ReviewThread {
+            id: id.to_string(),
+            path: path.to_string(),
+            line: Some(line),
+            is_resolved: resolved,
+            is_outdated: false,
+            comments: vec![ThreadComment {
+                author: "rev".to_string(),
+                body: "hm".to_string(),
+            }],
+        }
+    }
+
+    /// Entries come out as `[Summary(0), Thread(2) gone.rs, Thread(0)
+    /// target_y.rs, Thread(1) leaf_b.rs (resolved)]`.
+    fn pr_threads() -> PrThreads {
+        PrThreads {
+            pr_number: 7,
+            head_oid: "head".to_string(),
+            threads: vec![
+                gh_thread("T1", "target_y.rs", 3, false),
+                gh_thread("T2", "leaf_b.rs", 9, true),
+                gh_thread("T3", "gone.rs", 1, false),
+            ],
+            summaries: vec![ReviewSummary {
+                author: "rev".to_string(),
+                state: "COMMENTED".to_string(),
+                body: "overall".to_string(),
+            }],
+        }
+    }
+
+    fn with_threads(app: App, local_head: &str) -> App {
+        update(
+            app,
+            Msg::ThreadsFetched {
+                result: Ok(pr_threads()),
+                local_head: Some(local_head.to_string()),
+            },
+        )
+        .0
+    }
+
+    fn panel_open_at(focus: &str) -> App {
+        update(with_threads(app_at(focus), "head"), Msg::ToggleThreadPanel).0
+    }
+
+    #[test]
+    fn threads_fetched_badges_unresolved_threads_and_orders_rows() {
+        let app = with_threads(app_at("leaf_a"), "head");
+        assert_eq!(app.threads.unresolved_for(&NodeId::from("target_y")), 1);
+        assert_eq!(app.threads.unresolved_for(&NodeId::from("leaf_b")), 0);
+        assert_eq!(
+            app.threads.entries,
+            vec![
+                ThreadEntry::Summary(0),
+                ThreadEntry::Thread(2),
+                ThreadEntry::Thread(0),
+                ThreadEntry::Thread(1),
+            ]
+        );
+        assert_eq!(
+            app.threads.status.as_deref(),
+            Some("PR #7: 3 threads, 2 unresolved")
+        );
+    }
+
+    #[test]
+    fn threads_fetched_warns_when_local_head_drifted() {
+        let app = with_threads(app_at("leaf_a"), "elsewhere");
+        let status = app.threads.status.unwrap();
+        assert!(status.starts_with("PR #7: 3 threads"), "{status}");
+        assert!(status.contains("local HEAD differs"), "{status}");
+    }
+
+    #[test]
+    fn failed_fetch_keeps_previous_threads_and_reports_why() {
+        let app = with_threads(app_at("leaf_a"), "head");
+        let (app, cmd) = update(
+            app,
+            Msg::ThreadsFetched {
+                result: Err("gh failed: offline".to_string()),
+                local_head: None,
+            },
+        );
+        assert_eq!(cmd, Cmd::None);
+        assert!(app.threads.data.is_some());
+        assert_eq!(app.threads.unresolved_for(&NodeId::from("target_y")), 1);
+        assert_eq!(
+            app.threads.status.as_deref(),
+            Some("GitHub threads unavailable: gh failed: offline")
+        );
+    }
+
+    #[test]
+    fn toggle_thread_panel_opens_then_closes() {
+        let app = panel_open_at("leaf_a");
+        assert!(app.threads.panel_open);
+        let (app, _) = update(app, Msg::ToggleThreadPanel);
+        assert!(!app.threads.panel_open);
+    }
+
+    #[test]
+    fn toggle_thread_panel_does_not_open_off_the_graph_pane() {
+        let mut app = with_threads(app_at("leaf_a"), "head");
+        app.pane = Pane::File;
+        let (app, _) = update(app, Msg::ToggleThreadPanel);
+        assert!(!app.threads.panel_open);
+    }
+
+    #[test]
+    fn thread_move_steps_rows_and_moves_focus_to_the_threads_node() {
+        let app = panel_open_at("leaf_a");
+        // Row 1 is gone.rs: no node in the graph, so focus stays put.
+        let (app, _) = update(app, Msg::ThreadMove(1));
+        assert_eq!(app.threads.selected, 1);
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
+        let (app, _) = update(app, Msg::ThreadMove(1));
+        assert_eq!(app.focus, NodeId::from("target_y"));
+        let (app, _) = update(app, Msg::ThreadMove(10));
+        assert_eq!(app.threads.selected, 3);
+        assert_eq!(app.focus, NodeId::from("leaf_b"));
+        let (app, _) = update(app, Msg::ThreadMove(-10));
+        assert_eq!(app.threads.selected, 0);
+    }
+
+    #[test]
+    fn thread_move_is_a_no_op_with_the_panel_closed() {
+        let app = with_threads(app_at("leaf_a"), "head");
+        let (app, _) = update(app, Msg::ThreadMove(2));
+        assert_eq!(app.threads.selected, 0);
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
+    }
+
+    #[test]
+    fn graph_navigation_is_inert_while_the_thread_panel_is_open() {
+        let app = panel_open_at("leaf_a");
+        let (app, cmd) = update(app, Msg::FocusMove(Direction::Right));
+        assert_eq!(app.focus, NodeId::from("leaf_a"));
+        assert_eq!(cmd, Cmd::None);
+    }
+
+    #[test]
+    fn thread_open_opens_the_file_pane_at_the_threads_line() {
+        let app = panel_open_at("leaf_a");
+        let (app, _) = update(app, Msg::ThreadMove(2));
+        let (app, cmd) = update(app, Msg::ThreadOpen);
+        assert_eq!(
+            cmd,
+            Cmd::LoadFileAt {
+                node: NodeId::from("target_y"),
+                path: PathBuf::from("target_y.rs"),
+                line: 3,
+            }
+        );
+        assert_eq!(app.pane, Pane::File);
+        assert!(!app.threads.panel_open);
+        assert_eq!(app.focus, NodeId::from("target_y"));
+    }
+
+    #[test]
+    fn thread_open_on_a_summary_or_unmapped_thread_does_nothing() {
+        let app = panel_open_at("leaf_a");
+        let (app, cmd) = update(app, Msg::ThreadOpen);
+        assert_eq!(cmd, Cmd::None);
+        assert!(app.threads.panel_open);
+        let (app, _) = update(app, Msg::ThreadMove(1));
+        let (app, cmd) = update(app, Msg::ThreadOpen);
+        assert_eq!(cmd, Cmd::None);
+        assert_eq!(app.pane, Pane::Graph);
+    }
+
+    #[test]
+    fn refresh_threads_starts_a_fetch() {
+        let (app, cmd) = update(panel_open_at("leaf_a"), Msg::RefreshThreads);
+        assert_eq!(cmd, Cmd::FetchThreads);
+        assert_eq!(app.threads.status.as_deref(), Some(FETCHING_STATUS));
     }
 }

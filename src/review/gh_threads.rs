@@ -454,6 +454,7 @@ mod tests {
                 path: PathBuf::from(path),
                 base_blob: None,
                 head_blob: Some("h".to_string()),
+                stats: None,
             }],
         }
     }
@@ -464,6 +465,7 @@ mod tests {
             roots: nodes.iter().map(|n| n.id.clone()).collect(),
             nodes: nodes.into_iter().map(|n| (n.id.clone(), n)).collect(),
             edges: vec![],
+            totals: Default::default(),
         }
     }
 

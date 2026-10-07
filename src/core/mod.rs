@@ -8,3 +8,4 @@ pub mod file_view;
 pub mod focus;
 pub mod rail_view;
 pub mod review;
+pub mod threads;
