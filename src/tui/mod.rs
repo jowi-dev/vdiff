@@ -640,7 +640,7 @@ enum KeyAction {
 /// [`event_loop`]/[`render`]/dispatch still leaves the caller's shell in a
 /// normal, readable state instead of wedged in raw mode with the panic
 /// message swallowed by the alternate screen.
-fn restore_terminal_best_effort() {
+pub(crate) fn restore_terminal_best_effort() {
     let _ = disable_raw_mode();
     let _ = io::stdout().execute(LeaveAlternateScreen);
 }
@@ -652,7 +652,7 @@ fn restore_terminal_best_effort() {
 /// Installed once per [`run`] call, before `enable_raw_mode` is even
 /// called, so a panic during terminal setup itself is covered too, not
 /// just ones inside the event loop.
-fn install_panic_hook() {
+pub(crate) fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal_best_effort();

@@ -134,10 +134,66 @@ fn run_inbox(cli: &Cli, repo_path: &Path) -> ExitCode {
     }
 }
 
+/// `--inbox`'s picker (see [`vdiff::tui::inbox`]). `Enter` runs this same
+/// binary as a child `vdiff --pr <n>` (see [`Cli::inbox_open_args`]) and
+/// waits for it, so the review session is an ordinary `--pr` run with its
+/// own worktree setup and cleanup, and the picker comes back when it
+/// closes.
 #[cfg(feature = "tui")]
-fn launch_inbox_picker(_cli: &Cli, _repo_path: &Path) -> ExitCode {
-    eprintln!("error: the --inbox picker is not implemented yet; use --inbox --json");
-    ExitCode::FAILURE
+fn launch_inbox_picker(cli: &Cli, repo_path: &Path) -> ExitCode {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            eprintln!("error: couldn't locate the vdiff binary to open PRs with: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Which repo `--pr` resolves against; `None` (no GitHub remote here,
+    // e.g. `--all-repos` run from outside a checkout) lets every entry
+    // through and leaves any error to the child.
+    let current_repo = repo_name_with_owner(repo_path).ok();
+    let picker = vdiff::tui::inbox::InboxPicker::new(current_repo);
+    let fetch =
+        || vdiff::pipeline::inbox::fetch_inbox(repo_path, cli.all_repos).map_err(|e| e.to_string());
+    let open = |pr: u64| open_inbox_pr(&exe, pr, &cli.inbox_open_args(pr));
+    match vdiff::tui::inbox::run(picker, fetch, open) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error running the inbox picker: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run `exe args` (a `vdiff --pr <pr>` session) on this terminal and wait
+/// for it. Its stderr is captured rather than inherited, since the picker
+/// redraws over anything printed there: the last non-empty line becomes
+/// the picker's status, as a note on success (e.g. a modified PR worktree
+/// left in place) or as the error on failure.
+#[cfg(feature = "tui")]
+fn open_inbox_pr(exe: &Path, pr: u64, args: &[String]) -> Result<Option<String>, String> {
+    use std::process::{Command, Stdio};
+    let output = Command::new(exe)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| format!("couldn't start vdiff --pr {pr}: {err}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let last_line = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string());
+    if output.status.success() {
+        Ok(last_line)
+    } else {
+        Err(format!(
+            "vdiff --pr {pr} failed: {}",
+            last_line.unwrap_or_else(|| output.status.to_string())
+        ))
+    }
 }
 
 /// The headless-build (no `tui` feature) counterpart of

@@ -10,12 +10,19 @@
 //! a terminal; [`draw`] renders it; [`run`] owns the terminal and the
 //! fetch/open loop.
 
-use crossterm::event::KeyCode;
+use std::io;
+
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use crossterm::ExecutableCommand;
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
-use ratatui::Frame;
+use ratatui::{Frame, Terminal};
 
 use crate::review::inbox::{InboxCategory, InboxEntry, InboxReport};
 
@@ -139,7 +146,9 @@ fn category_heading(category: InboxCategory) -> &'static str {
 }
 
 /// Draw the picker into the whole frame: a title line, the grouped list,
-/// and a footer of key hints plus the status message.
+/// and a footer of key hints plus the status message. Each row leads with
+/// `owner/name#n` and the reason it is in the inbox, ahead of the title, so
+/// a narrow terminal truncates the title rather than the reason.
 pub fn draw(frame: &mut Frame, picker: &InboxPicker) {
     let [title_area, list_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
@@ -214,9 +223,9 @@ pub fn draw(frame: &mut Frame, picker: &InboxPicker) {
         }
         items.push(ListItem::new(Line::from(vec![
             Span::styled(format!("{}#{}", entry.repo, entry.number), bold),
-            Span::raw(format!("  {}  ", entry.title)),
-            Span::styled(format!("@{}", entry.author), dim),
-            Span::raw(format!("  {}", row.reason)),
+            Span::raw(format!("  {}  ", row.reason)),
+            Span::raw(entry.title.clone()),
+            Span::styled(format!("  @{}", entry.author), dim),
         ])));
     }
 
@@ -225,6 +234,81 @@ pub fn draw(frame: &mut Frame, picker: &InboxPicker) {
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("> ");
     frame.render_stateful_widget(list, list_area, &mut state);
+}
+
+/// Run the picker until the user quits. `fetch` computes the inbox (it is
+/// called on start, on `r`, and after every opened PR closes); `open` runs
+/// a review session for a PR number while this picker's terminal is
+/// suspended, returning an optional note or an error message for the
+/// status line. The terminal is restored on every exit path, and by the
+/// shared panic hook on a panic (see [`super::install_panic_hook`]).
+pub fn run(
+    picker: InboxPicker,
+    fetch: impl FnMut() -> Result<InboxReport, String>,
+    open: impl FnMut(u64) -> Result<Option<String>, String>,
+) -> io::Result<()> {
+    super::install_panic_hook();
+    enable_raw_mode()?;
+    io::stdout().execute(EnterAlternateScreen)?;
+    let result = Terminal::new(CrosstermBackend::new(io::stdout()))
+        .and_then(|mut terminal| event_loop(&mut terminal, picker, fetch, open));
+    super::restore_terminal_best_effort();
+    result
+}
+
+fn event_loop<B: Backend>(
+    terminal: &mut Terminal<B>,
+    mut picker: InboxPicker,
+    mut fetch: impl FnMut() -> Result<InboxReport, String>,
+    mut open: impl FnMut(u64) -> Result<Option<String>, String>,
+) -> io::Result<()>
+where
+    io::Error: From<B::Error>,
+{
+    terminal.draw(|f| draw(f, &picker))?;
+    picker.set_report(fetch());
+    loop {
+        terminal.draw(|f| draw(f, &picker))?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        let action =
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                PickerAction::Quit
+            } else {
+                picker.handle_key(key.code)
+            };
+        match action {
+            PickerAction::None => {}
+            PickerAction::Quit => return Ok(()),
+            PickerAction::Refresh => {
+                picker.set_status(Some("refreshing...".to_string()));
+                terminal.draw(|f| draw(f, &picker))?;
+                picker.set_report(fetch());
+                picker.set_status(None);
+            }
+            PickerAction::Open(number) => {
+                disable_raw_mode()?;
+                io::stdout().execute(LeaveAlternateScreen)?;
+                let outcome = open(number);
+                io::stdout().execute(EnterAlternateScreen)?;
+                enable_raw_mode()?;
+                // The child drew over the whole screen; forget ratatui's
+                // idea of what is on it so the next draw repaints fully.
+                terminal.clear()?;
+                picker.set_status(Some(format!("#{number} closed; refreshing...")));
+                terminal.draw(|f| draw(f, &picker))?;
+                picker.set_report(fetch());
+                picker.set_status(match outcome {
+                    Ok(note) => note,
+                    Err(err) => Some(err),
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
