@@ -903,7 +903,7 @@ fn extract_key_presses(events: &[egui::Event]) -> Vec<(Key, Modifiers)> {
 /// Translate an egui key press (with its modifiers) to vdiff's
 /// toolkit-independent [`KeyInput`]. Pure and unit-tested: with Ctrl held,
 /// only `w`/`d`/`u` map to anything ([`KeyInput::Ctrl`]); otherwise the
-/// keys [`crate::keymap::map_key`] cares about (h/j/k/l/g/G/d/r/t/s/c/f/[/],
+/// keys [`crate::keymap::map_key`] cares about (h/j/k/l/g/G/d/r/t/s/c/v/f/p/[/],
 /// Enter, Esc) map to anything, arrows map to [`KeyInput::Arrow`]
 /// unconditionally (checked before the Ctrl branch, so `Ctrl-w` followed by
 /// an arrow -- held or released -- both complete the `Ctrl-w` chord the
@@ -936,6 +936,7 @@ pub fn egui_key_to_input(key: Key, modifiers: Modifiers) -> Option<KeyInput> {
         Key::C => Some(KeyInput::Char('c')),
         Key::V => Some(KeyInput::Char('v')),
         Key::F => Some(KeyInput::Char('f')),
+        Key::P => Some(KeyInput::Char('p')),
         Key::OpenBracket => Some(KeyInput::Char('[')),
         Key::CloseBracket => Some(KeyInput::Char(']')),
         Key::Enter => Some(KeyInput::Enter),
@@ -975,6 +976,7 @@ mod tests {
             (Key::C, KeyInput::Char('c')),
             (Key::V, KeyInput::Char('v')),
             (Key::F, KeyInput::Char('f')),
+            (Key::P, KeyInput::Char('p')),
             (Key::OpenBracket, KeyInput::Char('[')),
             (Key::CloseBracket, KeyInput::Char(']')),
             (Key::Enter, KeyInput::Enter),
