@@ -87,7 +87,9 @@ use crate::core::app::{update, App, Cmd, Msg, Pane, Screen};
 use crate::core::focus::{move_focus, Direction};
 use crate::core::rail_view::RailDirection;
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome, Pending};
+use crate::nvim::gh_threads::threads_lua;
 use crate::nvim::session::NvimCmd;
+use crate::pipeline::gh_threads::{ThreadFetcher, ThreadSource};
 use crate::review::comments::map_comments;
 use crate::review::review_state::ReviewStore;
 use crate::review::store as review_store;
@@ -315,6 +317,12 @@ struct TuiState {
     /// for [`Self::ensure_nvim_session`]: a respawned session starts with
     /// none of them applied, exactly like the initial spawn did.
     nvim_init_cmds: Vec<String>,
+    /// Where [`Cmd::FetchThreads`] fetches GitHub PR review threads from
+    /// (issue #35, see [`TuiConfig::threads`]), or `None` to never fetch.
+    thread_source: Option<ThreadSource>,
+    /// The GitHub thread fetch in flight, polled every [`event_loop`] tick
+    /// by [`Self::poll_thread_fetch`]. A new fetch replaces it.
+    thread_fetcher: Option<ThreadFetcher>,
 }
 
 impl TuiState {
@@ -338,38 +346,94 @@ impl TuiState {
                 Ok(state) => self.dispatch(Msg::DiffLoaded(state)),
                 Err(message) => self.dispatch(Msg::LoadFailed(message)),
             },
-            Cmd::LoadFile(node) => match self.loader.load_file_view(&self.app.graph, &node) {
-                Ok(state) => {
-                    // A file open is exactly the moment a session the user
-                    // quit out of should come back -- see
-                    // `Self::ensure_nvim_session`. No-op when the current
-                    // one is still alive.
-                    self.ensure_nvim_session();
-                    // Issue #19: mirror the GUI's `VdiffApp::load_file` --
-                    // whenever the embedded session is alive, open the same
-                    // file it just loaded for the hand-rolled viewer
-                    // (same head content, same changed-range marks) so the
-                    // two never disagree about what's showing.
-                    if let Some(nvim) = self.nvim.as_mut() {
-                        if nvim.is_alive() {
-                            if let Some(file) = state.current_file() {
-                                nvim.open_file(
-                                    file.path.clone(),
-                                    Some(1),
-                                    file.changed_ranges.clone(),
-                                );
-                            }
-                        }
-                    }
-                    self.dispatch(Msg::FileLoaded(state));
-                }
-                Err(message) => self.dispatch(Msg::FileLoadFailed(message)),
-            },
+            Cmd::LoadFile(node) => self.load_file_at(&node, None),
+            Cmd::LoadFileAt { node, path, line } => self.load_file_at(&node, Some((path, line))),
             Cmd::CommentNode(node) => self.comment_node(&node),
             Cmd::PersistReviewState => self.persist_review_state(),
-            // Wired up properly in a later commit.
-            Cmd::LoadFileAt { node, .. } => self.execute(Cmd::LoadFile(node)),
-            Cmd::FetchThreads => {}
+            Cmd::FetchThreads => self.fetch_threads(),
+        }
+    }
+
+    /// [`Cmd::LoadFile`]/[`Cmd::LoadFileAt`]: load `node`'s file view and,
+    /// with a `target`, show that file at its 1-based line (a GitHub review
+    /// thread's anchor) via [`crate::core::file_view::FileViewState::seek`].
+    /// Whenever the embedded session is alive, the same file opens there
+    /// too (issue #19, mirroring the GUI's `VdiffApp::load_file_at`), after
+    /// re-sending the inline threads so a respawned session has them.
+    fn load_file_at(&mut self, node: &crate::graph::model::NodeId, target: Option<(PathBuf, u32)>) {
+        let mut state = match self.loader.load_file_view(&self.app.graph, node) {
+            Ok(state) => state,
+            Err(message) => return self.dispatch(Msg::FileLoadFailed(message)),
+        };
+        let line = match &target {
+            Some((path, line)) if state.seek(path, *line) => u64::from(*line),
+            _ => 1,
+        };
+        // A file open is exactly the moment a session the user quit out of
+        // should come back -- see `Self::ensure_nvim_session`. No-op when
+        // the current one is still alive.
+        self.ensure_nvim_session();
+        self.send_threads_to_nvim();
+        if let Some(nvim) = self.nvim.as_mut() {
+            if nvim.is_alive() {
+                if let Some(file) = state.current_file() {
+                    nvim.open_file(file.path.clone(), Some(line), file.changed_ranges.clone());
+                }
+            }
+        }
+        self.dispatch(Msg::FileLoaded(state));
+    }
+
+    /// [`Cmd::FetchThreads`]: start a background fetch from
+    /// [`Self::thread_source`], replacing any still in flight, and show the
+    /// reducer's "fetching" status. With no source, report straight back
+    /// that fetching is disabled so that status never sticks.
+    fn fetch_threads(&mut self) {
+        match &self.thread_source {
+            Some(source) => {
+                self.thread_fetcher = Some(ThreadFetcher::spawn(source.clone()));
+                self.notice = self.app.threads.status.clone();
+            }
+            None => {
+                self.dispatch(Msg::ThreadsFetched {
+                    result: Err("thread fetching is disabled".into()),
+                    local_head: None,
+                });
+                self.notice = self.app.threads.status.clone();
+            }
+        }
+    }
+
+    /// Fold a finished thread fetch in through [`Msg::ThreadsFetched`],
+    /// show its status as the notice, and refresh the inline threads in the
+    /// embedded session. A no-op while nothing is in flight or the fetch is
+    /// still running. Called every [`event_loop`] tick.
+    fn poll_thread_fetch(&mut self) {
+        let Some(outcome) = self
+            .thread_fetcher
+            .as_ref()
+            .and_then(ThreadFetcher::try_take)
+        else {
+            return;
+        };
+        self.thread_fetcher = None;
+        self.dispatch(Msg::ThreadsFetched {
+            result: outcome.result,
+            local_head: outcome.local_head,
+        });
+        self.notice = self.app.threads.status.clone();
+        self.send_threads_to_nvim();
+    }
+
+    /// Place the fetched threads inline in the embedded session (see
+    /// [`threads_lua`]; re-sending replaces the old marks). A no-op with no
+    /// threads yet, no session, or a dead one.
+    fn send_threads_to_nvim(&self) {
+        let (Some(nvim), Some(data)) = (&self.nvim, &self.app.threads.data) else {
+            return;
+        };
+        if nvim.is_alive() {
+            nvim.send(NvimCmd::ExecLua(threads_lua(data)));
         }
     }
 
@@ -826,7 +890,12 @@ pub fn run(app: App, config: TuiConfig) -> io::Result<()> {
         comment_target: None,
         nvim,
         nvim_init_cmds: config.nvim_init_cmds,
+        thread_source: config.threads,
+        thread_fetcher: None,
     };
+    if state.thread_source.is_some() {
+        state.dispatch(Msg::RefreshThreads);
+    }
 
     let result = event_loop(&mut terminal, &mut state, config.smoke);
 
@@ -1006,6 +1075,8 @@ fn event_loop(
             None
         };
         let nvim_grid_guard = nvim_grid.as_ref().and_then(|grid| grid.lock().ok());
+
+        state.poll_thread_fetch();
 
         terminal.draw(|frame| {
             render::draw(
@@ -1556,6 +1627,7 @@ mod tests {
     use super::*;
     use crate::core::app::Screen;
     use crate::graph::model::{NodeId, ProjectGraph};
+    use crate::pipeline::gh_threads::FetchOutcome;
     use crate::pipeline::repo::FakeRepo;
     use crossterm::event::KeyModifiers;
     use std::collections::{HashMap, HashSet};
@@ -1611,6 +1683,8 @@ mod tests {
             comment_target: None,
             nvim: None,
             nvim_init_cmds: Vec::new(),
+            thread_source: None,
+            thread_fetcher: None,
         }
     }
 
@@ -1876,6 +1950,69 @@ mod tests {
         handle_key(&mut state, press('d'));
         assert_eq!(state.app.screen, Screen::Graph, "d must not open a diff");
         assert!(state.app.threads.panel_open);
+    }
+
+    #[test]
+    fn fetch_with_no_source_says_so_in_the_notice() {
+        let mut state = state_fixture();
+        state.dispatch(Msg::RefreshThreads);
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("disabled"), "{notice}");
+        assert!(state.thread_fetcher.is_none());
+    }
+
+    #[test]
+    fn a_finished_fetch_lands_in_the_app_and_the_notice() {
+        let mut state = state_fixture();
+        state.thread_fetcher = Some(ThreadFetcher::spawn_with(|| FetchOutcome {
+            result: Ok(pr_threads()),
+            local_head: Some("head".to_string()),
+        }));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.thread_fetcher.is_some() && std::time::Instant::now() < deadline {
+            state.poll_thread_fetch();
+            std::thread::yield_now();
+        }
+        assert_eq!(state.app.threads.data, Some(pr_threads()));
+        assert_eq!(state.notice, state.app.threads.status);
+        assert!(state.notice.is_some());
+    }
+
+    #[test]
+    fn load_file_at_seeks_the_built_in_viewer_to_the_threads_line() {
+        use crate::graph::model::{FileRef, GitStatus, ModuleNode};
+        let mut state = state_fixture();
+        let id = NodeId::from("demo");
+        let file = |path: &str| FileRef {
+            path: PathBuf::from(path),
+            base_blob: None,
+            head_blob: Some("h".to_string()),
+        };
+        state.app.graph.nodes.insert(
+            id.clone(),
+            ModuleNode {
+                id: id.clone(),
+                display_name: "demo".to_string(),
+                parent: None,
+                children: vec![],
+                status: GitStatus::Modified,
+                files: vec![file("a.rs"), file("b.rs")],
+            },
+        );
+        state.loader.repo = Box::new(FakeRepo {
+            head_files: HashMap::from([
+                (PathBuf::from("a.rs"), "1\n2\n".to_string()),
+                (PathBuf::from("b.rs"), "1\n2\n3\n4\n5\n".to_string()),
+            ]),
+            ..FakeRepo::default()
+        });
+        state.execute(Cmd::LoadFileAt {
+            node: id,
+            path: PathBuf::from("b.rs"),
+            line: 4,
+        });
+        let view = state.app.file_view.as_ref().expect("file view loaded");
+        assert_eq!((view.file_index, view.scroll_row), (1, 3));
     }
 
     #[test]
