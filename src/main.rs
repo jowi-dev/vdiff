@@ -69,6 +69,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let requested_repo_path = cli.repo.clone().unwrap_or_else(|| PathBuf::from("."));
 
+    if cli.inbox {
+        return run_inbox(&cli, &requested_repo_path);
+    }
+
     // `--pr <n>` resolves against the caller's actual checkout (that's
     // where `gh`/`git fetch` run), then substitutes a temporary worktree
     // and the PR's base branch for the rest of startup -- see
@@ -103,6 +107,48 @@ fn main() -> ExitCode {
     }
 
     exit_code
+}
+
+/// `--inbox` (issue #36): print the inbox as JSON with `--json`, otherwise
+/// open the picker. Runs before `--pr`/repo handling, since the inbox is
+/// not tied to a change set and `--all-repos` works outside any checkout.
+fn run_inbox(cli: &Cli, repo_path: &Path) -> ExitCode {
+    if !cli.json {
+        return launch_inbox_picker(cli, repo_path);
+    }
+    match vdiff::pipeline::inbox::fetch_inbox(repo_path, cli.all_repos) {
+        Ok(report) => match serde_json::to_string_pretty(&report) {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error serializing inbox: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(feature = "tui")]
+fn launch_inbox_picker(_cli: &Cli, _repo_path: &Path) -> ExitCode {
+    eprintln!("error: the --inbox picker is not implemented yet; use --inbox --json");
+    ExitCode::FAILURE
+}
+
+/// The headless-build (no `tui` feature) counterpart of
+/// [`launch_inbox_picker`]: fail before touching `gh`, pointing at the
+/// `--json` output that does work in this build.
+#[cfg(not(feature = "tui"))]
+fn launch_inbox_picker(_cli: &Cli, _repo_path: &Path) -> ExitCode {
+    eprintln!(
+        "error: vdiff was built without the `tui` feature; the --inbox picker is unavailable in this build (use --inbox --json)"
+    );
+    ExitCode::FAILURE
 }
 
 /// The bulk of vdiff's startup logic: open the repo at `repo_path`, resolve

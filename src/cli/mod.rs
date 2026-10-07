@@ -128,6 +128,32 @@ pub struct Cli {
     /// (see `src/main.rs`'s `launch_tui`).
     #[arg(long, conflicts_with_all = ["dump", "export_comments", "publish_comments"])]
     pub tui: bool,
+    /// Open the review inbox (issue #36): a terminal picker listing open
+    /// PRs that need you -- your review is requested (including
+    /// re-requests), the author pushed commits since your latest review,
+    /// or someone replied on an unresolved review thread you started.
+    /// `Enter` opens the chosen PR via `vdiff --pr <n>` (forwarding
+    /// `--tui`, `--no-nvim`, and `--nvim-cmd`), and closing that session
+    /// returns to a freshly fetched inbox. Scoped to the current repo
+    /// unless `--all-repos` is given. Stateless: everything is recomputed
+    /// from GitHub through `gh` on every run, nothing is written to disk.
+    /// The picker needs the `tui` feature; `--json` does not. See
+    /// [`crate::review::inbox`].
+    #[arg(
+        long,
+        conflicts_with_all = ["pr", "dump", "export_comments", "publish_comments", "findings"]
+    )]
+    pub inbox: bool,
+    /// With `--inbox`, print the inbox as JSON to stdout instead of opening
+    /// the picker, then exit -- for status lines, boards, and pickers in
+    /// other tools. See `docs/inbox-schema.md`.
+    #[arg(long, requires = "inbox")]
+    pub json: bool,
+    /// With `--inbox`, list PRs from every repo you can see instead of only
+    /// the current one. PRs from other repos can be listed but not opened
+    /// from the picker, since `--pr` checks a PR out of the current repo.
+    #[arg(long, requires = "inbox")]
+    pub all_repos: bool,
 }
 
 /// `--dump` output format.
