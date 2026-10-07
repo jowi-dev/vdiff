@@ -62,3 +62,51 @@ fn inbox_json_without_gh_fails_with_a_friendly_message() {
     assert!(stderr.contains("`gh` (GitHub CLI) not found"), "{stderr}");
     assert!(output.stdout.is_empty());
 }
+
+#[test]
+fn opening_a_pr_forwards_repo_and_frontend_flags() {
+    let cli = Cli::try_parse_from([
+        "vdiff",
+        "--inbox",
+        "--repo",
+        "/src/app",
+        "--tui",
+        "--no-nvim",
+        "--nvim-cmd",
+        "set nu",
+        "--nvim-cmd",
+        "Foo",
+    ])
+    .unwrap();
+    assert_eq!(
+        cli.inbox_open_args(42),
+        [
+            "--pr",
+            "42",
+            "--repo",
+            "/src/app",
+            "--tui",
+            "--no-nvim",
+            "--nvim-cmd",
+            "set nu",
+            "--nvim-cmd",
+            "Foo",
+        ]
+    );
+}
+
+#[test]
+fn opening_a_pr_from_a_bare_inbox_is_just_pr() {
+    let cli = Cli::try_parse_from(["vdiff", "--inbox", "--all-repos"]).unwrap();
+    assert_eq!(cli.inbox_open_args(7), ["--pr", "7"]);
+}
+
+#[test]
+fn opened_pr_args_parse_as_a_valid_pr_invocation() {
+    let cli = Cli::try_parse_from(["vdiff", "--inbox", "--tui", "--no-nvim"]).unwrap();
+    let mut args = vec!["vdiff".to_string()];
+    args.extend(cli.inbox_open_args(9));
+    let child = Cli::try_parse_from(args).unwrap();
+    assert_eq!(child.pr, Some(9));
+    assert!(child.tui && !child.nvim && !child.inbox);
+}

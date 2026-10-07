@@ -162,3 +162,27 @@ pub enum DumpFormat {
     Text,
     Json,
 }
+
+impl Cli {
+    /// The arguments `--inbox`'s picker passes to a child `vdiff` to open
+    /// PR `pr`: `--pr <pr>`, plus the `--repo` and frontend flags
+    /// (`--tui`, `--no-nvim`, `--nvim-cmd`) this inbox was started with.
+    pub fn inbox_open_args(&self, pr: u64) -> Vec<String> {
+        let mut args = vec!["--pr".to_string(), pr.to_string()];
+        if let Some(repo) = &self.repo {
+            args.push("--repo".to_string());
+            args.push(repo.to_string_lossy().into_owned());
+        }
+        if self.tui {
+            args.push("--tui".to_string());
+        }
+        if !self.nvim {
+            args.push("--no-nvim".to_string());
+        }
+        for cmd in &self.nvim_cmd {
+            args.push("--nvim-cmd".to_string());
+            args.push(cmd.clone());
+        }
+        args
+    }
+}
