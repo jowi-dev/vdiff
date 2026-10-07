@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use egui::{Align2, Color32, FontId, Pos2, Rect as EguiRect, Sense, StrokeKind, Ui, Vec2};
 
 use crate::core::app::App;
+use crate::core::threads::ThreadsState;
 use crate::graph::layout::{self, LayoutResult, Pos as LPos, Rect as LRect};
 use crate::graph::model::{GitStatus, NodeId, ProjectGraph};
 use crate::graph::test_modules::{
@@ -217,6 +218,7 @@ pub fn show(
         reviewed: &app.reviewed,
         findings: &app.findings,
         comments: &app.comments,
+        threads: &app.threads,
     };
 
     paint_band_separators(&painter, layout, transform, response.rect);
@@ -455,6 +457,9 @@ struct NodeOverlay<'a> {
     /// (top-right), and attached test strip (below `main_rect`) never
     /// touch.
     comments: &'a HashMap<NodeId, Vec<Comment>>,
+    /// GitHub PR review threads (issue #35) -- each node's unresolved count
+    /// is painted by [`paint_gh_threads_badge`] in the bottom-left corner.
+    threads: &'a ThreadsState,
 }
 
 /// Paint `id`'s rect: status fill/border, a left-edge stripe in its
@@ -561,6 +566,13 @@ fn paint_node(
     if let Some(comments) = overlay.comments.get(id) {
         paint_comments_badge(painter, main_rect, transform, comments);
     }
+
+    paint_gh_threads_badge(
+        painter,
+        main_rect,
+        transform,
+        overlay.threads.unresolved_for(id),
+    );
 
     if id == focus {
         painter.rect_stroke(
@@ -680,16 +692,79 @@ fn paint_comments_badge(
     if comments.is_empty() {
         return;
     }
-    let radius = (7.0 * transform.scale.max(0.3)).max(5.0);
-    let center = main_rect.max - Vec2::new(radius + 2.0, radius + 2.0);
-    painter.circle_filled(center, radius, theme::COMMENT_BADGE_COLOR);
+    let radius = count_badge_radius(transform);
+    paint_count_badge(
+        painter,
+        bottom_right_badge_center(main_rect, radius),
+        radius,
+        theme::COMMENT_BADGE_COLOR,
+        comments.len(),
+    );
+}
+
+/// Paint the unresolved GitHub review thread count (issue #35) as a teal
+/// circle in the main rect's bottom-left corner -- the last free corner
+/// (findings top-left, tested top-right, comments bottom-right), so it
+/// never sits on top of the local comment badge it must stay distinct from.
+/// Nothing for a count of zero.
+fn paint_gh_threads_badge(
+    painter: &egui::Painter,
+    main_rect: EguiRect,
+    transform: &Transform,
+    unresolved: usize,
+) {
+    if unresolved == 0 {
+        return;
+    }
+    let radius = count_badge_radius(transform);
+    paint_count_badge(
+        painter,
+        bottom_left_badge_center(main_rect, radius),
+        radius,
+        theme::GH_THREAD_BADGE_COLOR,
+        unresolved,
+    );
+}
+
+/// A count badge's radius at the current zoom, with a floor so it stays
+/// legible zoomed out.
+fn count_badge_radius(transform: &Transform) -> f32 {
+    (7.0 * transform.scale.max(0.3)).max(5.0)
+}
+
+/// Center of a `radius` badge tucked into `rect`'s bottom-right corner.
+fn bottom_right_badge_center(rect: EguiRect, radius: f32) -> Pos2 {
+    rect.max - Vec2::new(radius + 2.0, radius + 2.0)
+}
+
+/// Center of a `radius` badge tucked into `rect`'s bottom-left corner.
+fn bottom_left_badge_center(rect: EguiRect, radius: f32) -> Pos2 {
+    Pos2::new(rect.min.x + radius + 2.0, rect.max.y - radius - 2.0)
+}
+
+/// A filled `color` circle with `count` in white on it.
+fn paint_count_badge(
+    painter: &egui::Painter,
+    center: Pos2,
+    radius: f32,
+    color: Color32,
+    count: usize,
+) {
+    painter.circle_filled(center, radius, color);
     painter.text(
         center,
         Align2::CENTER_CENTER,
-        format!("{}", comments.len()),
+        count.to_string(),
         FontId::proportional((radius * 1.1).max(6.0)),
         Color32::WHITE,
     );
+}
+
+/// The hint row's GitHub thread text: the fetch status (fetching, the
+/// thread summary, or why threads are unavailable), since the GUI has no
+/// other notice line. `None` before any fetch has started.
+fn threads_hint(threads: &ThreadsState) -> Option<String> {
+    threads.status.clone()
 }
 
 /// The legend, anchored to the bottom-LEFT corner of the screen (not
@@ -781,7 +856,7 @@ fn paint_hint_row(
 
     cursor_x = paint_text(
         painter,
-        "Enter: file   d: diff   c: comment   v: review",
+        "Enter: file   d: diff   c: comment   v: review   p: threads",
         cursor_x,
         text_y,
         HINT_COLOR,
@@ -796,6 +871,10 @@ fn paint_hint_row(
     if app.graph.totals.files > 0 {
         let summary = app.graph.totals.summary_line();
         cursor_x = paint_text(painter, &summary, cursor_x, text_y, HINT_COLOR) + 20.0;
+    }
+
+    if let Some(status) = threads_hint(&app.threads) {
+        cursor_x = paint_text(painter, &status, cursor_x, text_y, HINT_COLOR) + 20.0;
     }
 
     if hidden_count > 0 {
@@ -1293,5 +1372,24 @@ mod tests {
 
         let extent = layer_extent(&layout.layers[0], &layout);
         assert_eq!(extent, Some((5.0, 30.0)));
+    }
+
+    #[test]
+    fn gh_thread_badge_sits_in_the_bottom_left_corner_clear_of_comments() {
+        let rect = EguiRect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(110.0, 60.0));
+        let left = bottom_left_badge_center(rect, 6.0);
+        assert_eq!(left, Pos2::new(18.0, 52.0));
+        assert_ne!(left, bottom_right_badge_center(rect, 6.0));
+    }
+
+    #[test]
+    fn hint_row_threads_text_shows_the_status_when_there_is_one() {
+        let mut threads = crate::core::threads::ThreadsState::default();
+        assert_eq!(threads_hint(&threads), None);
+        threads.status = Some("PR #7: 2 threads, 1 unresolved".to_string());
+        assert_eq!(
+            threads_hint(&threads).as_deref(),
+            Some("PR #7: 2 threads, 1 unresolved")
+        );
     }
 }
