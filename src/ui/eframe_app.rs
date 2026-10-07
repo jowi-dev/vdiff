@@ -361,6 +361,7 @@ impl VdiffApp {
                 Err(message) => self.dispatch(Msg::LoadFailed(message)),
             },
             Cmd::LoadFile(node) => self.load_file(node),
+            Cmd::LoadFileAt { node, path, line } => self.load_file_at(node, Some((path, line))),
             Cmd::Relayout => {
                 // `graph`/`show_tests` are exactly what changed to produce
                 // this `Cmd::Relayout` (see `core::app::toggle_tests`), so
@@ -383,8 +384,6 @@ impl VdiffApp {
             }
             Cmd::CommentNode(node) => self.comment_node(node),
             Cmd::PersistReviewState => self.persist_review_state(),
-            // Wired up properly in a later commit.
-            Cmd::LoadFileAt { node, .. } => self.load_file(node),
             Cmd::FetchThreads => self.fetch_threads(),
         }
     }
@@ -470,32 +469,34 @@ impl VdiffApp {
     /// built-in viewer's load, unchanged -- same [`Msg::FileLoaded`]/
     /// [`Msg::FileLoadFailed`] either way.
     fn load_file(&mut self, node: NodeId) {
+        self.load_file_at(node, None);
+    }
+
+    /// [`Self::load_file`], optionally showing `target`'s file at its
+    /// 1-based line instead of the node's first file from the top -- the
+    /// [`Cmd::LoadFileAt`] a GitHub review thread opens with. The built-in
+    /// viewer seeks via [`FileViewState::seek`]; nvim opens the seeked file
+    /// at that line.
+    fn load_file_at(&mut self, node: NodeId, target: Option<(std::path::PathBuf, u32)>) {
+        if self.nvim.as_ref().is_some_and(|nvim| !nvim.is_alive()) {
+            self.respawn_nvim();
+        }
+        let mut state = match self.diff_loader.load_file_view(&self.app.graph, &node) {
+            Ok(state) => state,
+            Err(message) => return self.dispatch(Msg::FileLoadFailed(message)),
+        };
+        let line = match &target {
+            Some((path, line)) if state.seek(path, *line) => u64::from(*line),
+            _ => 1,
+        };
         if self.nvim.is_some() {
-            if self.nvim.as_ref().is_some_and(|nvim| !nvim.is_alive()) {
-                self.respawn_nvim();
+            self.nvim_current_file = state.current_file().map(|file| file.path.clone());
+            self.send_threads_to_nvim();
+            if let (Some(nvim), Some(file)) = (&self.nvim, state.current_file()) {
+                nvim.open_file(file.path.clone(), Some(line), file.changed_ranges.clone());
             }
-            match self.diff_loader.load_file_view(&self.app.graph, &node) {
-                Ok(state) => {
-                    self.nvim_current_file = self
-                        .app
-                        .graph
-                        .node(&node)
-                        .and_then(|module| module.files.first())
-                        .map(|file_ref| file_ref.path.clone());
-                    self.send_threads_to_nvim();
-                    if let (Some(nvim), Some(file)) = (&self.nvim, state.current_file()) {
-                        nvim.open_file(file.path.clone(), Some(1), file.changed_ranges.clone());
-                    }
-                    self.dispatch(Msg::FileLoaded(state));
-                }
-                Err(message) => self.dispatch(Msg::FileLoadFailed(message)),
-            }
-            return;
         }
-        match self.diff_loader.load_file_view(&self.app.graph, &node) {
-            Ok(state) => self.dispatch(Msg::FileLoaded(state)),
-            Err(message) => self.dispatch(Msg::FileLoadFailed(message)),
-        }
+        self.dispatch(Msg::FileLoaded(state));
     }
 
     /// Handle [`Cmd::CommentNode`]: in nvim mode, open the node's file (via
@@ -623,6 +624,7 @@ impl VdiffApp {
             && self.app.screen == Screen::Graph
             && self.app.pane == Pane::Graph
             && self.app.picker.is_none()
+            && !self.app.threads.panel_open
             && self.pending_key.is_none()
     }
 
@@ -1587,5 +1589,18 @@ mod thread_tests {
         }
         assert!(vdiff.thread_fetcher.is_none(), "outcome was taken");
         assert_eq!(vdiff.app.threads.data, Some(empty_threads()));
+    }
+
+    #[test]
+    fn load_file_at_opens_the_built_in_viewer_on_the_threads_file_and_line() {
+        let mut vdiff = vdiff_app(None);
+        vdiff.execute(Cmd::LoadFileAt {
+            node: NodeId::from("rust:demo"),
+            path: PathBuf::from("b.rs"),
+            line: 4,
+        });
+        let view = vdiff.app.file_view.as_ref().expect("file view loaded");
+        assert_eq!(view.file_index, 1);
+        assert_eq!(view.scroll_row, 3);
     }
 }
