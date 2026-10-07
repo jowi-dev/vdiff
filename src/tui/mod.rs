@@ -1987,6 +1987,7 @@ mod tests {
             path: PathBuf::from(path),
             base_blob: None,
             head_blob: Some("h".to_string()),
+            stats: None,
         };
         state.app.graph.nodes.insert(
             id.clone(),

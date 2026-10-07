@@ -1505,6 +1505,7 @@ mod thread_tests {
             path: PathBuf::from(path),
             base_blob: None,
             head_blob: Some(format!("h-{path}")),
+            stats: None,
         };
         let node = ModuleNode {
             id: node_id.clone(),
@@ -1518,6 +1519,7 @@ mod thread_tests {
             nodes: HashMap::from([(node_id.clone(), node)]),
             roots: vec![node_id],
             edges: vec![],
+            totals: Default::default(),
         };
         let head_files = HashMap::from([
             (PathBuf::from("a.rs"), "1\n2\n3\n".to_string()),

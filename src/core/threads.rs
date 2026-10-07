@@ -109,6 +109,7 @@ mod tests {
             nodes: HashMap::new(),
             roots: vec![],
             edges: vec![],
+            totals: Default::default(),
         };
         let thread = |path: &str, resolved: bool| ReviewThread {
             id: path.to_string(),
