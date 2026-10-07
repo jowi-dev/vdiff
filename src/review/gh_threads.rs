@@ -319,6 +319,36 @@ pub fn format_entry(threads: &PrThreads, entry: ThreadEntry) -> String {
     }
 }
 
+/// One-line summary for a notice: the PR number, thread count, and how
+/// many are unresolved.
+pub fn status_line(threads: &PrThreads) -> String {
+    let unresolved = threads.threads.iter().filter(|t| !t.is_resolved).count();
+    let noun = if threads.threads.len() == 1 {
+        "thread"
+    } else {
+        "threads"
+    };
+    format!(
+        "PR #{}: {} {noun}, {unresolved} unresolved",
+        threads.pr_number,
+        threads.threads.len()
+    )
+}
+
+/// A warning when `local_head` isn't the PR's head commit: thread lines
+/// are relative to the PR head, so unpushed (or unpulled) commits can make
+/// them drift. Detection only -- remapping lines is out of scope. `None`
+/// when they match or the local head is unknown.
+pub fn drift_warning(threads: &PrThreads, local_head: Option<&str>) -> Option<String> {
+    let local = local_head?;
+    (local != threads.head_oid).then(|| {
+        format!(
+            "local HEAD differs from PR #{}'s head; thread lines may be off",
+            threads.pr_number
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +513,22 @@ mod tests {
         assert_eq!(
             format_entry(&t, ThreadEntry::Thread(1)),
             "src/b.rs  @ghost  old  [outdated]"
+        );
+    }
+
+    #[test]
+    fn status_line_counts_threads_and_unresolved() {
+        assert_eq!(status_line(&parsed()), "PR #35: 3 threads, 2 unresolved");
+    }
+
+    #[test]
+    fn drift_warning_only_when_local_head_differs() {
+        let t = parsed();
+        assert_eq!(drift_warning(&t, Some("abc123")), None);
+        assert_eq!(drift_warning(&t, None), None);
+        assert_eq!(
+            drift_warning(&t, Some("def456")).as_deref(),
+            Some("local HEAD differs from PR #35's head; thread lines may be off")
         );
     }
 
