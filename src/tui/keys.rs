@@ -25,7 +25,7 @@ use crate::keymap::KeyInput;
 /// GUI -- still resolves); with `Ctrl` held otherwise, only `w`/`d`/`u` map
 /// to anything ([`KeyInput::Ctrl`]); everything else falls through to the
 /// plain-character table [`map_key`] actually understands
-/// (h/j/k/l/g/G/d/r/t/s/c/v/f/[/]), plus `Enter`/`Esc`.
+/// (h/j/k/l/g/G/d/r/t/s/c/v/f/p/[/]), plus `Enter`/`Esc`.
 pub fn crossterm_key_to_input(code: KeyCode, modifiers: KeyModifiers) -> Option<KeyInput> {
     if let Some(dir) = arrow_direction(code) {
         return Some(KeyInput::Arrow(dir));
@@ -48,7 +48,7 @@ pub fn crossterm_key_to_input(code: KeyCode, modifiers: KeyModifiers) -> Option<
     }
     match code {
         KeyCode::Char(
-            c @ ('h' | 'j' | 'k' | 'l' | 'g' | 'G' | 'd' | 'r' | 't' | 's' | 'c' | 'v' | 'f' | '['
+            c @ ('h' | 'j' | 'k' | 'l' | 'g' | 'G' | 'd' | 'r' | 't' | 's' | 'c' | 'v' | 'f' | 'p' | '['
             | ']'
             // `` ` `` and `z` aren't part of `crate::keymap::map_key`'s
             // shared vocabulary at all -- both are intercepted directly by
@@ -111,6 +111,7 @@ mod tests {
             ('`', KeyInput::Char('`')),
             ('z', KeyInput::Char('z')),
             ('o', KeyInput::Char('o')),
+            ('p', KeyInput::Char('p')),
         ];
         for (c, expected) in cases {
             assert_eq!(
