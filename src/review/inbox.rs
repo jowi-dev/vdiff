@@ -65,6 +65,87 @@ pub struct InboxEntry {
     pub unanswered_replies: u32,
 }
 
+impl InboxEntry {
+    /// Why this PR is in the inbox, as one human-readable line listing
+    /// every matching reason, e.g. `"3 new commits since your review, 2
+    /// replies"`.
+    pub fn reason(&self) -> String {
+        let mut parts = Vec::new();
+        if self.review_requested {
+            parts.push("review requested".to_string());
+        }
+        if self.head_changed_since_review {
+            parts.push(match self.new_commits_since_review {
+                Some(1) => "1 new commit since your review".to_string(),
+                Some(n) => format!("{n} new commits since your review"),
+                None => "new commits since your review".to_string(),
+            });
+        }
+        match self.unanswered_replies {
+            0 => {}
+            1 => parts.push("1 reply".to_string()),
+            n => parts.push(format!("{n} replies")),
+        }
+        parts.join(", ")
+    }
+}
+
+/// `vdiff --inbox --json`'s output: the whole inbox plus per-category
+/// counts, so a status line or board can show a number without walking
+/// `entries`. See `docs/inbox-schema.md`.
+#[derive(Debug, Clone, Serialize)]
+pub struct InboxReport {
+    /// The `owner/name` the inbox was limited to, or `null` for
+    /// `--all-repos`.
+    pub scope: Option<String>,
+    pub total: usize,
+    pub counts: InboxCounts,
+    pub entries: Vec<ReportEntry>,
+}
+
+/// Entry count per [`InboxCategory`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct InboxCounts {
+    pub review_requested: usize,
+    pub new_commits: usize,
+    pub replies: usize,
+}
+
+/// An [`InboxEntry`] plus its [`InboxEntry::reason`] line.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReportEntry {
+    #[serde(flatten)]
+    pub entry: InboxEntry,
+    pub reason: String,
+}
+
+impl InboxReport {
+    /// Build the report for `entries` (already sorted, as
+    /// [`parse_inbox_response`] returns them) fetched under `scope`.
+    pub fn new(scope: Option<String>, entries: Vec<InboxEntry>) -> Self {
+        let mut counts = InboxCounts::default();
+        for entry in &entries {
+            match entry.category {
+                InboxCategory::ReviewRequested => counts.review_requested += 1,
+                InboxCategory::NewCommits => counts.new_commits += 1,
+                InboxCategory::Replies => counts.replies += 1,
+            }
+        }
+        Self {
+            scope,
+            total: entries.len(),
+            counts,
+            entries: entries
+                .into_iter()
+                .map(|entry| ReportEntry {
+                    reason: entry.reason(),
+                    entry,
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Everything that can go wrong turning the inbox query's output into
 /// entries.
 #[derive(Debug, Error)]
@@ -467,5 +548,45 @@ mod tests {
     #[test]
     fn invalid_json_is_an_error() {
         assert!(parse_inbox_response("nope", ME).is_err());
+    }
+
+    fn entry() -> InboxEntry {
+        parse(vec![pr(7, "2026-01-01T00:00:00Z")], vec![]).remove(0)
+    }
+
+    #[test]
+    fn reason_lists_every_matching_reason() {
+        let mut e = entry();
+        assert_eq!(e.reason(), "review requested");
+        e.review_requested = false;
+        e.head_changed_since_review = true;
+        e.new_commits_since_review = Some(1);
+        e.unanswered_replies = 1;
+        assert_eq!(e.reason(), "1 new commit since your review, 1 reply");
+        e.new_commits_since_review = Some(3);
+        e.unanswered_replies = 2;
+        assert_eq!(e.reason(), "3 new commits since your review, 2 replies");
+        e.new_commits_since_review = None;
+        e.unanswered_replies = 0;
+        assert_eq!(e.reason(), "new commits since your review");
+    }
+
+    #[test]
+    fn report_serializes_scope_counts_and_entries() {
+        let report = InboxReport::new(Some("o/r".into()), vec![entry()]);
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["scope"], json!("o/r"));
+        assert_eq!(value["total"], json!(1));
+        assert_eq!(
+            value["counts"],
+            json!({ "review_requested": 1, "new_commits": 0, "replies": 0 })
+        );
+        assert_eq!(value["entries"][0]["category"], json!("review_requested"));
+        assert_eq!(value["entries"][0]["reason"], json!("review requested"));
+        assert_eq!(value["entries"][0]["new_commits_since_review"], json!(null));
+
+        let all = serde_json::to_value(InboxReport::new(None, vec![])).unwrap();
+        assert_eq!(all["scope"], json!(null));
+        assert_eq!(all["total"], json!(0));
     }
 }
