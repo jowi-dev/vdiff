@@ -1,7 +1,8 @@
 //! End-to-end test of `vdiff --dump json --include-diffs`: runs the actual
 //! built binary (via `CARGO_BIN_EXE_vdiff`, cargo's standard integration-test
 //! hook) against a git-init'd fixture repo and asserts on the parsed JSON
-//! envelope -- the `diffs` map, not just the graph.
+//! envelope -- the `diffs` map, not just the graph -- plus the
+//! `--include-threads` error paths, which never reach the network.
 
 use std::fs;
 use std::path::Path;
@@ -127,5 +128,47 @@ fn include_diffs_with_dump_text_is_a_friendly_error() {
     assert!(
         stderr.contains("--include-diffs") && stderr.contains("--dump json"),
         "expected a friendly error naming both flags, got: {stderr}"
+    );
+}
+
+#[test]
+fn include_threads_with_dump_text_is_a_friendly_error() {
+    let repo_dir = fixture_repo();
+    let bin = env!("CARGO_BIN_EXE_vdiff");
+    let output = Command::new(bin)
+        .arg("--repo")
+        .arg(repo_dir.path())
+        .arg("--base")
+        .arg("main")
+        .args(["--dump", "text", "--include-threads"])
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {bin}: {err}"));
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--include-threads") && stderr.contains("--dump json"),
+        "expected a friendly error naming both flags, got: {stderr}"
+    );
+}
+
+/// The fixture repo has no GitHub remote, so the fetch fails before any
+/// network call -- whether `gh` is installed, authenticated, or neither.
+#[test]
+fn include_threads_without_a_pr_fails_with_a_message() {
+    let repo_dir = fixture_repo();
+    let bin = env!("CARGO_BIN_EXE_vdiff");
+    let output = Command::new(bin)
+        .arg("--repo")
+        .arg(repo_dir.path())
+        .arg("--base")
+        .arg("main")
+        .args(["--dump", "json", "--include-threads"])
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {bin}: {err}"));
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error fetching GitHub threads"),
+        "expected a fetch error, got: {stderr}"
     );
 }

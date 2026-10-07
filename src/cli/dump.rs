@@ -13,6 +13,11 @@
 //! [`crate::diffing::hunks::FileDiff`]/[`crate::diffing::hunks::DiffHunk`]/
 //! [`crate::diffing::hunks::LinePair`].
 //!
+//! With `--include-threads`, a sibling `"threads"` key carries the PR's
+//! GitHub review threads grouped by node (see
+//! [`crate::review::gh_threads::ThreadsByNode`] and `docs/threads-schema.md`),
+//! absent rather than `null` without the flag, same as `"diffs"`.
+//!
 //! `--dump text` always stays graph-only; it never renders diff content.
 
 use std::collections::HashMap;
@@ -22,6 +27,7 @@ use serde::Serialize;
 use crate::cli::DumpFormat;
 use crate::diffing::hunks::FileDiffEntry;
 use crate::graph::model::{GitStatus, NodeId, ProjectGraph};
+use crate::review::gh_threads::ThreadsByNode;
 
 /// The `--dump json` top-level envelope. See the module docs for the exact
 /// shape with and without `--include-diffs`.
@@ -30,19 +36,26 @@ struct DumpEnvelope<'a> {
     graph: &'a ProjectGraph,
     #[serde(skip_serializing_if = "Option::is_none")]
     diffs: Option<&'a HashMap<String, Vec<FileDiffEntry>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threads: Option<&'a ThreadsByNode>,
 }
 
-/// Render `graph` per `format`. `diffs`, if given, is only used for
-/// [`DumpFormat::Json`] -- [`DumpFormat::Text`] ignores it and stays
-/// graph-only.
+/// Render `graph` per `format`. `diffs` and `threads`, if given, are only
+/// used for [`DumpFormat::Json`] -- [`DumpFormat::Text`] ignores them and
+/// stays graph-only.
 pub fn render(
     graph: &ProjectGraph,
     format: DumpFormat,
     diffs: Option<&HashMap<String, Vec<FileDiffEntry>>>,
+    threads: Option<&ThreadsByNode>,
 ) -> String {
     match format {
         DumpFormat::Json => {
-            let envelope = DumpEnvelope { graph, diffs };
+            let envelope = DumpEnvelope {
+                graph,
+                diffs,
+                threads,
+            };
             serde_json::to_string_pretty(&envelope).expect("DumpEnvelope serializes")
         }
         DumpFormat::Text => render_text(graph),
@@ -152,7 +165,7 @@ mod tests {
 
     #[test]
     fn text_renders_indented_status_letters_in_name_sorted_order() {
-        let output = render(&fixture(), DumpFormat::Text, None);
+        let output = render(&fixture(), DumpFormat::Text, None, None);
         assert_eq!(output, "M app\n  A alpha\n  D zeta");
     }
 
@@ -161,7 +174,7 @@ mod tests {
     #[test]
     fn json_envelope_without_diffs_has_only_a_graph_key() {
         let graph = fixture();
-        let output = render(&graph, DumpFormat::Json, None);
+        let output = render(&graph, DumpFormat::Json, None, None);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         let obj = parsed.as_object().unwrap();
         assert_eq!(obj.keys().collect::<Vec<_>>(), vec!["graph"]);
@@ -191,7 +204,7 @@ mod tests {
             }],
         );
 
-        let output = render(&graph, DumpFormat::Json, Some(&diffs));
+        let output = render(&graph, DumpFormat::Json, Some(&diffs), None);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         let obj = parsed.as_object().unwrap();
         assert!(obj.contains_key("diffs"));
@@ -200,5 +213,27 @@ mod tests {
             obj["diffs"].get("app::zeta").is_none(),
             "node with no scripted diff entry must be absent from the map"
         );
+    }
+
+    /// With `--include-threads`, the envelope gains a `"threads"` object
+    /// (see `ThreadsByNode`); without it, the key is absent.
+    #[test]
+    fn json_envelope_with_threads_includes_the_threads_object() {
+        use crate::review::gh_threads::{group_by_node, PrThreads};
+
+        let graph = fixture();
+        let threads = group_by_node(
+            &graph,
+            &PrThreads {
+                pr_number: 9,
+                ..PrThreads::default()
+            },
+        );
+        let output = render(&graph, DumpFormat::Json, None, Some(&threads));
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["threads"]["pr_number"], 9);
+        assert!(parsed["threads"]["nodes"].is_object());
+        assert!(parsed["threads"]["unmatched"].is_array());
+        assert!(parsed.get("diffs").is_none());
     }
 }

@@ -42,6 +42,11 @@ pub struct Cli {
     /// this flag set is a friendly CLI error, not a silent no-op.
     #[arg(long, requires = "dump")]
     pub include_diffs: bool,
+    /// Include the PR's GitHub review threads, grouped by node, in `--dump
+    /// json` output. Fetched through `gh` for `--pr <n>` or the current
+    /// branch's PR; a fetch failure is an error. Requires `--dump json`.
+    #[arg(long, requires = "dump")]
+    pub include_threads: bool,
     /// Startup self-test: open the GUI window, then close it after a couple
     /// seconds and exit 0. Used to sanity-check that the window opens
     /// without hanging around for a human to close it manually.

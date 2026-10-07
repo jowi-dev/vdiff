@@ -11,7 +11,7 @@
 //! only exist on GitHub's GraphQL API, which is why this parses GraphQL
 //! rather than the REST review-comments endpoint.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -247,6 +247,46 @@ pub fn unresolved_counts(graph: &ProjectGraph, threads: &[ReviewThread]) -> Hash
         }
     }
     counts
+}
+
+/// `--dump json --include-threads`'s `"threads"` value: every thread filed
+/// under each node whose files contain its path (keyed by the node id
+/// string, so a thread on a shared file appears under each node), plus
+/// the threads whose file isn't in the graph and the PR's review
+/// summaries. See `docs/threads-schema.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ThreadsByNode {
+    pub pr_number: u64,
+    pub head_oid: String,
+    pub summaries: Vec<ReviewSummary>,
+    pub nodes: BTreeMap<String, Vec<ReviewThread>>,
+    pub unmatched: Vec<ReviewThread>,
+}
+
+/// Group `threads` by graph node with [`thread_nodes`], for the headless
+/// dump. Thread order within a node follows the fetch order.
+pub fn group_by_node(graph: &ProjectGraph, threads: &PrThreads) -> ThreadsByNode {
+    let mut nodes: BTreeMap<String, Vec<ReviewThread>> = BTreeMap::new();
+    let mut unmatched = Vec::new();
+    for thread in &threads.threads {
+        let ids = thread_nodes(graph, thread);
+        if ids.is_empty() {
+            unmatched.push(thread.clone());
+        }
+        for id in ids {
+            nodes
+                .entry(id.to_string())
+                .or_default()
+                .push(thread.clone());
+        }
+    }
+    ThreadsByNode {
+        pr_number: threads.pr_number,
+        head_oid: threads.head_oid.clone(),
+        summaries: threads.summaries.clone(),
+        nodes,
+        unmatched,
+    }
 }
 
 /// One row of the thread list panel: an index into
@@ -486,6 +526,20 @@ mod tests {
         let counts = unresolved_counts(&graph(), &parsed().threads);
         assert_eq!(counts.get(&NodeId::from("a")), Some(&1));
         assert_eq!(counts.get(&NodeId::from("b")), Some(&1));
+    }
+
+    #[test]
+    fn group_by_node_files_threads_under_every_matching_node() {
+        let mut t = parsed();
+        t.threads[1].path = "nowhere.rs".to_string();
+        let grouped = group_by_node(&graph(), &t);
+        assert_eq!(grouped.pr_number, 35);
+        let a: Vec<&str> = grouped.nodes["a"].iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(a, vec!["T1", "T3"]);
+        assert!(!grouped.nodes.contains_key("b"));
+        assert_eq!(grouped.unmatched.len(), 1);
+        assert_eq!(grouped.unmatched[0].id, "T2");
+        assert_eq!(grouped.summaries.len(), 1);
     }
 
     #[test]
