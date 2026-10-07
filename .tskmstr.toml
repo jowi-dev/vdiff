@@ -20,4 +20,4 @@ base_branch = "main"
 # Without this, a lane run falls back to ~/.claude/prompts/vdiff.md, which
 # does not exist. Relative paths resolve against the lane's repo root, so the
 # prompt lives in the repo and is versioned with the code it instructs.
-prompt_file = "prompts/vdiff-lane.md"
+prompt_file = ".tskmstr/prompts/vdiff-lane.md"
