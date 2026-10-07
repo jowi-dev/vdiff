@@ -41,8 +41,10 @@ use crate::core::focus::Direction;
 use crate::graph::layout::{layout_from_layers, LayoutResult};
 use crate::graph::model::{GitStatus, ModuleNode, NodeId, ProjectGraph};
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome, Pending};
+use crate::nvim::gh_threads::threads_lua;
 use crate::nvim::session::NvimCmd;
 use crate::pipeline::file_diff::{changed_head_ranges, load_file_diff};
+use crate::pipeline::gh_threads::{ThreadFetcher, ThreadSource};
 use crate::pipeline::repo::GitRepo;
 use crate::review::comments::map_comments;
 use crate::review::review_state::ReviewStore;
@@ -57,6 +59,10 @@ const SMOKE_DURATION: Duration = Duration::from_secs(2);
 
 /// Scale multiplier applied per `+`/`-` keyboard zoom press.
 const ZOOM_KEY_FACTOR: f32 = 1.2;
+
+/// How often to repaint (and so poll [`ThreadFetcher::try_take`]) while a
+/// GitHub thread fetch is in flight.
+const THREAD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Everything [`Cmd::LoadDiff`] needs to read file content from git: the
 /// repository and the diff base it was resolved against at startup. Lives
@@ -233,6 +239,13 @@ pub struct VdiffApp {
     /// two moments either input can change. See its own doc for why this
     /// isn't just recomputed inline in `show` on every repaint.
     graph_view_cache: GraphViewCache,
+    /// Where [`Cmd::FetchThreads`] fetches GitHub PR review threads from
+    /// (issue #35), or `None` when fetching is disabled (`--smoke`).
+    thread_source: Option<ThreadSource>,
+    /// The GitHub thread fetch in flight, if any -- polled once per frame
+    /// by [`Self::poll_thread_fetch`]. A new [`Cmd::FetchThreads`] replaces
+    /// it, abandoning the older fetch's result.
+    thread_fetcher: Option<ThreadFetcher>,
 }
 
 /// Everything [`VdiffApp::new`] needs to set up (and later respawn) the
@@ -280,7 +293,9 @@ impl VdiffApp {
     /// [`LayoutResult`]. `smoke` enables the self-closing startup self-test
     /// (see the module-level `--smoke` flag in `main.rs`). `diff_loader`
     /// backs [`Cmd::LoadDiff`]. `nvim` carries everything the embedded-nvim
-    /// spike needs -- see [`NvimConfig`]'s doc.
+    /// spike needs -- see [`NvimConfig`]'s doc. With a GitHub thread source
+    /// in `review`, the first thread fetch starts right away (via
+    /// [`Msg::RefreshThreads`]) on a background thread.
     pub fn new(
         app: App,
         layout: LayoutResult,
@@ -290,7 +305,7 @@ impl VdiffApp {
         review: ReviewConfig,
     ) -> Self {
         let graph_view_cache = GraphViewCache::rebuild(&app);
-        Self {
+        let mut vdiff = Self {
             app,
             layout,
             transform: Transform::initial(),
@@ -311,7 +326,13 @@ impl VdiffApp {
             review_store: review.store,
             review_branch: review.branch,
             graph_view_cache,
+            thread_source: review.threads,
+            thread_fetcher: None,
+        };
+        if vdiff.thread_source.is_some() {
+            vdiff.dispatch(Msg::RefreshThreads);
         }
+        vdiff
     }
 
     /// Dispatch `msg` through the pure reducer and execute the resulting
@@ -364,7 +385,56 @@ impl VdiffApp {
             Cmd::PersistReviewState => self.persist_review_state(),
             // Wired up properly in a later commit.
             Cmd::LoadFileAt { node, .. } => self.load_file(node),
-            Cmd::FetchThreads => {}
+            Cmd::FetchThreads => self.fetch_threads(),
+        }
+    }
+
+    /// Handle [`Cmd::FetchThreads`]: start a background fetch from
+    /// [`Self::thread_source`], replacing (and so abandoning) any fetch
+    /// still in flight. With no source, report straight back through
+    /// [`Msg::ThreadsFetched`] that fetching is disabled, so the reducer's
+    /// "fetching" status never sticks.
+    fn fetch_threads(&mut self) {
+        match &self.thread_source {
+            Some(source) => self.thread_fetcher = Some(ThreadFetcher::spawn(source.clone())),
+            None => self.dispatch(Msg::ThreadsFetched {
+                result: Err("thread fetching is disabled".into()),
+                local_head: None,
+            }),
+        }
+    }
+
+    /// Take the in-flight thread fetch's outcome if it has finished, fold
+    /// it in through [`Msg::ThreadsFetched`], and refresh the inline
+    /// threads in the embedded nvim session (see
+    /// [`Self::send_threads_to_nvim`]). A no-op while nothing is in flight
+    /// or the fetch is still running.
+    fn poll_thread_fetch(&mut self) {
+        let Some(outcome) = self
+            .thread_fetcher
+            .as_ref()
+            .and_then(ThreadFetcher::try_take)
+        else {
+            return;
+        };
+        self.thread_fetcher = None;
+        self.dispatch(Msg::ThreadsFetched {
+            result: outcome.result,
+            local_head: outcome.local_head,
+        });
+        self.send_threads_to_nvim();
+    }
+
+    /// Place the fetched GitHub threads inline in the embedded nvim session
+    /// as virtual lines (see [`threads_lua`]; re-sending replaces the old
+    /// marks). A no-op with no threads yet, outside nvim mode, or with a
+    /// dead session -- [`Self::load_file`] re-sends after a respawn.
+    fn send_threads_to_nvim(&self) {
+        let (Some(nvim), Some(data)) = (&self.nvim, &self.app.threads.data) else {
+            return;
+        };
+        if nvim.is_alive() {
+            nvim.send(NvimCmd::ExecLua(threads_lua(data)));
         }
     }
 
@@ -412,6 +482,7 @@ impl VdiffApp {
                         .node(&node)
                         .and_then(|module| module.files.first())
                         .map(|file_ref| file_ref.path.clone());
+                    self.send_threads_to_nvim();
                     if let (Some(nvim), Some(file)) = (&self.nvim, state.current_file()) {
                         nvim.open_file(file.path.clone(), Some(1), file.changed_ranges.clone());
                     }
@@ -846,7 +917,8 @@ impl VdiffApp {
 
 impl eframe::App for VdiffApp {
     /// Non-painting logic, called once before [`Self::ui`] each frame: the
-    /// `--smoke` self-close timer and key-event handling.
+    /// `--smoke` self-close timer, polling the nvim/GitHub-thread
+    /// background channels, and key-event handling.
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         if self.smoke {
             if self.started_at.elapsed() > SMOKE_DURATION {
@@ -858,6 +930,12 @@ impl eframe::App for VdiffApp {
         self.reclaim_focus_from_dead_nvim();
         self.poll_vdiff_diff_requests();
         self.poll_comment_saved();
+        self.poll_thread_fetch();
+        if self.thread_fetcher.is_some() {
+            // `try_take` is a poll, not a wakeup: keep frames coming so the
+            // result lands without waiting for user input.
+            ctx.request_repaint_after(THREAD_POLL_INTERVAL);
+        }
         self.handle_keys(ctx);
         self.handle_zoom_keys(ctx);
     }
@@ -1359,5 +1437,155 @@ mod tests {
         assert!(file.deleted);
         assert_eq!(file.lines, vec!["old content"]);
         assert!(file.changed_ranges.is_empty(), "no head content to mark up");
+    }
+}
+
+#[cfg(test)]
+mod thread_tests {
+    use super::*;
+    use crate::core::threads::FETCHING_STATUS;
+    use crate::pipeline::gh_threads::{FetchOutcome, ThreadFetcher, ThreadSource};
+    use crate::pipeline::repo::FakeRepo;
+    use crate::review::gh_threads::PrThreads;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    /// One modified node `rust:demo` backed by `a.rs` (3 lines) and `b.rs`
+    /// (5 lines), with no base content -- enough for `load_file_view` to
+    /// build a real two-file `FileViewState`.
+    fn demo_graph_and_repo() -> (ProjectGraph, FakeRepo) {
+        use crate::graph::model::{FileRef, GitStatus, ModuleNode};
+
+        let node_id = NodeId::from("rust:demo");
+        let file = |path: &str| FileRef {
+            path: PathBuf::from(path),
+            base_blob: None,
+            head_blob: Some(format!("h-{path}")),
+        };
+        let node = ModuleNode {
+            id: node_id.clone(),
+            display_name: "demo".to_string(),
+            parent: None,
+            children: vec![],
+            status: GitStatus::Modified,
+            files: vec![file("a.rs"), file("b.rs")],
+        };
+        let graph = ProjectGraph {
+            nodes: HashMap::from([(node_id.clone(), node)]),
+            roots: vec![node_id],
+            edges: vec![],
+        };
+        let head_files = HashMap::from([
+            (PathBuf::from("a.rs"), "1\n2\n3\n".to_string()),
+            (PathBuf::from("b.rs"), "1\n2\n3\n4\n5\n".to_string()),
+        ]);
+        let repo = FakeRepo {
+            default_base_oid: "base-oid".to_string(),
+            head_files,
+            ..Default::default()
+        };
+        (graph, repo)
+    }
+
+    /// A built-in-viewer (`nvim: None`) [`VdiffApp`] over
+    /// [`demo_graph_and_repo`], fetching threads from `threads`.
+    fn vdiff_app(threads: Option<ThreadSource>) -> VdiffApp {
+        let (graph, repo) = demo_graph_and_repo();
+        let layout = crate::graph::layout::layout(&graph);
+        let rows = crate::graph::layout::rows_with_x_centers(&layout);
+        let app = App {
+            graph,
+            layers: layout.layers.clone(),
+            rows,
+            focus: NodeId::from("rust:demo"),
+            screen: Screen::Graph,
+            diff: None,
+            picker: None,
+            show_tests: false,
+            file_view: None,
+            pane: Pane::Graph,
+            viewport_rows: 20,
+            reviewed: Default::default(),
+            findings: Default::default(),
+            comments: Default::default(),
+            fold_collapsed: Default::default(),
+            fn_index: Default::default(),
+            fn_expanded: Default::default(),
+            threads: Default::default(),
+        };
+        VdiffApp::new(
+            app,
+            layout,
+            false,
+            DiffLoader {
+                repo: Box::new(repo),
+                base_oid: "base-oid".to_string(),
+            },
+            NvimConfig {
+                pane: None,
+                cwd: PathBuf::from("."),
+                init_cmds: vec![],
+                egui_ctx: Context::default(),
+            },
+            ReviewConfig {
+                store: ReviewStore::default(),
+                branch: "main".to_string(),
+                threads,
+            },
+        )
+    }
+
+    fn empty_threads() -> PrThreads {
+        PrThreads {
+            pr_number: 7,
+            head_oid: "head".to_string(),
+            threads: vec![],
+            summaries: vec![],
+        }
+    }
+
+    #[test]
+    fn refresh_with_no_source_ends_with_a_non_fetching_status() {
+        let mut vdiff = vdiff_app(None);
+        vdiff.dispatch(Msg::RefreshThreads);
+        let status = vdiff.app.threads.status.as_deref();
+        assert!(status.is_some(), "a refresh always reports something");
+        assert_ne!(status, Some(FETCHING_STATUS));
+        assert!(vdiff.thread_fetcher.is_none());
+    }
+
+    #[test]
+    fn construction_with_a_source_starts_fetching() {
+        let vdiff = vdiff_app(Some(ThreadSource {
+            // Not a repo: the background `gh` call fails, which this test
+            // never waits for.
+            repo_path: PathBuf::from("/nonexistent/vdiff-test"),
+            pr: Some(1),
+        }));
+        assert_eq!(vdiff.app.threads.status.as_deref(), Some(FETCHING_STATUS));
+        assert!(vdiff.thread_fetcher.is_some());
+    }
+
+    #[test]
+    fn construction_without_a_source_leaves_threads_alone() {
+        let vdiff = vdiff_app(None);
+        assert_eq!(vdiff.app.threads.status, None);
+        assert!(vdiff.thread_fetcher.is_none());
+    }
+
+    #[test]
+    fn polling_a_finished_fetch_folds_it_into_the_app() {
+        let mut vdiff = vdiff_app(None);
+        vdiff.thread_fetcher = Some(ThreadFetcher::spawn_with(|| FetchOutcome {
+            result: Ok(empty_threads()),
+            local_head: Some("head".to_string()),
+        }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while vdiff.thread_fetcher.is_some() && Instant::now() < deadline {
+            vdiff.poll_thread_fetch();
+            std::thread::yield_now();
+        }
+        assert!(vdiff.thread_fetcher.is_none(), "outcome was taken");
+        assert_eq!(vdiff.app.threads.data, Some(empty_threads()));
     }
 }
