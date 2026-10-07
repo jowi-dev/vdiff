@@ -194,6 +194,9 @@ pub struct TuiConfig {
     /// deliberately loads their real config rather than `--clean`.
     /// Ignored (silently) when [`Self::nvim_enabled`] is `false`.
     pub nvim_init_cmds: Vec<String>,
+    /// Where to fetch GitHub PR review threads from (issue #35), or `None`
+    /// to never fetch (`--smoke`).
+    pub threads: Option<crate::pipeline::gh_threads::ThreadSource>,
 }
 
 /// Owns [`App`] and everything [`TuiConfig`] carried in, driving the

@@ -270,6 +270,9 @@ pub struct ReviewConfig {
     pub store: ReviewStore,
     /// The current branch name (see [`GitRepo::current_branch`]).
     pub branch: String,
+    /// Where to fetch GitHub PR review threads from (issue #35), or `None`
+    /// to never fetch (`--smoke`).
+    pub threads: Option<crate::pipeline::gh_threads::ThreadSource>,
 }
 
 impl VdiffApp {

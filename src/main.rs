@@ -14,6 +14,7 @@ use vdiff::graph::layout::layout_as_drawn;
 use vdiff::graph::model::{NodeId, ProjectGraph};
 #[cfg(any(feature = "gui", feature = "tui"))]
 use vdiff::nvim::session::nvim_available;
+use vdiff::pipeline::gh_threads::ThreadSource;
 use vdiff::pipeline::git2_repo::Git2Repo;
 use vdiff::pipeline::pr::{resolve_pr_base_ref, PrCheckout};
 use vdiff::pipeline::publish::{changed_ranges_for_paths, post_review, repo_name_with_owner};
@@ -54,6 +55,10 @@ struct ReviewSetup {
     /// comments are vdiff's own bookkeeping rather than an agent-contract
     /// artifact.
     comments: Comments,
+    /// Where the frontend fetches GitHub PR review threads from (issue #35):
+    /// the checked-out branch's PR, or `--pr <n>`'s. `None` under
+    /// `--smoke`, which must never reach the network.
+    threads: Option<ThreadSource>,
 }
 
 /// `--findings <path>`'s already-loaded-and-mapped result (see
@@ -285,6 +290,10 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
                 branch: repo.current_branch(),
                 findings,
                 comments,
+                threads: (!cli.smoke).then(|| ThreadSource {
+                    repo_path: repo_path.to_path_buf(),
+                    pr: cli.pr,
+                }),
             };
             if cli.tui {
                 launch_tui(
@@ -411,6 +420,7 @@ fn launch_tui(
         branch,
         findings,
         comments,
+        threads,
     } = review_setup;
     // The TUI's rail view never consults layout rects (see
     // `vdiff::tui`'s module doc) -- only `layers`/`rows`, both already
@@ -445,6 +455,7 @@ fn launch_tui(
         dense_fold_seeded,
         nvim_enabled,
         nvim_init_cmds: nvim_cmd,
+        threads,
     };
 
     match vdiff::tui::run(app, config) {
@@ -865,6 +876,7 @@ fn run_gui(
         branch,
         findings,
         comments,
+        threads,
     } = review_setup;
     if want_nvim && !nvim_available() {
         eprintln!("warning: nvim mode is on by default but no `nvim` binary was found on PATH; falling back to the built-in file viewer");
@@ -926,6 +938,7 @@ fn run_gui(
                 ReviewConfig {
                     store: review_store,
                     branch,
+                    threads,
                 },
             )))
         }),
