@@ -50,6 +50,10 @@
 //! [`TuiState::ensure_nvim_session`] -- a session the user quit out of;
 //! see [`TuiState::nvim`]'s doc).
 //!
+//! [`inbox`] is separate from the graph frontend: `--inbox`'s full-screen
+//! review-inbox picker (issue #36), which owns its own terminal session and
+//! opens each PR as a child `vdiff --pr` process rather than through [`run`].
+//!
 //! Event-driven, not per-frame polled: [`event_loop`] blocks on
 //! `crossterm::event::poll` and only redraws on an actual state change (a
 //! dispatched message) or the periodic tick used for `--smoke`'s self-close
