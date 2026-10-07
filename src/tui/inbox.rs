@@ -241,7 +241,7 @@ pub fn draw(frame: &mut Frame, picker: &InboxPicker) {
 /// a review session for a PR number while this picker's terminal is
 /// suspended, returning an optional note or an error message for the
 /// status line. The terminal is restored on every exit path, and by the
-/// shared panic hook on a panic (see [`super::install_panic_hook`]).
+/// shared panic hook on a panic (`tui::install_panic_hook`).
 pub fn run(
     picker: InboxPicker,
     fetch: impl FnMut() -> Result<InboxReport, String>,
