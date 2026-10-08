@@ -1,0 +1,112 @@
+//! `--inbox` (issue #36) parsing/conflict rules plus its headless JSON
+//! path's failure mode when `gh` is missing. Clap validates flag
+//! combinations before any feature-gated code runs, so these run the same
+//! in every feature combination. See `tests/cli_inbox_feature_gate.rs` for
+//! the picker's "no `tui` feature" behavior.
+
+use std::process::Command;
+
+use clap::Parser;
+use tempfile::TempDir;
+use vdiff::cli::Cli;
+
+#[test]
+fn inbox_flags_parse_and_default_off() {
+    let cli = Cli::try_parse_from(["vdiff"]).unwrap();
+    assert!(!cli.inbox && !cli.json && !cli.all_repos);
+
+    let cli = Cli::try_parse_from(["vdiff", "--inbox", "--json", "--all-repos"]).unwrap();
+    assert!(cli.inbox && cli.json && cli.all_repos);
+}
+
+#[test]
+fn json_and_all_repos_require_inbox() {
+    assert!(Cli::try_parse_from(["vdiff", "--json"]).is_err());
+    assert!(Cli::try_parse_from(["vdiff", "--all-repos"]).is_err());
+}
+
+#[test]
+fn inbox_combines_with_tui_and_no_nvim_for_the_opened_pr() {
+    let cli = Cli::try_parse_from(["vdiff", "--inbox", "--tui", "--no-nvim"]).unwrap();
+    assert!(cli.inbox && cli.tui && !cli.nvim);
+}
+
+#[test]
+fn inbox_conflicts_with_other_modes() {
+    for other in [
+        &["--pr", "1"][..],
+        &["--dump", "json"],
+        &["--export-comments"],
+        &["--publish-comments", "1"],
+        &["--findings", "f.json"],
+    ] {
+        let mut args = vec!["vdiff", "--inbox"];
+        args.extend_from_slice(other);
+        assert!(
+            Cli::try_parse_from(&args).is_err(),
+            "--inbox should conflict with {other:?}"
+        );
+    }
+}
+
+#[test]
+fn inbox_json_without_gh_fails_with_a_friendly_message() {
+    let empty_path = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_vdiff"))
+        .args(["--inbox", "--json"])
+        .env("PATH", empty_path.path())
+        .output()
+        .expect("run vdiff");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("`gh` (GitHub CLI) not found"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn opening_a_pr_forwards_repo_and_frontend_flags() {
+    let cli = Cli::try_parse_from([
+        "vdiff",
+        "--inbox",
+        "--repo",
+        "/src/app",
+        "--tui",
+        "--no-nvim",
+        "--nvim-cmd",
+        "set nu",
+        "--nvim-cmd",
+        "Foo",
+    ])
+    .unwrap();
+    assert_eq!(
+        cli.inbox_open_args(42),
+        [
+            "--pr",
+            "42",
+            "--repo",
+            "/src/app",
+            "--tui",
+            "--no-nvim",
+            "--nvim-cmd",
+            "set nu",
+            "--nvim-cmd",
+            "Foo",
+        ]
+    );
+}
+
+#[test]
+fn opening_a_pr_from_a_bare_inbox_is_just_pr() {
+    let cli = Cli::try_parse_from(["vdiff", "--inbox", "--all-repos"]).unwrap();
+    assert_eq!(cli.inbox_open_args(7), ["--pr", "7"]);
+}
+
+#[test]
+fn opened_pr_args_parse_as_a_valid_pr_invocation() {
+    let cli = Cli::try_parse_from(["vdiff", "--inbox", "--tui", "--no-nvim"]).unwrap();
+    let mut args = vec!["vdiff".to_string()];
+    args.extend(cli.inbox_open_args(9));
+    let child = Cli::try_parse_from(args).unwrap();
+    assert_eq!(child.pr, Some(9));
+    assert!(child.tui && !child.nvim && !child.inbox);
+}

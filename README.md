@@ -36,10 +36,11 @@ independent of each other: `gui` (the egui/eframe graph-canvas GUI) and
 --graph`-style vertical rail DAG of every visible module, rather than the
 2D graph canvas). A
 `--no-default-features` build is fully headless: no window or terminal UI
-ever opens, and `--dump`/`--export-comments`/`--publish-comments` are the
-only usable entry points -- any invocation that would otherwise launch a
-frontend (bare `vdiff`, `--tui`, `--smoke`, `--pr` without a headless flag,
-...) exits 1 with a message naming the missing feature instead.
+ever opens, and `--dump`/`--export-comments`/`--publish-comments`/`--inbox
+--json` are the only usable entry points -- any invocation that would
+otherwise launch a frontend (bare `vdiff`, `--tui`, `--smoke`, `--pr` without
+a headless flag, the `--inbox` picker, ...) exits 1 with a message naming
+the missing feature instead.
 
 ```sh
 cargo build --release --no-default-features            # headless CLI only, no egui/eframe/ratatui/syntect in the dependency tree
@@ -206,6 +207,42 @@ vdiff reads that store back out with:
 ```sh
 vdiff --export-comments   # print every captured comment as markdown
 ```
+
+## Review inbox
+
+`vdiff --inbox` lists the open PRs that need you, so circling back to
+reviews doesn't depend on notifications or browser tabs. A PR shows up when:
+
+- **your review is requested**, including when the author re-requests it;
+- **the author pushed since your latest review** -- the PR's head commit
+  differs from the commit your last submitted review was on, shown with the
+  number of new commits (or just "new commits" after a force-push, when the
+  count can't be known);
+- **someone replied on a thread you started** -- an unresolved review thread
+  you opened has replies from others newer than your own last comment there.
+
+A PR matching several of these is listed once, under the first group, with
+every reason on its row. Each group is sorted by last update.
+
+```sh
+vdiff --inbox                     # picker for the current repo's PRs
+vdiff --inbox --all-repos         # every repo you can see
+vdiff --inbox --tui --no-nvim     # flags after --inbox apply to the PRs it opens
+vdiff --inbox --json              # the same list as JSON, for status lines and boards
+```
+
+In the picker, `j`/`k` move, `Enter` opens the selected PR with `vdiff --pr
+<n>` (forwarding `--repo`, `--tui`, `--no-nvim`, and `--nvim-cmd`), `r`
+refetches, and `q` quits. Closing the opened review returns you to a freshly
+fetched inbox. `--pr` checks PRs out of the current repo, so with
+`--all-repos` a PR from another repo is listed but not opened; the status
+line names the repo to run it from instead.
+
+Everything is computed from GitHub through `gh` on every run, and nothing is
+written to disk: running `--inbox` twice with no GitHub changes in between
+shows the same list. Each search covers the 30 most relevant PRs. The picker
+needs the `tui` feature; `--inbox --json` works in every build. See
+[`docs/inbox-schema.md`](docs/inbox-schema.md) for the JSON shape.
 
 ## AI-review payload
 

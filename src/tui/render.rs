@@ -4775,9 +4775,8 @@ mod tests {
         );
 
         let scroll_x = 10usize;
-        let scrolled =
-            plane_minimap_oracle(&app, graph_area.width, graph_area.height, 0, scroll_x)
-                .expect("map shows");
+        let scrolled = plane_minimap_oracle(&app, graph_area.width, graph_area.height, 0, scroll_x)
+            .expect("map shows");
         assert_ne!(
             scrolled.viewport.x, vp.x,
             "fixture scroll must actually move the mapped viewport"

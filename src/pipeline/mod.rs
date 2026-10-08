@@ -8,6 +8,7 @@ pub mod extract;
 pub mod file_diff;
 pub mod functions;
 pub mod git2_repo;
+pub mod inbox;
 pub mod pr;
 pub mod publish;
 pub mod repo;

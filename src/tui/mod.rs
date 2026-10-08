@@ -50,6 +50,10 @@
 //! [`TuiState::ensure_nvim_session`] -- a session the user quit out of;
 //! see [`TuiState::nvim`]'s doc).
 //!
+//! [`inbox`] is separate from the graph frontend: `--inbox`'s full-screen
+//! review-inbox picker (issue #36), which owns its own terminal session and
+//! opens each PR as a child `vdiff --pr` process rather than through [`run`].
+//!
 //! Event-driven, not per-frame polled: [`event_loop`] blocks on
 //! `crossterm::event::poll` and only redraws on an actual state change (a
 //! dispatched message) or the periodic tick used for `--smoke`'s self-close
@@ -57,6 +61,7 @@
 //! `request_repaint_after` loop can.
 
 pub mod highlight;
+pub mod inbox;
 pub mod keys;
 pub mod loader;
 pub mod minimap;
@@ -639,7 +644,7 @@ enum KeyAction {
 /// [`event_loop`]/[`render`]/dispatch still leaves the caller's shell in a
 /// normal, readable state instead of wedged in raw mode with the panic
 /// message swallowed by the alternate screen.
-fn restore_terminal_best_effort() {
+pub(crate) fn restore_terminal_best_effort() {
     let _ = disable_raw_mode();
     let _ = io::stdout().execute(LeaveAlternateScreen);
 }
@@ -651,7 +656,7 @@ fn restore_terminal_best_effort() {
 /// Installed once per [`run`] call, before `enable_raw_mode` is even
 /// called, so a panic during terminal setup itself is covered too, not
 /// just ones inside the event loop.
-fn install_panic_hook() {
+pub(crate) fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal_best_effort();

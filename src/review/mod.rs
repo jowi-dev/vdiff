@@ -50,9 +50,18 @@
 //! already been posted (per PR number) so a repeat run doesn't double-post.
 //! The `gh`-shelling-out glue lives in [`crate::pipeline::publish`]; the
 //! sidecar's IO lives in [`store`], alongside `comments.json`'s.
+//!
+//! [`inbox`] is the pure half of `vdiff --inbox` (issue #36): classifying
+//! open PRs into the review inbox (review requested, new commits since the
+//! viewer's last review, replies on the viewer's threads) from one GraphQL
+//! response, plus the `--inbox --json` report shape (see
+//! `docs/inbox-schema.md`). Unlike the rest of this module it reads no
+//! local store and writes nothing: the `gh` glue in
+//! [`crate::pipeline::inbox`] recomputes it from GitHub every run.
 
 pub mod comments;
 pub mod findings;
+pub mod inbox;
 pub mod publish;
 pub mod review_state;
 pub mod store;
