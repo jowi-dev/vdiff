@@ -51,6 +51,12 @@
 //! The `gh`-shelling-out glue lives in [`crate::pipeline::publish`]; the
 //! sidecar's IO lives in [`store`], alongside `comments.json`'s.
 //!
+//! [`gh_threads`] is the pure model for the opposite direction (issue
+//! #35): reading a PR's existing GitHub review threads back in, to badge
+//! them on the graph, list them, and place them inline in nvim. Held in
+//! memory only, never written to disk; the `gh api graphql` glue lives in
+//! [`crate::pipeline::gh_threads`].
+//!
 //! [`inbox`] is the pure half of `vdiff --inbox` (issue #36): classifying
 //! open PRs into the review inbox (review requested, new commits since the
 //! viewer's last review, replies on the viewer's threads) from one GraphQL
@@ -61,6 +67,7 @@
 
 pub mod comments;
 pub mod findings;
+pub mod gh_threads;
 pub mod inbox;
 pub mod publish;
 pub mod review_state;

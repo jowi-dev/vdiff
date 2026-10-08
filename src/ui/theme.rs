@@ -122,6 +122,10 @@ pub fn severity_color(severity: Severity) -> Color32 {
 /// [`leaf_fill`]/[`TESTED_BADGE_COLOR`]/[`severity_color`] hue.
 pub const COMMENT_BADGE_COLOR: Color32 = Color32::from_rgb(0x9d, 0x7c, 0xd8);
 
+/// Fill for the unresolved GitHub review thread count badge (issue #35):
+/// teal, so it never reads as the violet local comment badge.
+pub const GH_THREAD_BADGE_COLOR: Color32 = Color32::from_rgb(0x2a, 0x9d, 0x8f);
+
 /// Screen-space breathing room kept above the topmost node when the graph
 /// first opens (baked into [`crate::ui::graph_view::Transform`]'s default
 /// offset) and preserved by auto-pan (see

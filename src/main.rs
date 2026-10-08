@@ -14,6 +14,7 @@ use vdiff::graph::layout::layout_as_drawn;
 use vdiff::graph::model::{NodeId, ProjectGraph};
 #[cfg(any(feature = "gui", feature = "tui"))]
 use vdiff::nvim::session::nvim_available;
+use vdiff::pipeline::gh_threads::ThreadSource;
 use vdiff::pipeline::git2_repo::Git2Repo;
 use vdiff::pipeline::pr::{resolve_pr_base_ref, PrCheckout};
 use vdiff::pipeline::publish::{changed_ranges_for_paths, post_review, repo_name_with_owner};
@@ -21,6 +22,7 @@ use vdiff::pipeline::repo::GitRepo;
 use vdiff::pipeline::{build_graph, PipelineOptions};
 use vdiff::review::comments::{format_iso8601, map_comments, Comment};
 use vdiff::review::findings::{map_findings, parse_findings, Finding};
+use vdiff::review::gh_threads::{drift_warning, group_by_node};
 use vdiff::review::publish::{
     build_payload, filter_unpublished, partition_comments, render_body, render_plan,
 };
@@ -54,6 +56,10 @@ struct ReviewSetup {
     /// comments are vdiff's own bookkeeping rather than an agent-contract
     /// artifact.
     comments: Comments,
+    /// Where the frontend fetches GitHub PR review threads from (issue #35):
+    /// the checked-out branch's PR, or `--pr <n>`'s. `None` under
+    /// `--smoke`, which must never reach the network.
+    threads: Option<ThreadSource>,
 }
 
 /// `--findings <path>`'s already-loaded-and-mapped result (see
@@ -264,7 +270,7 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
     };
 
     match cli.dump {
-        Some(format) => dump(&graph, format, cli.include_diffs, repo.as_ref(), &base_oid),
+        Some(format) => dump(&graph, format, cli, repo.as_ref(), &base_oid, repo_path),
         None => {
             if graph.nodes.is_empty() {
                 let base_ref = base_override.as_deref().unwrap_or(&base_oid);
@@ -285,6 +291,10 @@ fn run(cli: &Cli, repo_path: &Path, base_override: Option<String>) -> ExitCode {
                 branch: repo.current_branch(),
                 findings,
                 comments,
+                threads: (!cli.smoke).then(|| ThreadSource {
+                    repo_path: repo_path.to_path_buf(),
+                    pr: cli.pr,
+                }),
             };
             if cli.tui {
                 launch_tui(
@@ -411,6 +421,7 @@ fn launch_tui(
         branch,
         findings,
         comments,
+        threads,
     } = review_setup;
     // The TUI's rail view never consults layout rects (see
     // `vdiff::tui`'s module doc) -- only `layers`/`rows`, both already
@@ -445,6 +456,7 @@ fn launch_tui(
         dense_fold_seeded,
         nvim_enabled,
         nvim_init_cmds: nvim_cmd,
+        threads,
     };
 
     match vdiff::tui::run(app, config) {
@@ -697,22 +709,50 @@ fn publish_comments(repo_path: &Path, pr_number: u64, dry_run: bool, republish: 
     ExitCode::SUCCESS
 }
 
-/// `--dump <format>`: render `graph`, computing the `--include-diffs`
-/// payload first if requested. `--include-diffs` with `--dump text` is a
-/// friendly CLI error (clap's `requires = "dump"` only guarantees `--dump`
-/// was given at all, not which format) rather than a silent no-op.
+/// `--dump <format>`: render `graph`, computing the `--include-diffs` and
+/// `--include-threads` payloads first if requested. Either flag with
+/// `--dump text` is a friendly CLI error (clap's `requires = "dump"` only
+/// guarantees `--dump` was given at all, not which format) rather than a
+/// silent no-op. A failed thread fetch is fatal: the flag explicitly asked
+/// for threads, unlike the frontends, which open without them.
 fn dump(
     graph: &ProjectGraph,
     format: cli::DumpFormat,
-    include_diffs: bool,
+    args: &Cli,
     repo: &dyn GitRepo,
     base_oid: &str,
+    repo_path: &Path,
 ) -> ExitCode {
-    if include_diffs && format != cli::DumpFormat::Json {
-        eprintln!("error: --include-diffs requires --dump json");
-        return ExitCode::FAILURE;
+    for (given, flag) in [
+        (args.include_diffs, "--include-diffs"),
+        (args.include_threads, "--include-threads"),
+    ] {
+        if given && format != cli::DumpFormat::Json {
+            eprintln!("error: {flag} requires --dump json");
+            return ExitCode::FAILURE;
+        }
     }
-    let diffs = if include_diffs {
+    let threads = if args.include_threads {
+        let outcome = vdiff::pipeline::gh_threads::fetch(&ThreadSource {
+            repo_path: repo_path.to_path_buf(),
+            pr: args.pr,
+        });
+        match outcome.result {
+            Ok(threads) => {
+                if let Some(warning) = drift_warning(&threads, outcome.local_head.as_deref()) {
+                    eprintln!("warning: {warning}");
+                }
+                Some(group_by_node(graph, &threads))
+            }
+            Err(err) => {
+                eprintln!("error fetching GitHub threads: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    let diffs = if args.include_diffs {
         match vdiff::pipeline::file_diff::diffs_for_graph(repo, base_oid, graph) {
             Ok(diffs) => Some(diffs),
             Err(err) => {
@@ -723,7 +763,10 @@ fn dump(
     } else {
         None
     };
-    println!("{}", cli::render(graph, format, diffs.as_ref()));
+    println!(
+        "{}",
+        cli::render(graph, format, diffs.as_ref(), threads.as_ref())
+    );
     ExitCode::SUCCESS
 }
 
@@ -831,6 +874,7 @@ fn build_initial_app(
         fold_collapsed: std::collections::HashSet::new(),
         fn_index,
         fn_expanded: std::collections::HashSet::new(),
+        threads: Default::default(),
     };
     (app, review_store, layout_result)
 }
@@ -864,6 +908,7 @@ fn run_gui(
         branch,
         findings,
         comments,
+        threads,
     } = review_setup;
     if want_nvim && !nvim_available() {
         eprintln!("warning: nvim mode is on by default but no `nvim` binary was found on PATH; falling back to the built-in file viewer");
@@ -925,6 +970,7 @@ fn run_gui(
                 ReviewConfig {
                     store: review_store,
                     branch,
+                    threads,
                 },
             )))
         }),

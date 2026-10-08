@@ -416,6 +416,7 @@ mod tests {
             fold_collapsed: std::collections::HashSet::new(),
             fn_index: crate::graph::functions::FunctionIndex::default(),
             fn_expanded: std::collections::HashSet::new(),
+            threads: Default::default(),
         }
     }
 

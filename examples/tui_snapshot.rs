@@ -72,6 +72,7 @@ fn main() {
         fold_collapsed: HashSet::new(),
         fn_index: vdiff::graph::functions::FunctionIndex::default(),
         fn_expanded: HashSet::new(),
+        threads: Default::default(),
     };
     let seeded = seed_fold_collapsed_if_dense(&mut app);
     eprintln!(

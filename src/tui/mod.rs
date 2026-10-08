@@ -87,7 +87,9 @@ use crate::core::app::{update, App, Cmd, Msg, Pane, Screen};
 use crate::core::focus::{move_focus, Direction};
 use crate::core::rail_view::RailDirection;
 use crate::keymap::{map_key, KeyContext, KeyInput, KeyOutcome, Pending};
+use crate::nvim::gh_threads::threads_lua;
 use crate::nvim::session::NvimCmd;
+use crate::pipeline::gh_threads::{ThreadFetcher, ThreadSource};
 use crate::review::comments::map_comments;
 use crate::review::review_state::ReviewStore;
 use crate::review::store as review_store;
@@ -194,6 +196,9 @@ pub struct TuiConfig {
     /// deliberately loads their real config rather than `--clean`.
     /// Ignored (silently) when [`Self::nvim_enabled`] is `false`.
     pub nvim_init_cmds: Vec<String>,
+    /// Where to fetch GitHub PR review threads from (issue #35), or `None`
+    /// to never fetch (`--smoke`).
+    pub threads: Option<crate::pipeline::gh_threads::ThreadSource>,
 }
 
 /// Owns [`App`] and everything [`TuiConfig`] carried in, driving the
@@ -312,6 +317,12 @@ struct TuiState {
     /// for [`Self::ensure_nvim_session`]: a respawned session starts with
     /// none of them applied, exactly like the initial spawn did.
     nvim_init_cmds: Vec<String>,
+    /// Where [`Cmd::FetchThreads`] fetches GitHub PR review threads from
+    /// (issue #35, see [`TuiConfig::threads`]), or `None` to never fetch.
+    thread_source: Option<ThreadSource>,
+    /// The GitHub thread fetch in flight, polled every [`event_loop`] tick
+    /// by [`Self::poll_thread_fetch`]. A new fetch replaces it.
+    thread_fetcher: Option<ThreadFetcher>,
 }
 
 impl TuiState {
@@ -335,35 +346,94 @@ impl TuiState {
                 Ok(state) => self.dispatch(Msg::DiffLoaded(state)),
                 Err(message) => self.dispatch(Msg::LoadFailed(message)),
             },
-            Cmd::LoadFile(node) => match self.loader.load_file_view(&self.app.graph, &node) {
-                Ok(state) => {
-                    // A file open is exactly the moment a session the user
-                    // quit out of should come back -- see
-                    // `Self::ensure_nvim_session`. No-op when the current
-                    // one is still alive.
-                    self.ensure_nvim_session();
-                    // Issue #19: mirror the GUI's `VdiffApp::load_file` --
-                    // whenever the embedded session is alive, open the same
-                    // file it just loaded for the hand-rolled viewer
-                    // (same head content, same changed-range marks) so the
-                    // two never disagree about what's showing.
-                    if let Some(nvim) = self.nvim.as_mut() {
-                        if nvim.is_alive() {
-                            if let Some(file) = state.current_file() {
-                                nvim.open_file(
-                                    file.path.clone(),
-                                    Some(1),
-                                    file.changed_ranges.clone(),
-                                );
-                            }
-                        }
-                    }
-                    self.dispatch(Msg::FileLoaded(state));
-                }
-                Err(message) => self.dispatch(Msg::FileLoadFailed(message)),
-            },
+            Cmd::LoadFile(node) => self.load_file_at(&node, None),
+            Cmd::LoadFileAt { node, path, line } => self.load_file_at(&node, Some((path, line))),
             Cmd::CommentNode(node) => self.comment_node(&node),
             Cmd::PersistReviewState => self.persist_review_state(),
+            Cmd::FetchThreads => self.fetch_threads(),
+        }
+    }
+
+    /// [`Cmd::LoadFile`]/[`Cmd::LoadFileAt`]: load `node`'s file view and,
+    /// with a `target`, show that file at its 1-based line (a GitHub review
+    /// thread's anchor) via [`crate::core::file_view::FileViewState::seek`].
+    /// Whenever the embedded session is alive, the same file opens there
+    /// too (issue #19, mirroring the GUI's `VdiffApp::load_file_at`), after
+    /// re-sending the inline threads so a respawned session has them.
+    fn load_file_at(&mut self, node: &crate::graph::model::NodeId, target: Option<(PathBuf, u32)>) {
+        let mut state = match self.loader.load_file_view(&self.app.graph, node) {
+            Ok(state) => state,
+            Err(message) => return self.dispatch(Msg::FileLoadFailed(message)),
+        };
+        let line = match &target {
+            Some((path, line)) if state.seek(path, *line) => u64::from(*line),
+            _ => 1,
+        };
+        // A file open is exactly the moment a session the user quit out of
+        // should come back -- see `Self::ensure_nvim_session`. No-op when
+        // the current one is still alive.
+        self.ensure_nvim_session();
+        self.send_threads_to_nvim();
+        if let Some(nvim) = self.nvim.as_mut() {
+            if nvim.is_alive() {
+                if let Some(file) = state.current_file() {
+                    nvim.open_file(file.path.clone(), Some(line), file.changed_ranges.clone());
+                }
+            }
+        }
+        self.dispatch(Msg::FileLoaded(state));
+    }
+
+    /// [`Cmd::FetchThreads`]: start a background fetch from
+    /// [`Self::thread_source`], replacing any still in flight, and show the
+    /// reducer's "fetching" status. With no source, report straight back
+    /// that fetching is disabled so that status never sticks.
+    fn fetch_threads(&mut self) {
+        match &self.thread_source {
+            Some(source) => {
+                self.thread_fetcher = Some(ThreadFetcher::spawn(source.clone()));
+                self.notice = self.app.threads.status.clone();
+            }
+            None => {
+                self.dispatch(Msg::ThreadsFetched {
+                    result: Err("thread fetching is disabled".into()),
+                    local_head: None,
+                });
+                self.notice = self.app.threads.status.clone();
+            }
+        }
+    }
+
+    /// Fold a finished thread fetch in through [`Msg::ThreadsFetched`],
+    /// show its status as the notice, and refresh the inline threads in the
+    /// embedded session. A no-op while nothing is in flight or the fetch is
+    /// still running. Called every [`event_loop`] tick.
+    fn poll_thread_fetch(&mut self) {
+        let Some(outcome) = self
+            .thread_fetcher
+            .as_ref()
+            .and_then(ThreadFetcher::try_take)
+        else {
+            return;
+        };
+        self.thread_fetcher = None;
+        self.dispatch(Msg::ThreadsFetched {
+            result: outcome.result,
+            local_head: outcome.local_head,
+        });
+        self.notice = self.app.threads.status.clone();
+        self.send_threads_to_nvim();
+    }
+
+    /// Place the fetched threads inline in the embedded session (see
+    /// [`threads_lua`]; re-sending replaces the old marks). A no-op with no
+    /// threads yet, no session, or a dead one.
+    fn send_threads_to_nvim(&self) {
+        let (Some(nvim), Some(data)) = (&self.nvim, &self.app.threads.data) else {
+            return;
+        };
+        if nvim.is_alive() {
+            nvim.send(NvimCmd::ExecLua(threads_lua(data)));
         }
     }
 
@@ -820,7 +890,12 @@ pub fn run(app: App, config: TuiConfig) -> io::Result<()> {
         comment_target: None,
         nvim,
         nvim_init_cmds: config.nvim_init_cmds,
+        thread_source: config.threads,
+        thread_fetcher: None,
     };
+    if state.thread_source.is_some() {
+        state.dispatch(Msg::RefreshThreads);
+    }
 
     let result = event_loop(&mut terminal, &mut state, config.smoke);
 
@@ -1001,6 +1076,8 @@ fn event_loop(
         };
         let nvim_grid_guard = nvim_grid.as_ref().and_then(|grid| grid.lock().ok());
 
+        state.poll_thread_fetch();
+
         terminal.draw(|frame| {
             render::draw(
                 frame,
@@ -1087,8 +1164,10 @@ fn event_loop(
 /// status-line convention rather than lingering until something else
 /// happens to overwrite it.
 ///
-/// `q` quits (unless the edge-picker overlay is open, so `Esc` has first
-/// say over closing that instead); `Ctrl-e` *or* `c` on the file pane
+/// `q` quits (unless the edge picker or the GitHub thread panel is open --
+/// see [`overlay_open`] -- so `Esc` has first say over closing that
+/// instead, and every other interception below stands down for it too);
+/// `Ctrl-e` *or* `c` on the file pane
 /// requests [`KeyAction::EditInNvim`] instead of dispatching through
 /// `map_key` (see [`should_edit_in_nvim`]); `h`/`j`/`k`/`l` on the rail view (see
 /// [`rail_key_msg`]) dispatch the rail-specific messages directly, bypassing
@@ -1113,7 +1192,7 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
         return action;
     }
 
-    if key.code == KeyCode::Char('q') && state.app.picker.is_none() {
+    if key.code == KeyCode::Char('q') && !overlay_open(&state.app) {
         return KeyAction::Quit;
     }
 
@@ -1148,7 +1227,7 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
             state.nvim.is_some(),
             state.app.screen,
             state.app.pane,
-            state.app.picker.is_some(),
+            overlay_open(&state.app),
             state.pending_key.is_some(),
         )
     {
@@ -1181,6 +1260,7 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> KeyAction {
         pane: state.app.pane,
         file_open: state.app.file_view.is_some(),
         picker_open: state.app.picker.is_some(),
+        threads_open: state.app.threads.panel_open,
         pending: state.pending_key,
     };
     let outcome = map_key(input, ctx);
@@ -1335,11 +1415,22 @@ fn diff_target(app: &App) -> crate::graph::model::NodeId {
 fn should_edit_in_nvim(state: &TuiState, input: KeyInput) -> bool {
     (input == KeyInput::Ctrl('e') || input == KeyInput::Char('c'))
         && state.app.pane == Pane::File
+        && !overlay_open(&state.app)
         && state.pending_key.is_none()
 }
 
+/// Whether a modal overlay owns the keyboard: the `gd`/`gr` edge picker or
+/// the GitHub thread panel (issue #35). Every TUI-only interception in
+/// [`handle_key`] (`q`, backtick, `Ctrl-e`/`c`, nvim `d`, and the per-view
+/// `h`/`j`/`k`/`l`/`z` handlers) stands down while this is true, so the
+/// overlay's own keys reach [`map_key`], whose `picker_open`/`threads_open`
+/// contexts take precedence there.
+fn overlay_open(app: &App) -> bool {
+    app.picker.is_some() || app.threads.panel_open
+}
+
 /// Whether `input` is the [`ViewMode`] toggle: backtick, on the graph
-/// screen's graph pane with no picker/chord in progress. Backtick was
+/// screen's graph pane with no overlay (see [`overlay_open`]) or chord in progress. Backtick was
 /// picked over the more obvious `v` (already `Msg::ToggleReviewed`) or `z`
 /// (the canvas's own fold-chord prefix -- see [`canvas_key_msg`]) precisely
 /// because it collides with nothing else bound anywhere in this crate's
@@ -1349,7 +1440,7 @@ fn should_toggle_view_mode(state: &TuiState, input: KeyInput) -> bool {
     input == KeyInput::Char('`')
         && state.app.screen == Screen::Graph
         && state.app.pane == Pane::Graph
-        && state.app.picker.is_none()
+        && !overlay_open(&state.app)
         && state.pending_key.is_none()
 }
 
@@ -1380,13 +1471,13 @@ fn should_toggle_condensed(state: &TuiState, input: KeyInput) -> bool {
 /// collapse/row-step meaning, and folding uses a `z`-prefixed chord
 /// (`zc`/`zo`, vim's own `foldclose`/`foldopen` mnemonic) instead of `h`/`l`
 /// directly, since those two keys are already spoken for by movement here.
-/// `None` outside [`Screen::Graph`]/[`Pane::Graph`], with a picker open, or
+/// `None` outside [`Screen::Graph`]/[`Pane::Graph`], with an overlay open (see [`overlay_open`]), or
 /// with an unrelated chord (`crate::keymap::Pending`) already in progress --
 /// same guard [`rail_key_msg`] uses, for the same reason.
 fn canvas_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
     if state.app.screen != Screen::Graph
         || state.app.pane != Pane::Graph
-        || state.app.picker.is_some()
+        || overlay_open(&state.app)
         || state.pending_key.is_some()
     {
         state.canvas_fold_pending = false;
@@ -1443,7 +1534,7 @@ fn canvas_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
 fn plane_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
     if state.app.screen != Screen::Graph
         || state.app.pane != Pane::Graph
-        || state.app.picker.is_some()
+        || overlay_open(&state.app)
         || state.pending_key.is_some()
     {
         state.canvas_fold_pending = false;
@@ -1491,7 +1582,7 @@ fn plane_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
 /// The rail-view message `input` should dispatch directly, bypassing
 /// `map_key`, or `None` if it isn't one of the four rail-specific keys, or
 /// the context isn't right for them: [`Screen::Graph`]/[`Pane::Graph`] with
-/// no picker open (the picker's own `j`/`k` selection-move must win instead
+/// no overlay open (see [`overlay_open`]: the picker/thread panel's own `j`/`k` must win instead
 /// -- see `map_key`'s picker-open precedence) and no chord in progress
 /// (`h`/`j`/`k`/`l` aren't chord characters themselves, but if some other
 /// chord -- e.g. `g`+? -- is already pending, this key should complete or
@@ -1502,7 +1593,7 @@ fn plane_key_msg(state: &mut TuiState, input: KeyInput) -> Option<Msg> {
 fn rail_key_msg(state: &TuiState, input: KeyInput) -> Option<Msg> {
     if state.app.screen != Screen::Graph
         || state.app.pane != Pane::Graph
-        || state.app.picker.is_some()
+        || overlay_open(&state.app)
         || state.pending_key.is_some()
     {
         return None;
@@ -1536,6 +1627,7 @@ mod tests {
     use super::*;
     use crate::core::app::Screen;
     use crate::graph::model::{NodeId, ProjectGraph};
+    use crate::pipeline::gh_threads::FetchOutcome;
     use crate::pipeline::repo::FakeRepo;
     use crossterm::event::KeyModifiers;
     use std::collections::{HashMap, HashSet};
@@ -1569,6 +1661,7 @@ mod tests {
             fold_collapsed: HashSet::new(),
             fn_index: crate::graph::functions::FunctionIndex::default(),
             fn_expanded: std::collections::HashSet::new(),
+            threads: Default::default(),
         };
         TuiState {
             app,
@@ -1590,6 +1683,8 @@ mod tests {
             comment_target: None,
             nvim: None,
             nvim_init_cmds: Vec::new(),
+            thread_source: None,
+            thread_fetcher: None,
         }
     }
 
@@ -1775,6 +1870,161 @@ mod tests {
             handle_key(&mut state, press('q')),
             KeyAction::Continue
         ));
+    }
+
+    // -- GitHub review thread panel (issue #35) ----------------------------
+
+    fn gh_thread(id: &str, path: &str, line: u32) -> crate::review::gh_threads::ReviewThread {
+        crate::review::gh_threads::ReviewThread {
+            id: id.to_string(),
+            path: path.to_string(),
+            line: Some(line),
+            is_resolved: false,
+            is_outdated: false,
+            comments: vec![crate::review::gh_threads::ThreadComment {
+                author: "rev".to_string(),
+                body: "look here".to_string(),
+            }],
+        }
+    }
+
+    /// Two unresolved threads, `leaf.rs:2` then `target.rs:5` in panel order.
+    fn pr_threads() -> crate::review::gh_threads::PrThreads {
+        crate::review::gh_threads::PrThreads {
+            pr_number: 35,
+            head_oid: "head".to_string(),
+            threads: vec![
+                gh_thread("T1", "leaf.rs", 2),
+                gh_thread("T2", "target.rs", 5),
+            ],
+            summaries: vec![],
+        }
+    }
+
+    /// [`state_with_layered_graph`] focused on `leaf`, in `mode`, with
+    /// [`pr_threads`] fetched and the thread panel opened via `p`.
+    fn state_with_thread_panel(mode: ViewMode) -> TuiState {
+        let mut state = state_with_layered_graph("leaf");
+        state.view_mode = mode;
+        state.dispatch(Msg::ThreadsFetched {
+            result: Ok(pr_threads()),
+            local_head: Some("head".to_string()),
+        });
+        handle_key(&mut state, press('p'));
+        assert!(state.app.threads.panel_open, "p should open the panel");
+        state
+    }
+
+    #[test]
+    fn j_and_k_with_the_thread_panel_open_step_threads_in_every_view() {
+        for mode in [ViewMode::Plane, ViewMode::Canvas, ViewMode::Rail] {
+            let mut state = state_with_thread_panel(mode);
+            assert_eq!(state.app.threads.selected, 0, "{mode:?}");
+            handle_key(&mut state, press('j'));
+            assert_eq!(
+                state.app.threads.selected, 1,
+                "{mode:?}: j must reach ThreadMove"
+            );
+            assert_eq!(state.app.focus, NodeId::from("target"), "{mode:?}");
+            handle_key(&mut state, press('k'));
+            assert_eq!(
+                state.app.threads.selected, 0,
+                "{mode:?}: k must reach ThreadMove"
+            );
+            assert_eq!(state.app.focus, NodeId::from("leaf"), "{mode:?}");
+            assert!(state.app.threads.panel_open, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn graph_only_keys_are_inert_while_the_thread_panel_is_open() {
+        let mut state = state_with_thread_panel(ViewMode::Plane);
+        assert!(matches!(
+            handle_key(&mut state, press('q')),
+            KeyAction::Continue
+        ));
+        handle_key(&mut state, press('`'));
+        assert_eq!(state.view_mode, ViewMode::Plane, "backtick must not cycle");
+        handle_key(&mut state, press('z'));
+        assert!(!state.canvas_fold_pending, "z must not arm a fold chord");
+        handle_key(&mut state, press('d'));
+        assert_eq!(state.app.screen, Screen::Graph, "d must not open a diff");
+        assert!(state.app.threads.panel_open);
+    }
+
+    #[test]
+    fn fetch_with_no_source_says_so_in_the_notice() {
+        let mut state = state_fixture();
+        state.dispatch(Msg::RefreshThreads);
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("disabled"), "{notice}");
+        assert!(state.thread_fetcher.is_none());
+    }
+
+    #[test]
+    fn a_finished_fetch_lands_in_the_app_and_the_notice() {
+        let mut state = state_fixture();
+        state.thread_fetcher = Some(ThreadFetcher::spawn_with(|| FetchOutcome {
+            result: Ok(pr_threads()),
+            local_head: Some("head".to_string()),
+        }));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.thread_fetcher.is_some() && std::time::Instant::now() < deadline {
+            state.poll_thread_fetch();
+            std::thread::yield_now();
+        }
+        assert_eq!(state.app.threads.data, Some(pr_threads()));
+        assert_eq!(state.notice, state.app.threads.status);
+        assert!(state.notice.is_some());
+    }
+
+    #[test]
+    fn load_file_at_seeks_the_built_in_viewer_to_the_threads_line() {
+        use crate::graph::model::{FileRef, GitStatus, ModuleNode};
+        let mut state = state_fixture();
+        let id = NodeId::from("demo");
+        let file = |path: &str| FileRef {
+            path: PathBuf::from(path),
+            base_blob: None,
+            head_blob: Some("h".to_string()),
+            stats: None,
+        };
+        state.app.graph.nodes.insert(
+            id.clone(),
+            ModuleNode {
+                id: id.clone(),
+                display_name: "demo".to_string(),
+                parent: None,
+                children: vec![],
+                status: GitStatus::Modified,
+                files: vec![file("a.rs"), file("b.rs")],
+            },
+        );
+        state.loader.repo = Box::new(FakeRepo {
+            head_files: HashMap::from([
+                (PathBuf::from("a.rs"), "1\n2\n".to_string()),
+                (PathBuf::from("b.rs"), "1\n2\n3\n4\n5\n".to_string()),
+            ]),
+            ..FakeRepo::default()
+        });
+        state.execute(Cmd::LoadFileAt {
+            node: id,
+            path: PathBuf::from("b.rs"),
+            line: 4,
+        });
+        let view = state.app.file_view.as_ref().expect("file view loaded");
+        assert_eq!((view.file_index, view.scroll_row), (1, 3));
+    }
+
+    #[test]
+    fn p_and_esc_close_the_thread_panel() {
+        let mut state = state_with_thread_panel(ViewMode::Rail);
+        handle_key(&mut state, press('p'));
+        assert!(!state.app.threads.panel_open);
+        handle_key(&mut state, press('p'));
+        assert!(state.app.threads.panel_open);
+        handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!state.app.threads.panel_open);
     }
 
     // -- Fix: file-less rows get a notice instead of a dead key (review

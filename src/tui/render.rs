@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use ratatui::layout::{Alignment, Constraint, Direction as LayoutDirection, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::core::app::{App, Pane, Screen};
@@ -215,6 +215,9 @@ pub fn draw(
 
     draw_legend(frame, legend_area, app, notice, dropped_edges, view_mode);
 
+    if app.pane == Pane::Graph && app.screen == Screen::Graph {
+        draw_thread_panel(frame, main_area, app);
+    }
     if app.pane == Pane::Graph {
         draw_picker(frame, area, app);
     }
@@ -594,7 +597,11 @@ pub fn display_line_count(rows: &[(RailRow, usize)]) -> usize {
 
 /// One node's rendered line: a status-colored bullet, `label`, and
 /// trailing badges -- changed-test checkmark, findings count/severity,
-/// comment count, reviewed mark. `label` is `id`'s
+/// local comment count (magenta `💬N`), unresolved GitHub PR review thread
+/// count (cyan `◆N`, issue #35), reviewed mark. Every view's label-width
+/// estimate ([`plain_row_text`], [`plane_leaf_label`]) is derived from
+/// these same spans, so a new badge needs no separate layout math.
+/// `label` is `id`'s
 /// [`rail_view::disambiguated_labels`] entry rather than
 /// `node.display_name` directly, so two distinct ids that happen to share
 /// a bare display name (e.g. two different `docs` directories) render
@@ -634,6 +641,13 @@ fn node_line(app: &App, id: &NodeId, label: &str) -> Line<'static> {
                 Style::default().fg(Color::Magenta),
             ));
         }
+    }
+    let unresolved_threads = app.threads.unresolved_for(id);
+    if unresolved_threads > 0 {
+        spans.push(Span::styled(
+            format!(" ◆{unresolved_threads}"),
+            Style::default().fg(Color::Cyan),
+        ));
     }
     if app.reviewed.contains(id) {
         spans.push(Span::styled(" ✔", Style::default().fg(Color::Cyan)));
@@ -2335,6 +2349,68 @@ fn draw_picker(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(list, popup);
 }
 
+/// Most rows the thread panel shows at once before scrolling.
+const THREAD_PANEL_MAX_ROWS: u16 = 10;
+
+/// The GitHub review thread panel (issue #35), while
+/// [`crate::core::threads::ThreadsState::panel_open`]: a bordered list
+/// docked along the bottom of the graph area (`area`), titled with the
+/// fetch status, the highlighted row reversed like [`draw_picker`]'s, and
+/// the panel's keys on its last line. Docked rather than centered so the
+/// graph focus each `j`/`k` moves stays visible above it. With no rows it
+/// says so instead of drawing an empty box.
+fn draw_thread_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let threads = &app.threads;
+    if !threads.panel_open {
+        return;
+    }
+    let rows = threads.row_labels();
+    let visible = (rows.len() as u16).clamp(1, THREAD_PANEL_MAX_ROWS);
+    // Rows, one key-hint line, and the top/bottom border.
+    let height = (visible + 3).min(area.height);
+    let panel = Rect {
+        x: area.x,
+        y: area.y + area.height - height,
+        width: area.width,
+        height,
+    };
+    let mut lines: Vec<Line> = if rows.is_empty() {
+        vec![Line::from("no threads")]
+    } else {
+        thread_panel_window(threads.selected, rows.len(), visible as usize)
+            .map(|i| {
+                let style = if i == threads.selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                Line::from(Span::styled(rows[i].clone(), style))
+            })
+            .collect()
+    };
+    lines.push(Line::from(Span::styled(
+        "j/k move  Enter open  r refresh  p/Esc close",
+        Style::default().fg(Color::DarkGray),
+    )));
+    let title = match &threads.status {
+        Some(status) => format!(" GitHub threads -- {status} "),
+        None => " GitHub threads ".to_string(),
+    };
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
+        panel,
+    );
+}
+
+/// The `visible`-row slice of a `total`-row list to show so `selected`
+/// stays in view: from the top until the selection passes the last
+/// visible row, then scrolled just enough to keep it on the bottom row.
+fn thread_panel_window(selected: usize, total: usize, visible: usize) -> std::ops::Range<usize> {
+    let start = (selected + 1).saturating_sub(visible);
+    start..(start + visible).min(total)
+}
+
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
@@ -2419,6 +2495,7 @@ mod tests {
             fold_collapsed: HashSet::new(),
             fn_index: crate::graph::functions::FunctionIndex::default(),
             fn_expanded: std::collections::HashSet::new(),
+            threads: Default::default(),
         }
     }
 
@@ -2616,6 +2693,7 @@ mod tests {
             fold_collapsed: HashSet::new(),
             fn_index: crate::graph::functions::FunctionIndex::default(),
             fn_expanded: std::collections::HashSet::new(),
+            threads: Default::default(),
         };
         let text = render_to_string(&app);
         assert!(
@@ -2654,6 +2732,7 @@ mod tests {
             fold_collapsed: collapsed,
             fn_index: crate::graph::functions::FunctionIndex::default(),
             fn_expanded: std::collections::HashSet::new(),
+            threads: Default::default(),
         };
         let text = render_to_string(&app);
         assert!(text.contains("modules"), "expected the fold summary text");
@@ -2701,6 +2780,28 @@ mod tests {
             },
             ns_id,
         )
+    }
+
+    #[test]
+    fn node_line_shows_an_unresolved_github_thread_badge() {
+        let mut app = app_at("leaf");
+        app.threads.unresolved.insert(NodeId::from("target"), 2);
+        let line = node_line(&app, &NodeId::from("target"), "target");
+        let badge = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == " ◆2")
+            .expect("expected a ◆2 thread badge");
+        assert_eq!(badge.style.fg, Some(Color::Cyan));
+        assert!(render_to_string(&app).contains("◆2"));
+    }
+
+    #[test]
+    fn node_line_has_no_thread_badge_when_nothing_is_unresolved() {
+        let mut app = app_at("leaf");
+        app.threads.unresolved.insert(NodeId::from("target"), 0);
+        let line = node_line(&app, &NodeId::from("target"), "target");
+        assert!(!line.spans.iter().any(|s| s.content.contains('◆')));
     }
 
     #[test]
@@ -3062,6 +3163,7 @@ mod tests {
             fold_collapsed: HashSet::new(),
             fn_index: crate::graph::functions::FunctionIndex::default(),
             fn_expanded: std::collections::HashSet::new(),
+            threads: Default::default(),
         }
     }
 
@@ -3221,6 +3323,7 @@ mod tests {
             fold_collapsed: HashSet::new(),
             fn_index: crate::graph::functions::FunctionIndex::default(),
             fn_expanded: std::collections::HashSet::new(),
+            threads: Default::default(),
         }
     }
 
@@ -4913,5 +5016,62 @@ mod tests {
             "no map border expected"
         );
         assert!(!buffer_text(&buffer).contains('▪'));
+    }
+
+    // -- GitHub review thread panel (issue #35) ------------------------------
+
+    fn app_with_thread_panel(open: bool) -> App {
+        use crate::review::gh_threads::{PrThreads, ReviewThread, ThreadComment};
+        let thread = |path: &str| ReviewThread {
+            id: path.to_string(),
+            path: path.to_string(),
+            line: Some(3),
+            is_resolved: false,
+            is_outdated: false,
+            comments: vec![ThreadComment {
+                author: "rev".to_string(),
+                body: "please rename".to_string(),
+            }],
+        };
+        let app = app_at("leaf");
+        let (mut app, _) = crate::core::app::update(
+            app,
+            crate::core::app::Msg::ThreadsFetched {
+                result: Ok(PrThreads {
+                    pr_number: 7,
+                    head_oid: "h".to_string(),
+                    threads: vec![thread("a.rs"), thread("b.rs")],
+                    summaries: vec![],
+                }),
+                local_head: None,
+            },
+        );
+        app.threads.panel_open = open;
+        app.threads.selected = 1;
+        app
+    }
+
+    #[test]
+    fn thread_panel_lists_rows_under_a_titled_border_with_its_keys() {
+        let out = render_to_string(&app_with_thread_panel(true));
+        assert!(out.contains("GitHub threads"), "{out}");
+        assert!(out.contains("PR #7: 2 threads, 2 unresolved"), "{out}");
+        assert!(out.contains("a.rs:3  @rev  please rename"), "{out}");
+        assert!(out.contains("b.rs:3  @rev  please rename"), "{out}");
+        assert!(out.contains("Enter open"), "{out}");
+    }
+
+    #[test]
+    fn thread_panel_is_absent_while_closed() {
+        let out = render_to_string(&app_with_thread_panel(false));
+        assert!(!out.contains("GitHub threads"), "{out}");
+    }
+
+    #[test]
+    fn thread_panel_window_keeps_the_selection_visible() {
+        assert_eq!(thread_panel_window(0, 3, 5), 0..3);
+        assert_eq!(thread_panel_window(2, 10, 4), 0..4);
+        assert_eq!(thread_panel_window(7, 10, 4), 4..8);
+        assert_eq!(thread_panel_window(9, 10, 4), 6..10);
     }
 }

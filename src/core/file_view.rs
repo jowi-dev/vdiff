@@ -6,7 +6,7 @@
 //! [`crate::core::diff_state::DiffPaneState`]'s split for the full-screen
 //! diff pane.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::graph::model::NodeId;
 
@@ -131,6 +131,20 @@ impl FileViewState {
         self.file_index = shifted.clamp(0, max) as usize;
         self.scroll_row = 0;
     }
+
+    /// Show `path` scrolled so 1-based `line` is the top row, clamped to
+    /// the file's last line -- how a GitHub review thread opens the
+    /// built-in viewer at its anchor. Returns `false`, changing nothing,
+    /// when no file backing this node is `path`.
+    pub fn seek(&mut self, path: &Path, line: u32) -> bool {
+        let Some(index) = self.files.iter().position(|f| f.path == path) else {
+            return false;
+        };
+        self.file_index = index;
+        let last = self.total_rows().saturating_sub(1);
+        self.scroll_row = (line.saturating_sub(1) as usize).min(last);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -148,6 +162,36 @@ mod tests {
 
     fn state_with(files: Vec<FileViewEntry>) -> FileViewState {
         FileViewState::new(NodeId::from("n"), files)
+    }
+
+    fn named(path: &str, lines: usize) -> FileViewEntry {
+        FileViewEntry {
+            path: PathBuf::from(path),
+            ..entry(lines, vec![])
+        }
+    }
+
+    #[test]
+    fn seek_selects_the_matching_file_and_scrolls_to_the_line() {
+        let mut s = state_with(vec![named("a.rs", 10), named("b.rs", 10)]);
+        assert!(s.seek(Path::new("b.rs"), 4));
+        assert_eq!(s.file_index, 1);
+        assert_eq!(s.scroll_row, 3);
+    }
+
+    #[test]
+    fn seek_clamps_past_the_end_of_the_file() {
+        let mut s = state_with(vec![named("a.rs", 5)]);
+        assert!(s.seek(Path::new("a.rs"), 99));
+        assert_eq!(s.scroll_row, 4);
+    }
+
+    #[test]
+    fn seek_unknown_path_leaves_state_alone() {
+        let mut s = state_with(vec![named("a.rs", 5)]);
+        s.scroll_row = 2;
+        assert!(!s.seek(Path::new("zzz.rs"), 1));
+        assert_eq!((s.file_index, s.scroll_row), (0, 2));
     }
 
     #[test]

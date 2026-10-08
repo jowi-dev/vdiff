@@ -55,6 +55,7 @@ vdiff                  # open the graph for the current repo's change set; file 
 vdiff --no-nvim        # same, but file panes use the built-in read-only viewer instead
 vdiff --base main      # diff against a specific ref instead of the detected default branch
 vdiff --tui            # terminal UI instead: a nested 2D graph of the whole change set
+vdiff --pr 42          # review GitHub PR #42 in a temporary worktree, with its review threads
 ```
 
 The terminal UI (`--tui`) reuses the same diff/file panes as the GUI --
@@ -117,8 +118,11 @@ node, counting a file shared by several modules only once; binary files are
 labeled `binary` rather than given fake line counts, and a pure rename
 shows as `+0 / -0` (the file still counts as changed).
 
-`--pr <url>` (reviewing a GitHub PR directly) is on the roadmap, not
-available yet.
+`vdiff --pr <n>` reviews GitHub PR `<n>` directly: it resolves the PR
+through the `gh` CLI, checks its head out into a temporary git worktree
+(never touching your checkout), and diffs against the PR's base branch
+unless `--base` says otherwise. The worktree is removed on exit if it has
+no local changes.
 
 ## Keys
 
@@ -132,14 +136,15 @@ zoom is a 2D-canvas-only concept):
 | `d`                  | Diff the current file against the merge-base                 |
 | `t`                  | Toggle showing test modules                                   |
 | `c`                  | Comment on the focused node (see below — requires `vdiff.nvim`) |
+| `p`                  | Open the GitHub review-thread panel (see below)               |
 | `gd` / `gr`          | Follow dependencies / dependents from the focused node        |
 | `+` / `-` / `=`      | Zoom in / out / reset                                          |
 | `Esc`                | Back out (close file pane, close diff, ...)                    |
 | `Ctrl-w h` / `Ctrl-w l` | Move focus between the graph and file panes                |
 
 `--tui`'s graph screen differs on `` ` ``/`h`/`j`/`k`/`l`/fold only
-(everything else above still applies, `Enter`/`d`/`t`/`c`/`gd`/`gr`/`Esc`/
-`Ctrl-w h/l` included):
+(everything else above still applies, `Enter`/`d`/`t`/`c`/`p`/`gd`/`gr`/
+`Esc`/`Ctrl-w h/l` included):
 
 | Key(s)   | Does                                                          |
 |----------|-----------------------------------------------------------------|
@@ -243,6 +248,42 @@ written to disk: running `--inbox` twice with no GitHub changes in between
 shows the same list. Each search covers the 30 most relevant PRs. The picker
 needs the `tui` feature; `--inbox --json` works in every build. See
 [`docs/inbox-schema.md`](docs/inbox-schema.md) for the JSON shape.
+
+## GitHub review threads
+
+When the branch you open has a GitHub PR, or you launch with `--pr <n>`,
+vdiff fetches the PR's review threads through `gh` in the background and
+shows them three ways:
+
+- **Graph badges.** Each node shows its count of unresolved threads on its
+  files, separate from the local-comment badge. The TUI draws it as a cyan
+  `◆N`; the GUI paints it in the node's bottom-left corner.
+- **Thread panel.** `p` opens a list of threads: review summaries first,
+  then unresolved threads, then resolved ones, each with its file, line,
+  author, first line, reply count, and resolved or outdated state.
+- **Inline in nvim.** Each thread's comments appear as virtual lines under
+  its anchored line in the embedded Neovim pane, whichever way you reach
+  the file. Outdated threads appear in the panel only.
+
+In the panel:
+
+| Key(s)       | Does                                                         |
+|--------------|--------------------------------------------------------------|
+| `j` `k`      | Step through threads; graph focus follows the thread's node  |
+| `Enter`      | Open the thread's file at its line                          |
+| `r`          | Fetch threads again, picking up new ones and resolutions     |
+| `p` `Esc`    | Close the panel                                              |
+
+Threads live in memory only; GitHub stays the source of truth, and `r`
+asks it again. With no PR for the branch, no `gh`, or no network, vdiff
+opens as usual and shows why there are no threads. Thread lines are
+relative to the PR's head commit, so when your local `HEAD` differs (for
+example, unpushed commits) vdiff warns that lines may be off. Reading is
+all vdiff does for now: reply to and resolve threads on GitHub.
+
+For scripts and review agents, `vdiff --dump json --include-threads`
+adds the threads to the JSON dump, grouped by node. See
+[`docs/threads-schema.md`](docs/threads-schema.md) for the shape.
 
 ## AI-review payload
 

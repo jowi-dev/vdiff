@@ -5,6 +5,7 @@
 //! [`grid`] is pure -- protocol parsing and grid state, unit-tested.
 //! [`session`] is impure -- process spawning, threading, and RPC framing.
 
+pub mod gh_threads;
 pub mod grid;
 pub mod session;
 pub mod vdiff_glue;

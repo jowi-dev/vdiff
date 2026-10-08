@@ -58,6 +58,11 @@ pub struct KeyContext {
     /// [`Screen::Graph`]/[`Pane::Graph`], but its keys take priority
     /// regardless.
     pub picker_open: bool,
+    /// Whether the GitHub thread list panel is open (see
+    /// [`crate::core::app::App::threads`]). Checked right after
+    /// `picker_open`: the panel owns `j`/`k`/`Enter`/`r`/`p`/`Esc` and
+    /// leaves everything else unmapped.
+    pub threads_open: bool,
     /// A prefix key returned as [`KeyOutcome::Pending`] by the previous
     /// call, or `None` if no chord is in progress.
     pub pending: Option<Pending>,
@@ -82,16 +87,20 @@ pub enum KeyOutcome {
 /// Precedence:
 /// 1. `ctx.picker_open` -- `j`/`k` move the selection, `Enter` selects,
 ///    `Esc` cancels; everything else is unmapped.
-/// 2. `ctx.pending` set -- completes a chord started by a previous call
+/// 2. `ctx.threads_open` -- the GitHub thread panel: `j`/`k` (or the
+///    arrows) -> [`Msg::ThreadMove`], `Enter` -> [`Msg::ThreadOpen`], `r` ->
+///    [`Msg::RefreshThreads`], `p`/`Esc` -> [`Msg::ToggleThreadPanel`];
+///    everything else is unmapped.
+/// 3. `ctx.pending` set -- completes a chord started by a previous call
 ///    (see [`resolve_pending`]); any other completion clears the chord
 ///    with no message.
-/// 3. Otherwise, per `ctx.screen`/`ctx.pane`:
+/// 4. Otherwise, per `ctx.screen`/`ctx.pane`:
 ///    - [`Screen::Graph`]/[`Pane::Graph`]: `h`/`j`/`k`/`l` ->
 ///      [`Msg::FocusMove`], `Enter` -> [`Msg::OpenFile`], `d` ->
 ///      [`Msg::OpenDiff`], `g` -> [`KeyOutcome::Pending`] (`gt` ->
 ///      [`Msg::GoToTest`]), `t` -> [`Msg::ToggleTests`], `c` ->
-///      [`Msg::CommentNode`], `v` -> [`Msg::ToggleReviewed`], `Ctrl-w` ->
-///      [`KeyOutcome::Pending`].
+///      [`Msg::CommentNode`], `v` -> [`Msg::ToggleReviewed`], `p` ->
+///      [`Msg::ToggleThreadPanel`], `Ctrl-w` -> [`KeyOutcome::Pending`].
 ///    - [`Screen::Graph`]/[`Pane::File`]: `j`/`k` -> [`Msg::FileScroll`],
 ///      `Ctrl-d`/`Ctrl-u` -> [`Msg::FileHalfPage`], `g`/`]`/`[` ->
 ///      [`KeyOutcome::Pending`], `G` -> [`Msg::FileJumpBottom`], `d` ->
@@ -113,6 +122,21 @@ pub fn map_key(key: KeyInput, ctx: KeyContext) -> KeyOutcome {
         };
     }
 
+    if ctx.threads_open {
+        return match key {
+            KeyInput::Char('j') | KeyInput::Arrow(Direction::Down) => {
+                KeyOutcome::Msg(Msg::ThreadMove(1))
+            }
+            KeyInput::Char('k') | KeyInput::Arrow(Direction::Up) => {
+                KeyOutcome::Msg(Msg::ThreadMove(-1))
+            }
+            KeyInput::Enter => KeyOutcome::Msg(Msg::ThreadOpen),
+            KeyInput::Char('r') => KeyOutcome::Msg(Msg::RefreshThreads),
+            KeyInput::Char('p') | KeyInput::Esc => KeyOutcome::Msg(Msg::ToggleThreadPanel),
+            _ => KeyOutcome::None,
+        };
+    }
+
     if let Some(pending) = ctx.pending {
         return resolve_pending(pending, key, ctx);
     }
@@ -130,6 +154,7 @@ pub fn map_key(key: KeyInput, ctx: KeyContext) -> KeyOutcome {
                 KeyInput::Char('t') => KeyOutcome::Msg(Msg::ToggleTests),
                 KeyInput::Char('c') => KeyOutcome::Msg(Msg::CommentNode),
                 KeyInput::Char('v') => KeyOutcome::Msg(Msg::ToggleReviewed),
+                KeyInput::Char('p') => KeyOutcome::Msg(Msg::ToggleThreadPanel),
                 KeyInput::Ctrl('w') => KeyOutcome::Pending(Pending::CtrlW),
                 _ => KeyOutcome::None,
             },
@@ -231,6 +256,7 @@ mod tests {
             pane: Pane::Graph,
             file_open: false,
             picker_open: false,
+            threads_open: false,
             pending: None,
         }
     }
@@ -241,6 +267,7 @@ mod tests {
             pane: Pane::File,
             file_open: true,
             picker_open: false,
+            threads_open: false,
             pending: None,
         }
     }
@@ -251,6 +278,7 @@ mod tests {
             pane: Pane::Graph,
             file_open: false,
             picker_open: false,
+            threads_open: false,
             pending: None,
         }
     }
@@ -261,7 +289,40 @@ mod tests {
             pane: Pane::Graph,
             file_open: false,
             picker_open: true,
+            threads_open: false,
             pending: None,
+        }
+    }
+
+    fn threads_ctx() -> KeyContext {
+        KeyContext {
+            threads_open: true,
+            ..graph_ctx()
+        }
+    }
+
+    #[test]
+    fn p_on_the_graph_pane_opens_the_thread_panel() {
+        assert_eq!(
+            map_key(KeyInput::Char('p'), graph_ctx()),
+            KeyOutcome::Msg(Msg::ToggleThreadPanel)
+        );
+    }
+
+    #[test]
+    fn thread_panel_owns_its_keys() {
+        let cases = [
+            (KeyInput::Char('j'), KeyOutcome::Msg(Msg::ThreadMove(1))),
+            (KeyInput::Char('k'), KeyOutcome::Msg(Msg::ThreadMove(-1))),
+            (KeyInput::Enter, KeyOutcome::Msg(Msg::ThreadOpen)),
+            (KeyInput::Char('r'), KeyOutcome::Msg(Msg::RefreshThreads)),
+            (KeyInput::Char('p'), KeyOutcome::Msg(Msg::ToggleThreadPanel)),
+            (KeyInput::Esc, KeyOutcome::Msg(Msg::ToggleThreadPanel)),
+            (KeyInput::Char('h'), KeyOutcome::None),
+            (KeyInput::Char('d'), KeyOutcome::None),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(map_key(key, threads_ctx()), expected, "{key:?}");
         }
     }
 
